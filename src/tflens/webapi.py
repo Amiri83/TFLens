@@ -18,6 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .model import EDGE_KINDS, SCHEMA_VERSION
 from .output import dumps, run_analysis
+from .overview import build_overview
 from .report import describe_node
 from .snippets import SourceLines, snippet_lines
 
@@ -484,9 +485,19 @@ def _defined_in(model: dict[str, Any], path: str) -> list[dict[str, Any]]:
     return [_compact(n) for n in here]
 
 
+def _all_files(model: dict[str, Any]) -> list[str]:
+    """Every file discovery saw (models written before discovery: the analyzed files)."""
+    disc = model.get("discovery")
+    return sorted(set(disc["all_files"]) | set(model["files"])) if disc else model["files"]
+
+
 def repo_tree(model: dict[str, Any], title: str = "") -> dict[str, Any]:
-    """Directory/file tree of the analyzed files, with module addresses per directory."""
+    """Directory/file tree of the whole repository: analyzed files are marked
+    (``analyzed``), directories discovery did not walk carry ``skipped`` (the reason),
+    and each directory lists its module addresses."""
     by_dir = _modules_by_dir(model)
+    analyzed = set(model["files"])
+    roots = {r["dir"] for r in (model.get("structure") or {}).get("roots", [])}
     counts: dict[str, int] = {}
     for n in model["nodes"]:
         if n["location"] and n["kind"] in ("resource", "data"):
@@ -496,28 +507,42 @@ def repo_tree(model: dict[str, Any], title: str = "") -> dict[str, Any]:
         "path": ".",
         "type": "dir",
         "modules": by_dir.get(".", []),
+        "root": "." in roots,
         "children": [],
     }
     dirs = {".": root}
-    for f in sorted(model["files"]):
-        parts = PurePosixPath(f).parts
-        parent = root
-        for i in range(len(parts) - 1):
-            path = "/".join(parts[: i + 1])
-            if path not in dirs:
-                d = {
-                    "name": parts[i],
-                    "path": path,
-                    "type": "dir",
-                    "modules": by_dir.get(path, []),
-                    "children": [],
-                }
-                dirs[path] = d
-                parent["children"].append(d)
-            parent = dirs[path]
+
+    def ensure_dir(path: str) -> dict[str, Any]:
+        if path in dirs:
+            return dirs[path]
+        parent = ensure_dir(str(PurePosixPath(path).parent))
+        d = {
+            "name": PurePosixPath(path).name,
+            "path": path,
+            "type": "dir",
+            "modules": by_dir.get(path, []),
+            "root": path in roots,
+            "children": [],
+        }
+        dirs[path] = d
+        parent["children"].append(d)
+        return d
+
+    for f in _all_files(model):
+        parent = ensure_dir(str(PurePosixPath(f).parent))
         parent["children"].append(
-            {"name": parts[-1], "path": f, "type": "file", "resources": counts.get(f, 0)}
+            {
+                "name": PurePosixPath(f).name,
+                "path": f,
+                "type": "file",
+                "analyzed": f in analyzed,
+                "resources": counts.get(f, 0),
+            }
         )
+    for s in (model.get("discovery") or {}).get("skipped", []):
+        d = ensure_dir(s["path"])
+        d["skipped"] = s["reason"]
+        d["skipped_kind"] = s["kind"]
     _sort_tree(root)
     return root
 
@@ -531,10 +556,21 @@ def _sort_tree(d: dict[str, Any]) -> None:
 
 def file_detail(model: dict[str, Any], path: str) -> dict[str, Any] | None:
     if path not in model["files"]:
-        return None
+        if path not in _all_files(model):
+            return None
+        return {
+            "path": path,
+            "analyzed": False,
+            "note": "Not analyzed: TFLens reads *.tf, *.tf.json, *.tfvars(.json) and "
+            "terragrunt.hcl files only.",
+            "modules": [],
+            "resources": [],
+            "unknowns": [],
+        }
     parent = str(PurePosixPath(path).parent)
     return {
         "path": path,
+        "analyzed": True,
         "modules": _modules_by_dir(model).get(parent, []),
         "resources": _defined_in(model, path),
         "unknowns": [
@@ -543,7 +579,21 @@ def file_detail(model: dict[str, Any], path: str) -> dict[str, Any] | None:
     }
 
 
+def source_view(
+    path: str, start: int, end: int, source: SourceLines | None
+) -> dict[str, Any] | None:
+    """A ``file:line`` reference with its snippet (only files listed in the model)."""
+    lines = source(path) if source is not None else None
+    if lines is None:
+        return None
+    start = max(1, min(start, len(lines) or 1))
+    end = max(start, min(end, len(lines) or 1))
+    loc = {"file": path, "start_line": start, "end_line": end}
+    return {**loc, "lines": snippet_lines(loc, source, context=3)}
+
+
 def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
+    disc = model.get("discovery") or {}
     out = {
         "title": store.title if store else "",
         "summary": model["summary"],
@@ -551,6 +601,9 @@ def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict
         "parse_errors": model["parse_errors"],
         "remote_modules": model.get("remote_modules", []),
         "tool": model.get("tool"),
+        "status": disc.get("status", "ok"),
+        "reason": disc.get("reason", ""),
+        "skipped": disc.get("skipped", []),
     }
     if store is not None:
         out["model_path"] = str(store.model_path)
@@ -626,6 +679,16 @@ class Api:
             )
         if path == "/api/tree":
             return json_response(repo_tree(model, self.store.title))
+        if path == "/api/overview":
+            return json_response(build_overview(model, self.store.title))
+        if path == "/api/source":
+            try:
+                start = int(query.get("start", "1"))
+                end = int(query.get("end", str(start)))
+            except ValueError:
+                return json_response({"error": "start/end must be line numbers"}, 400)
+            view = source_view(query.get("file", ""), start, end, self.store.lines)
+            return json_response(view) if view else _not_found(f"file {query.get('file')!r}")
         if path == "/api/node":
             detail = node_detail(model, query.get("id", ""), self.store.lines)
             return json_response(detail) if detail else _not_found(f"node {query.get('id')!r}")

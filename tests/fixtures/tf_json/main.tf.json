@@ -1,0 +1,67 @@
+{
+  "//": "repo-a written in Terraform JSON syntax",
+  "terraform": {
+    "required_version": ">= 1.6.0",
+    "backend": {
+      "s3": {
+        "bucket": "repo-a-tfstate",
+        "key": "tf-json/terraform.tfstate",
+        "region": "us-east-1"
+      }
+    },
+    "required_providers": {
+      "aws": {
+        "source": "hashicorp/aws",
+        "version": "~> 5.40"
+      }
+    }
+  },
+  "provider": {
+    "aws": {
+      "region": "us-east-1"
+    }
+  },
+  "variable": {
+    "env": {
+      "type": "string"
+    }
+  },
+  "module": {
+    "queue": {
+      "source": "./modules/queue",
+      "name": "repo-a-${var.env}-jobs"
+    }
+  },
+  "resource": {
+    "aws_iam_role": {
+      "fn": {
+        "name": "repo-a-${var.env}-fn-a",
+        "assume_role_policy": "${jsonencode({Version = \"2012-10-17\", Statement = [{Effect = \"Allow\", Action = \"sts:AssumeRole\", Principal = {Service = \"lambda.amazonaws.com\"}}]})}"
+      }
+    },
+    "aws_iam_role_policy": {
+      "fn": {
+        "role": "${aws_iam_role.fn.id}",
+        "policy": "${jsonencode({Version = \"2012-10-17\", Statement = [{Effect = \"Allow\", Action = [\"sqs:ReceiveMessage\", \"sqs:DeleteMessage\", \"sqs:GetQueueAttributes\"], Resource = module.queue.arn}]})}"
+      }
+    },
+    "aws_lambda_function": {
+      "fn": {
+        "function_name": "fn-a-${var.env}",
+        "role": "${aws_iam_role.fn.arn}",
+        "runtime": "python3.12",
+        "handler": "app.handler",
+        "filename": "build/fn-a.zip",
+        "tags": {
+          "Environment": "${var.env}"
+        }
+      }
+    },
+    "aws_lambda_event_source_mapping": {
+      "jobs": {
+        "event_source_arn": "${module.queue.arn}",
+        "function_name": "${aws_lambda_function.fn.arn}"
+      }
+    }
+  }
+}

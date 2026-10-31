@@ -1,7 +1,8 @@
 # TFLens
 
-Static, read-only analyzer for Terraform repositories. It parses `.tf`/`.tfvars`
-files (python-hcl2), evaluates what can be determined from the code (variables,
+Static, read-only analyzer for Terraform repositories. It parses `.tf`, `.tf.json`,
+`.tfvars`, `.tfvars.json` and `terragrunt.hcl` files (python-hcl2 and its own JSON
+reader, both with exact line numbers), evaluates what can be determined from the code (variables,
 tfvars, locals, local modules and their outputs, `aws_iam_policy_document`), and
 builds a graph of AWS resources and their relationships, each relationship
 backed by evidence (file, line range, snippet).
@@ -23,10 +24,47 @@ tflens --dir path/to/terraform --out model.json --report report.md
 | `--dir PATH` | repository to analyze (required) |
 | `--out FILE` | write the model JSON |
 | `--report FILE` | write the markdown report |
+| `--overview FILE` | write the markdown overview (see below) |
 | `--var-file FILE` | extra tfvars for root modules (relative to `--dir`), repeatable |
 | `--var NAME=VALUE` | set a root variable, repeatable |
 
-With neither `--out` nor `--report`, the model JSON goes to stdout.
+With none of `--out`, `--report` or `--overview`, the model JSON goes to stdout.
+If the repository has nothing to analyze, `tflens` exits with status 1 and prints
+the reason and a listing of what the repository contains.
+
+## Zero-config onboarding
+
+Nothing has to be configured before a first analysis:
+
+- **Discovery is never silent.** Every directory that is not walked is listed with
+  the reason: unreadable (the `os.walk` error), tool / VCS / hidden directories
+  (`.git`, `.terraform`, ...) and symlinks. If no `*.tf`, `*.tf.json` or
+  `terragrunt.hcl` file is found the run **fails** with that reason and a listing
+  of the top two directory levels with file counts by extension.
+- **Roots**: directories that are not called as a module by another directory
+  (their `backend` / `cloud` / `provider` / `terraform` blocks are listed as the
+  signals), and Terragrunt units. A unit's `terraform { source }` is resolved
+  (`get_repo_root()`, `get_terragrunt_dir()`, `find_in_parent_folders()`,
+  `path_relative_to_include()`, literal locals); a local source is analyzed with
+  the unit's `inputs` (merged with `include`-d parents) as variable values, a
+  remote one is reported with its kind and version.
+- **Backend** per root: type and its key settings (s3 `bucket` / `key` / `region` /
+  `dynamodb_table`, gcs, azurerm, remote / cloud, ...), from the `backend` block, a
+  `*.tfbackend` partial configuration, or Terragrunt `remote_state`; a setting that
+  cannot be known is `UNKNOWN` with the reason. Plus the workspace setup.
+- **Providers**: `required_providers` constraints per module, versions locked in
+  `.terraform.lock.hcl`, `required_version`, and `provider` configurations.
+- **Modules**: every call, classified local / registry / git / s3 / gcs / http,
+  with its version (`version` or `?ref=`), call site and inputs.
+- **Environments**: from tfvars files (`envs/dev.tfvars`, `vars/prod.tfvars`,
+  with `common.tfvars` applied to each), `envs/*` or env-named root directories,
+  and Terragrunt layouts (`live/<env>/...`, `env.hcl`). In the managed app they
+  are created automatically (on add / Sync / **Detect environments**), bound to
+  their root, and can be edited; an edited environment is never overwritten.
+- **Overview** (the analyzer's first tab, `overview.md` of each run): what the
+  repository deploys and, per root, backend, providers, modules, resources by
+  service, the top ACCESS / TRIGGER / NETWORK relationships and the unknowns.
+  Every line links to its `file:line`.
 
 The report ends with an **Evidence** section: every relationship gets an entry
 (`E1`, `E2`, ... linked from the resource sections) with file, line range and
@@ -80,9 +118,11 @@ first save; just starting the server or browsing writes neither.
 - **Environments** per repository: tfvars files plus extra `-var KEY=VALUE` lines
   (values stored encrypted, only names shown). **Analyze** runs the static
   analyzer read-only and records a run.
-- **Runs**: history per repository. A run's `model.json` and `report.md` stay on
-  disk under `out/<repo>/<run>/`; the database stores only the path and summary
-  counts. **Open** shows the run in the analyzer at `/runs/<id>/` (read-only).
+- **Runs**: history per repository. A run's `model.json`, `report.md` and
+  `overview.md` stay on disk under `out/<repo>/<run>/`; the database stores only
+  the path, summary counts and status. **Open** shows the run in the analyzer at
+  `/runs/<id>/` (read-only). A failed run is listed with its reason (and, when
+  nothing was analyzable, what the repository contains).
 - **Accounts**: AWS account records in the same form as IPLens (encrypted or
   memory-only secrets, masked display). The analysis never uses them; TFLens makes
   no AWS calls.
@@ -97,7 +137,10 @@ first save; just starting the server or browsing writes neither.
 
 - **Graph**: nodes colored by service, edges by kind (CONFIG dashed, RUNS_ON
   dotted); filters by edge kind, service and module; search by name or id.
-- **Repository**: file/module tree; selecting a file lists what it defines.
+- **Overview**: see above; a `file:line` opens the source snippet.
+- **Repository**: the whole repository tree (analyzed files marked, skipped
+  directories with their reason, roots tagged); selecting a file lists what it
+  defines.
 - **Detail panel** (click a node or edge): summary, the defining block, evidence
   snippets with highlighted line numbers, and unknowns with their reasons.
 
@@ -109,7 +152,7 @@ no external requests; the graph library is vendored (copy `cytoscape.min.js` int
 
 JSON API (all GET; under `/runs/<id>/` for a run): `api/summary`, `api/graph`,
 `api/nodes`, `api/edges`, `api/node?id=`, `api/edge?id=`, `api/tree`,
-`api/file?path=`, `api/model`; `POST api/regenerate` (standalone only, needs the
+`api/file?path=`, `api/overview`, `api/source?file=&start=&end=`, `api/model`; `POST api/regenerate` (standalone only, needs the
 header `X-TFLens: 1`).
 
 ## Remote modules
@@ -149,7 +192,9 @@ Edge kinds:
 `schema_version`, `summary`, `files`, `parse_errors`, `roots`, `remote_modules`,
 `modules` (module tree with inputs, outputs and remote source/version), `variables` (value and where it came from),
 `nodes`, `edges` (with `evidence` and `via`), `unknowns` (subject, attribute,
-reason, location). Symbolic values are encoded explicitly: `{"$ref": ...}`,
+reason, location), `discovery` (status / failure reason, analyzable and all files,
+skipped directories, inventory) and `structure` (roots with backend, providers,
+modules, resources; environments). Symbolic values are encoded explicitly: `{"$ref": ...}`,
 `{"$unknown": reason}`, `{"$template": ...}`, `{"$json": ...}`.
 
 ## Development

@@ -257,7 +257,13 @@ def test_repo_tree_and_file_listing(api):
     assert worker["path"] == "modules/worker"
     assert worker["modules"] == ["module.worker"]
     assert worker["children"] == [
-        {"name": "main.tf", "path": "modules/worker/main.tf", "type": "file", "resources": 5}
+        {
+            "name": "main.tf",
+            "path": "modules/worker/main.tf",
+            "type": "file",
+            "analyzed": True,
+            "resources": 5,
+        }
     ]
     f = get(api, "/api/file?path=" + quote("modules/worker/main.tf"))
     assert f["modules"] == ["module.worker"]

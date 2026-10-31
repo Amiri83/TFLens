@@ -471,6 +471,19 @@ def add_env(
         raise ValueError("unknown repository")
     env, files, extra = _env_fields(name, var_files, extra_vars, encrypt)
     enc, keys = extra or ("", "")
+    detected = conn.execute(
+        "SELECT id FROM tf_repo_envs WHERE repo_id=? AND root_rel=? AND env=? AND confirmed=0 "
+        "AND kinds NOT IN ('', 'manual')",
+        (repo_id, repo["subdir"] or ".", env),
+    ).fetchone()
+    if detected is not None:
+        # the user defines an environment TFLens had detected: adopt it with their values
+        conn.execute(
+            "UPDATE tf_repo_envs SET var_file=?, var_files=?, extra_vars_enc=?, "
+            "extra_vars_keys=?, confirmed=1 WHERE id=?",
+            (files[0] if files else "", json.dumps(files), enc, keys, detected["id"]),
+        )
+        return int(detected["id"])
     try:
         cur = conn.execute(
             "INSERT INTO tf_repo_envs(repo_id, root_rel, root_label, env, kinds, var_file, "
@@ -503,8 +516,10 @@ def update_env(
     """Edit an environment. ``extra_vars=None`` keeps the stored variables; '' clears."""
     env, files, extra = _env_fields(name, var_files, extra_vars, encrypt)
     try:
+        # confirmed=1: a later discovery never overwrites what the user edited
         cur = conn.execute(
-            "UPDATE tf_repo_envs SET env=?, var_file=?, var_files=? WHERE id=? AND repo_id=?",
+            "UPDATE tf_repo_envs SET env=?, var_file=?, var_files=?, confirmed=1 "
+            "WHERE id=? AND repo_id=?",
             (env, files[0] if files else "", json.dumps(files), env_id, repo_id),
         )
     except sqlite3.IntegrityError:
@@ -540,7 +555,7 @@ def _env_row(r: sqlite3.Row) -> dict[str, Any]:
 
 def list_envs(conn: sqlite3.Connection, repo_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT * FROM tf_repo_envs WHERE repo_id=? ORDER BY env", (repo_id,)
+        "SELECT * FROM tf_repo_envs WHERE repo_id=? ORDER BY env, root_rel", (repo_id,)
     ).fetchall()
     return [_env_row(r) for r in rows]
 
@@ -550,6 +565,82 @@ def get_env(conn: sqlite3.Connection, repo_id: int, env_id: int) -> dict[str, An
         "SELECT * FROM tf_repo_envs WHERE id=? AND repo_id=?", (env_id, repo_id)
     ).fetchone()
     return _env_row(row) if row else None
+
+
+@dataclass
+class Discovery:
+    added: int = 0
+    updated: int = 0
+    gone: int = 0
+    found: int = 0
+
+
+def discover_envs(conn: sqlite3.Connection, repo: dict[str, Any]) -> Discovery:
+    """Create / refresh the environments detected in the repository (tfvars files,
+    envs/ or env-named directories, Terragrunt layouts). Environments the user edited
+    (``confirmed``) or added by hand are never changed; detected ones no longer found are
+    kept but marked ``present=0``."""
+    from .detect import detect_environments
+    from .engine import Engine
+    from .loader import load_repo
+
+    root = analysis_root(repo)
+    if not root.is_dir():
+        raise ValueError(
+            "the repository has not been synced yet"
+            if repo["source"] == "git"
+            else "the directory does not exist"
+        )
+    loaded = load_repo(root)
+    found = detect_environments(loaded, Engine(loaded))
+    result = Discovery(found=len(found))
+    rows = {
+        (r["root_rel"], r["env"]): r
+        for r in conn.execute("SELECT * FROM tf_repo_envs WHERE repo_id=?", (repo["id"],))
+    }
+    seen: set[int] = set()
+    for e in found:
+        kinds = ",".join(e["kinds"])
+        files = json.dumps(e["var_files"])
+        label = e["root"] if e["root"] != "." else (repo["subdir"] or ".")
+        row = rows.get((e["root"], e["name"]))
+        if row is None:
+            try:
+                cur = conn.execute(
+                    "INSERT INTO tf_repo_envs(repo_id, root_rel, root_label, env, kinds, "
+                    "var_file, var_files, confirmed, present) VALUES(?, ?, ?, ?, ?, ?, ?, 0, 1)",
+                    (
+                        repo["id"],
+                        e["root"],
+                        label,
+                        e["name"],
+                        kinds,
+                        e["var_files"][0] if e["var_files"] else "",
+                        files,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                continue
+            seen.add(int(cur.lastrowid or 0))
+            result.added += 1
+            continue
+        seen.add(int(row["id"]))
+        if row["confirmed"] or row["kinds"] in ("", "manual"):
+            conn.execute("UPDATE tf_repo_envs SET present=1 WHERE id=?", (row["id"],))
+            continue
+        if (row["kinds"], row["var_files"], row["present"]) != (kinds, files, 1):
+            result.updated += 1
+        conn.execute(
+            "UPDATE tf_repo_envs SET kinds=?, var_file=?, var_files=?, root_label=?, present=1 "
+            "WHERE id=?",
+            (kinds, e["var_files"][0] if e["var_files"] else "", files, label, row["id"]),
+        )
+    for row in rows.values():
+        if int(row["id"]) not in seen and row["kinds"] not in ("", "manual") and row["present"]:
+            conn.execute("UPDATE tf_repo_envs SET present=0 WHERE id=?", (row["id"],))
+            result.gone += 1
+    conn.execute("UPDATE tf_repos SET discovered_at=? WHERE id=?", (_now(), repo["id"]))
+    return result
 
 
 def env_vars(env: dict[str, Any], decrypt: Decrypt | None) -> dict[str, str]:
@@ -724,6 +815,15 @@ def run_dir_for(out_dir: Path, repo: dict[str, Any], run_id: int) -> Path:
     return out_dir / f"{repo['id']}-{_slug(repo['name'])}" / str(run_id)
 
 
+def env_scope(env: dict[str, Any] | None) -> str | None:
+    """The directory an environment covers: detected environments are bound to their
+    root(s); manual ones (and '.') cover the whole analyzed directory."""
+    if not env or env.get("kinds", "manual") in ("", "manual"):
+        return None
+    scope = env.get("root_rel") or "."
+    return None if scope == "." else scope
+
+
 def create_run(
     conn: sqlite3.Connection,
     repo: dict[str, Any],
@@ -731,9 +831,13 @@ def create_run(
     out_dir: Path,
     decrypt: Decrypt | None,
 ) -> int:
-    """Analyze ``repo`` (with ``env``'s tfvars and variables) read-only; write model.json
-    and report.md to ``out/<repo>/<run>/`` and record the run. Returns the run id."""
-    from .output import dumps, run_analysis
+    """Analyze ``repo`` (with ``env``'s tfvars and variables) read-only; write model.json,
+    report.md and overview.md to ``out/<repo>/<run>/`` and record the run. Returns the run
+    id. A run whose discovery finds nothing to analyze is recorded as failed, with the
+    reason and a listing of what the repository contains (its model is still written, so
+    the run opens and shows every file). Precondition errors raise ValueError."""
+    from .output import dumps, listing_text, run_analysis
+    from .overview import build_overview, render_overview_markdown
     from .report import render_report
 
     root = analysis_root(repo)
@@ -747,22 +851,20 @@ def create_run(
     for f in var_files:
         if not (root / f).is_file() or not _inside(root / f, root):
             raise ValueError(f"tfvars file {f} not found in the repository")
-    analysis = run_analysis(root, var_files, env_vars(env, decrypt) if env else {})
-    cur = conn.execute(
-        "INSERT INTO runs(ts, repo_id, repo, env_id, env, commit_sha, summary, model_path, "
-        "root_path) VALUES(?, ?, ?, ?, ?, ?, ?, '', ?)",
-        (
-            _now(),
-            repo["id"],
-            repo["name"],
-            env["id"] if env else None,
-            env["env"] if env else "",
-            head_commit(Path(repo["path"])) if repo["source"] == "local" else repo["commit_sha"],
-            json.dumps(analysis.model["summary"], sort_keys=True),
-            str(root),
-        ),
+    analysis = run_analysis(
+        root, var_files, env_vars(env, decrypt) if env else {}, scope=env_scope(env)
     )
-    run_id = int(cur.lastrowid or 0)
+    listing = listing_text(analysis.model["discovery"]["inventory"])
+    error = f"{analysis.failure}\n{listing}" if analysis.failed else ""
+    run_id = _insert_run(
+        conn,
+        repo,
+        env,
+        summary=analysis.model["summary"],
+        root=root,
+        status=FAILED if analysis.failed else OK,
+        error=error,
+    )
     run_dir = run_dir_for(out_dir, repo, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     model_path = run_dir / "model.json"
@@ -771,8 +873,55 @@ def create_run(
     (run_dir / "report.md").write_text(
         render_report(analysis.model, title, analysis.repo.lines), encoding="utf-8"
     )
+    (run_dir / "overview.md").write_text(
+        render_overview_markdown(build_overview(analysis.model, title), listing),
+        encoding="utf-8",
+    )
     conn.execute("UPDATE runs SET model_path=? WHERE id=?", (str(model_path), run_id))
     return run_id
+
+
+def _insert_run(
+    conn: sqlite3.Connection,
+    repo: dict[str, Any],
+    env: dict[str, Any] | None,
+    *,
+    summary: dict[str, Any],
+    root: Path | None,
+    status: str,
+    error: str,
+) -> int:
+    commit = repo.get("commit_sha", "")
+    if repo["source"] == "local":
+        commit = head_commit(Path(repo["path"])) if Path(repo["path"]).is_dir() else ""
+    cur = conn.execute(
+        "INSERT INTO runs(ts, repo_id, repo, env_id, env, commit_sha, summary, model_path, "
+        "root_path, status, error) VALUES(?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)",
+        (
+            _now(),
+            repo["id"],
+            repo["name"],
+            env["id"] if env else None,
+            env["env"] if env else "",
+            commit,
+            json.dumps(summary, sort_keys=True),
+            str(root) if root else "",
+            status,
+            error,
+        ),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def record_failed_run(
+    conn: sqlite3.Connection, repo: dict[str, Any], env: dict[str, Any] | None, reason: str
+) -> int:
+    """Record a run that failed before producing a model (no files on disk)."""
+    try:
+        root: Path | None = analysis_root(repo)
+    except ValueError:
+        root = None
+    return _insert_run(conn, repo, env, summary={}, root=root, status=FAILED, error=reason)
 
 
 def _run_row(r: sqlite3.Row) -> dict[str, Any]:
@@ -784,6 +933,9 @@ def _run_row(r: sqlite3.Row) -> dict[str, Any]:
     s = out["summary"]
     out["node_count"] = sum((s.get("nodes") or {}).values())
     out["edge_count"] = sum((s.get("edges") or {}).values())
+    error = out.get("error") or ""
+    out["reason"], _, out["error_detail"] = error.partition("\n")
+    out["status"] = out.get("status") or OK
     return out
 
 

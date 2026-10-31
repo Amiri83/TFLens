@@ -1,10 +1,18 @@
-"""Load a Terraform repository: python-hcl2 values + exact source locations."""
+"""Load a Terraform repository: python-hcl2 values + exact source locations.
+
+Discovery is never silent: every directory that is not walked (unreadable, a tool / VCS
+directory, a symlink) is recorded in :attr:`RepoSource.skipped`, and every file seen is
+listed in :attr:`RepoSource.all_files` (analyzable or not) so the UI can show the whole
+repository. Analyzed syntaxes: ``*.tf``, ``*.tf.json``, ``*.tfvars``, ``*.tfvars.json``
+and ``terragrunt.hcl`` (see :mod:`tflens.terragrunt`).
+"""
 
 from __future__ import annotations
 
 import json
 import os
 import posixpath
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -12,10 +20,16 @@ from typing import Any
 import hcl2
 
 from .expr import normalize_key, raw_to_expr
-from .locate import LocBlock, scan
+from .jsonloc import JsonLocError, tf_json, tfvars_json
+from .locate import LocBlock, object_keys, scan
 from .values import Location
 
 _SKIP_DIRS = {".terraform", ".git", ".venv", "venv", "node_modules", "__pycache__"}
+OUTPUT_DIR = "tflens-out"  # written by `tflens serve --dir` inside the repository
+TERRAGRUNT_FILE = "terragrunt.hcl"
+LOCK_FILE = ".terraform.lock.hcl"
+# Files listed in the repository tree (the full inventory); beyond this it is truncated.
+MAX_LISTED_FILES = 20000
 _LABEL_COUNT = {
     "resource": 2,
     "data": 2,
@@ -66,12 +80,65 @@ class ModuleSource:
     resources: dict[tuple[str, str], Block] = field(default_factory=dict)
     data: dict[tuple[str, str], Block] = field(default_factory=dict)
     module_calls: dict[str, Block] = field(default_factory=dict)
+    terraform: list[Block] = field(default_factory=list)  # terraform {} blocks
+    providers: list[Block] = field(default_factory=list)  # provider "x" {} blocks
 
 
 @dataclass
 class ParseError:
     file: str
     message: str
+
+
+@dataclass(frozen=True)
+class SkippedDir:
+    """A directory discovery did not walk, and why."""
+
+    path: str
+    kind: str  # unreadable | ignored | symlink
+    reason: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {"path": self.path, "kind": self.kind, "reason": self.reason}
+
+
+@dataclass
+class TgConfig:
+    """One Terragrunt configuration file (``terragrunt.hcl`` or an included ``*.hcl``)."""
+
+    file: str
+    dir: str
+    loc: Location
+    source: Attr | None = None  # terraform { source = ... }
+    terraform: Block | None = None
+    inputs: dict[str, Attr] = field(default_factory=dict)
+    includes: list[Block] = field(default_factory=list)
+    remote_state: Block | None = None
+    generate: list[Block] = field(default_factory=list)
+    dependencies: dict[str, Block] = field(default_factory=dict)
+    locals: dict[str, Attr] = field(default_factory=dict)
+
+
+def file_kind(name: str) -> str:
+    """How discovery treats a file name: terraform | tfvars | terragrunt | lock | other."""
+    if name.endswith((".tf", ".tf.json")):
+        return "terraform"
+    if name.endswith((".tfvars", ".tfvars.json")):
+        return "tfvars"
+    if name == TERRAGRUNT_FILE:
+        return "terragrunt"
+    if name == LOCK_FILE:
+        return "lock"
+    return "other"
+
+
+def extension(name: str) -> str:
+    """Extension used in the inventory (``.tf.json`` / ``.tfvars.json`` kept whole)."""
+    for double in (".tf.json", ".tfvars.json"):
+        if name.endswith(double):
+            return double
+    base = name.lstrip(".")
+    return "." + base.rsplit(".", 1)[1].lower() if "." in base else "(none)"
 
 
 @dataclass(frozen=True)
@@ -105,7 +172,25 @@ class RepoSource:
     errors: list[ParseError] = field(default_factory=list)
     # root module dir -> modules.json key -> entry
     remote: dict[str, dict[str, RemoteModule]] = field(default_factory=dict)
+    # discovery: every file seen (repo-relative) and the directories not walked
+    all_files: list[str] = field(default_factory=list)
+    skipped: list[SkippedDir] = field(default_factory=list)
+    truncated: bool = False
+    # inventory: directory -> extension -> file count (directory's own files only)
+    dir_ext: dict[str, Counter[str]] = field(default_factory=dict)
+    # Terragrunt: config file -> parsed config; units are resolved by terragrunt.py
+    terragrunt: dict[str, TgConfig] = field(default_factory=dict)
+    units: list[Any] = field(default_factory=list)
+    # .terraform.lock.hcl: directory -> provider source -> (version, location)
+    locks: dict[str, dict[str, tuple[str, Location]]] = field(default_factory=dict)
     _lines: dict[str, list[str]] = field(default_factory=dict, repr=False)
+
+    @property
+    def analyzable(self) -> list[str]:
+        """Files TFLens analyzes: Terraform (HCL / JSON) and Terragrunt configurations."""
+        return sorted(
+            f for f in self.files if file_kind(posixpath.basename(f)) in ("terraform", "terragrunt")
+        )
 
     @property
     def remote_dirs(self) -> set[str]:
@@ -131,24 +216,66 @@ class RepoSource:
         return "\n".join(lines)
 
 
+def _rel(root: Path, path: str) -> str:
+    rel = Path(path).relative_to(root).as_posix()
+    return rel or "."
+
+
 def load_repo(root: Path) -> RepoSource:
+    from .terragrunt import resolve_units
+
     root = root.resolve()
     repo = RepoSource(root=root)
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = sorted(d for d in dirnames if d not in _SKIP_DIRS and not d.startswith("."))
-        rel_dir = Path(dirpath).relative_to(root).as_posix()
+
+    def onerror(exc: OSError) -> None:
+        path = _rel(root, exc.filename) if exc.filename else "?"
+        repo.skipped.append(SkippedDir(path, "unreadable", f"cannot list: {exc.strerror or exc}"))
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
+        rel_dir = _rel(root, dirpath)
+        keep = []
+        for d in sorted(dirnames):
+            sub = f"{rel_dir}/{d}" if rel_dir != "." else d
+            if os.path.islink(os.path.join(dirpath, d)):
+                repo.skipped.append(SkippedDir(sub, "symlink", "symbolic link (not followed)"))
+            elif d == OUTPUT_DIR and rel_dir == ".":
+                # TFLens's own output: left out of the model entirely, so a model does not
+                # depend on whether an earlier one was written next to it
+                continue
+            elif d in _SKIP_DIRS or d.startswith("."):
+                repo.skipped.append(SkippedDir(sub, "ignored", "tool, VCS or hidden directory"))
+            else:
+                keep.append(d)
+        dirnames[:] = keep
+        counts = repo.dir_ext.setdefault(rel_dir, Counter())
         for fname in sorted(filenames):
             rel = f"{rel_dir}/{fname}" if rel_dir != "." else fname
-            if fname.endswith(".tf"):
+            counts[extension(fname)] += 1
+            if len(repo.all_files) < MAX_LISTED_FILES:
+                repo.all_files.append(rel)
+            else:
+                repo.truncated = True
+            kind = file_kind(fname)
+            if kind == "terraform":
                 repo.files.append(rel)
                 mod = repo.modules.setdefault(rel_dir, ModuleSource(dir=rel_dir))
                 mod.files.append(rel)
                 _load_tf(repo, mod, rel)
-            elif fname.endswith(".tfvars"):
+            elif kind == "tfvars":
                 repo.files.append(rel)
                 _load_tfvars(repo, rel)
+            elif kind == "terragrunt":
+                repo.files.append(rel)
+                load_terragrunt(repo, rel)
+            elif kind == "lock":
+                repo.files.append(rel)
+                _load_lock(repo, rel_dir, rel)
     for mod_dir in sorted(repo.modules):
         _load_manifest(repo, mod_dir)
+    repo.skipped.sort(key=lambda s: s.path)
+    repo.all_files.sort()
+    repo.units = resolve_units(repo)
+    repo.files.sort()
     return repo
 
 
@@ -207,19 +334,32 @@ def _module_files(repo: RepoSource, rel_dir: str) -> list[str]:
     path = repo.root / rel_dir
     try:
         path.resolve().relative_to(repo.root)
-        names = sorted(p.name for p in path.iterdir() if p.is_file() and p.name.endswith(".tf"))
+        names = sorted(
+            p.name for p in path.iterdir() if p.is_file() and p.name.endswith((".tf", ".tf.json"))
+        )
     except (OSError, ValueError):
         return []
     return [f"{rel_dir}/{n}" if rel_dir != "." else n for n in names]
 
 
-def _read(repo: RepoSource, rel: str) -> tuple[dict[str, Any], LocBlock] | None:
-    path = repo.root / rel
+def _text(repo: RepoSource, rel: str) -> str | None:
     try:
-        text = path.read_text(encoding="utf-8")
+        return (repo.root / rel).read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         repo.errors.append(ParseError(rel, f"cannot read file: {exc}"))
         return None
+
+
+def _read(repo: RepoSource, rel: str) -> tuple[dict[str, Any], LocBlock] | None:
+    text = _text(repo, rel)
+    if text is None:
+        return None
+    if rel.endswith(".tf.json"):
+        try:
+            return tf_json(text)
+        except JsonLocError as exc:
+            repo.errors.append(ParseError(rel, f"JSON syntax error: {exc}"))
+            return None
     try:
         data = hcl2.loads(text)
     except Exception as exc:  # python-hcl2 raises lark errors of various types
@@ -235,17 +375,136 @@ def _read(repo: RepoSource, rel: str) -> tuple[dict[str, Any], LocBlock] | None:
 
 
 def _load_tfvars(repo: RepoSource, rel: str) -> None:
+    if rel.endswith(".json"):
+        text = _text(repo, rel)
+        if text is None:
+            return
+        try:
+            values = tfvars_json(text)
+        except JsonLocError as exc:
+            repo.errors.append(ParseError(rel, f"JSON syntax error: {exc}"))
+            return
+        repo.tfvars[rel] = {
+            k: Attr(k, v, Location(rel, start, end)) for k, (v, start, end) in values.items()
+        }
+        return
+    out = read_attrs(repo, rel)
+    if out is not None:
+        repo.tfvars[rel] = out
+
+
+def read_attrs(repo: RepoSource, rel: str) -> dict[str, Attr] | None:
+    """Top-level attributes of an HCL file (tfvars, ``*.tfbackend``), with locations."""
     res = _read(repo, rel)
     if res is None:
-        return
+        return None
     data, locs = res
     out: dict[str, Attr] = {}
     for k, v in data.items():
         name = normalize_key(k)
-        if not isinstance(name, str) or name.startswith("__"):
+        if not isinstance(name, str) or name.startswith("__") or _is_block_list(v):
             continue
         out[name] = Attr(name, v, _loc(rel, locs.attrs.get(name), locs))
-    repo.tfvars[rel] = out
+    return out
+
+
+def _is_block_list(v: Any) -> bool:
+    return (
+        isinstance(v, list)
+        and bool(v)
+        and all(isinstance(x, dict) and x.get("__is_block__") for x in v)
+    )
+
+
+def read_blocks(repo: RepoSource, rel: str, block_type: str) -> list[Block]:
+    """Top-level blocks of one type (no labels) in an HCL file, e.g. ``locals`` of env.hcl."""
+    res = _read(repo, rel)
+    if res is None:
+        return []
+    data, locs = res
+    out = []
+    for entry in data.get(block_type, []):
+        for labels, body in _unnest(entry, 0):
+            cands = locs.children_of(block_type)
+            lb = cands[len(out)] if len(out) < len(cands) else None
+            out.append(_make_block(rel, block_type, labels, body, lb, locs))
+    return out
+
+
+def _load_lock(repo: RepoSource, rel_dir: str, rel: str) -> None:
+    """Provider versions pinned in ``.terraform.lock.hcl`` (written by terraform init)."""
+    res = _read(repo, rel)
+    if res is None:
+        return
+    data, locs = res
+    out: dict[str, tuple[str, Location]] = {}
+    for entry in data.get("provider", []):
+        for labels, body in _unnest(entry, 1):
+            version = raw_to_expr(body.get("version", ""))
+            value = getattr(version, "value", None)
+            if not isinstance(value, str):
+                continue
+            lb = next((c for c in locs.children if c.labels == labels), None)
+            out[labels[0]] = (value, _loc(rel, (lb.start, lb.end) if lb else None, locs))
+    repo.locks[rel_dir] = out
+
+
+def load_terragrunt(repo: RepoSource, rel: str) -> TgConfig | None:
+    """Parse a Terragrunt configuration (cached; included files are loaded on demand)."""
+    if rel in repo.terragrunt:
+        return repo.terragrunt[rel]
+    text = _text(repo, rel)
+    if text is None:
+        return None
+    res = _read(repo, rel)
+    if res is None:
+        return None
+    if rel not in repo.files:
+        repo.files.append(rel)
+    data, locs = res
+    rel_dir = posixpath.dirname(rel) or "."
+    cfg = TgConfig(rel, rel_dir, Location(rel, locs.start, locs.end))
+    labelled = {"dependency": 1, "generate": 1}
+    for raw_key, value in data.items():
+        key = normalize_key(raw_key)
+        if not isinstance(value, list) or not all(isinstance(v, dict) for v in value):
+            span = locs.attrs.get(key)
+            if key == "inputs" and isinstance(value, dict):
+                keys = object_keys(text, *span) if span else {}
+                for k, v in value.items():
+                    name = str(normalize_key(k))
+                    if not name.startswith("__"):
+                        cfg.inputs[name] = Attr(name, v, _loc(rel, keys.get(name) or span, locs))
+            continue
+        for entry in value:
+            depth = labelled.get(key, 0)
+            if key == "include" and not entry.get("__is_block__"):
+                depth = 1  # include "root" { ... }
+            for labels, body in _unnest(entry, depth):
+                cands = [c for c in locs.children if c.type == key and c.labels == labels]
+                block = _make_block(rel, key, labels, body, cands[0] if cands else None, locs)
+                if key == "terraform":
+                    cfg.terraform = block
+                    cfg.source = block.attrs.get("source")
+                elif key == "include":
+                    cfg.includes.append(block)
+                elif key == "remote_state":
+                    cfg.remote_state = block
+                elif key == "generate":
+                    cfg.generate.append(block)
+                elif key == "dependency":
+                    cfg.dependencies[labels[0]] = block
+                elif key == "locals":
+                    cfg.locals.update(block.attrs)
+    repo.terragrunt[rel] = cfg
+    return cfg
+
+
+def map_keys(repo: RepoSource, attr: Attr) -> dict[str, Location]:
+    """Locations of the keys of a map-valued attribute (``config = {...}``)."""
+    text = "\n".join(repo.lines(attr.loc.file))
+    spans = object_keys(text, attr.loc.start_line, attr.loc.end_line)
+    return {k: Location(attr.loc.file, s, e) for k, (s, e) in spans.items()}
 
 
 def _loc(file: str, span: tuple[int, int] | None, fallback: LocBlock) -> Location:
@@ -327,7 +586,12 @@ def _make_block(
                 if not isinstance(nb, dict):
                     continue
                 child_lb = loc_children[i] if i < len(loc_children) else None
-                nested.append(_make_block(file, name, (), nb, child_lb, span))
+                labels: tuple[str, ...] = ()
+                if name == "backend":  # backend "s3" { ... }: keep the label and key lines
+                    inner = [(k, x) for k, x in nb.items() if isinstance(x, dict)]
+                    if len(inner) == 1 and len(nb) == 1:
+                        labels, nb = (str(normalize_key(inner[0][0])),), inner[0][1]
+                nested.append(_make_block(file, name, labels, nb, child_lb, span))
             block.blocks[name] = nested
         else:
             attr_span = lb.attrs.get(name) if lb else None
@@ -349,3 +613,7 @@ def _register(mod: ModuleSource, block: Block) -> None:
         mod.outputs[labels[0]] = block
     elif t == "locals":
         mod.locals.update(block.attrs)
+    elif t == "terraform":
+        mod.terraform.append(block)
+    elif t == "provider":
+        mod.providers.append(block)

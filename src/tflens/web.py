@@ -364,8 +364,10 @@ def _run_api(run_id: int) -> Api:
             return cached
     with _read() as conn:
         run = tfrepo.get_run(conn, run_id) if conn is not None else None
-    if run is None or not run["model_path"]:
+    if run is None:
         abort(404)
+    if not run["model_path"]:
+        abort(404, f"Run {run_id} failed before producing a model: {run['reason'] or 'no reason'}")
     title = run["repo"] + (f" ({run['env']})" if run["env"] else "") + f" · run {run_id}"
     api = Api(
         ModelStore(
@@ -387,8 +389,19 @@ def _forget_run(run_id: int) -> None:
         _ext()["runs"].pop(run_id, None)
 
 
+def _record_failure(repo: dict[str, Any], env: dict[str, Any] | None, reason: str) -> None:
+    """Keep a failed run in the history with its reason (best effort)."""
+    try:
+        with _write() as conn:
+            tfrepo.record_failed_run(conn, repo, env, reason)
+    except Exception:
+        log.exception("cannot record the failed run of repo=%s", repo["id"])
+
+
 def _analyze(repo: dict[str, Any], env: dict[str, Any] | None) -> int | None:
-    """Create a run (flashes the outcome); returns its id, None on failure."""
+    """Create a run (flashes the outcome); returns its id if it produced a model (also
+    for a run whose discovery failed: it opens to show the repository), else None.
+    Every failure is recorded as a failed run with its reason."""
     label = repo["name"] + (f" / {env['env']}" if env else "")
     try:
         with _write() as conn:
@@ -402,24 +415,35 @@ def _analyze(repo: dict[str, Any], env: dict[str, Any] | None) -> int | None:
             )
             run = tfrepo.get_run(conn, run_id)
     except ValueError as exc:
-        flash(f"Analyze {label}: {exc}", "error")
+        _record_failure(repo, env, str(exc))
+        flash(f"Analyze {label} failed: {exc}", "error")
         return None
-    except Exception:
+    except Exception as exc:
         log.exception("analysis of repo=%s env=%s failed", repo["id"], env and env["id"])
+        _record_failure(repo, env, f"internal error ({type(exc).__name__}): see the log")
         flash(f"Analyze {label} failed. See the log for details.", "error")
         return None
     if pruned:
         with _ext()["runs_lock"]:
             _ext()["runs"].clear()  # pruned runs must not be served from the cache
     log.info(
-        "run %s: repo=%s env=%s nodes=%s edges=%s (%d old run(s) pruned)",
+        "run %s: repo=%s env=%s status=%s nodes=%s edges=%s (%d old run(s) pruned)",
         run_id,
         repo["id"],
         env["env"] if env else "-",
+        run["status"] if run else "?",
         run["node_count"] if run else "?",
         run["edge_count"] if run else "?",
         pruned,
     )
+    if run and run["status"] == tfrepo.FAILED:
+        flash(
+            Markup(
+                'Analyze {0} failed: {1} — <a href="{2}">open run {3}</a> to see the repository'
+            ).format(label, run["reason"], url_for("run_view", run_id=run_id), run_id),
+            "error",
+        )
+        return run_id
     flash(
         Markup('Analyzed {0}: run {1} — <a href="{2}">open in the analyzer</a>').format(
             label, run_id, url_for("run_view", run_id=run_id)
@@ -427,6 +451,35 @@ def _analyze(repo: dict[str, Any], env: dict[str, Any] | None) -> int | None:
         "ok",
     )
     return run_id
+
+
+def _discover(repo: dict[str, Any], quiet: bool = False) -> None:
+    """Detect the repository's environments (flashes the outcome)."""
+    try:
+        with _write() as conn:
+            found = tfrepo.discover_envs(conn, repo)
+    except ValueError as exc:
+        if not quiet:
+            flash(f"Environments not detected: {exc}", "error")
+        return
+    except Exception:
+        log.exception("environment discovery of repo=%s failed", repo["id"])
+        flash("Environment detection failed. See the log for details.", "error")
+        return
+    log.info(
+        "environments of repo=%s: %d found, %d added, %d updated, %d gone",
+        repo["id"],
+        found.found,
+        found.added,
+        found.updated,
+        found.gone,
+    )
+    if found.added or found.updated or found.gone or not quiet:
+        flash(
+            f"Environments detected: {found.found} found ({found.added} new, "
+            f"{found.updated} updated, {found.gone} no longer found)",
+            "ok",
+        )
 
 
 def _sync(repo: dict[str, Any]) -> bool:
@@ -445,6 +498,7 @@ def _sync(repo: dict[str, Any]) -> bool:
     log.info("sync of repo=%s ok: commit %s", repo["id"], result.commit[:12] or "-")
     commit = f" at {result.commit[:12]}" if result.commit else ""
     flash(f"Synced {repo['name']}{commit} ({result.detail})", "ok")
+    _discover(repo, quiet=True)
     return True
 
 
@@ -646,6 +700,8 @@ def _register_managed(app: Flask) -> None:
         # Never the token; the URL has no credentials (refused by validate_git_url).
         log.info("repository added: id=%s source=%s auth=%s", repo_id, source, f.get("git_auth"))
         flash("Repository added", "ok")
+        if source == "local":  # a git repository is detected after its first Sync
+            _discover(_repo_or_404(repo_id), quiet=True)
         return redirect(url_for("settings_tfrepo", repo_id=repo_id))
 
     @app.get("/repos/<int:repo_id>")
@@ -720,6 +776,11 @@ def _register_managed(app: Flask) -> None:
         run_id = _analyze(repo, env)
         if run_id is not None and request.form.get("open") == "1":
             return redirect(url_for("run_view", run_id=run_id))
+        return redirect(url_for("settings_tfrepo", repo_id=repo_id))
+
+    @app.post("/repos/<int:repo_id>/discover")
+    def tfrepo_discover(repo_id: int):
+        _discover(_repo_or_404(repo_id))
         return redirect(url_for("settings_tfrepo", repo_id=repo_id))
 
     @app.post("/repos/<int:repo_id>/envs")
