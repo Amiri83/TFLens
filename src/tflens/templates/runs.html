@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Runs{% endblock %}
+{% block content %}
+<h1>Runs</h1>
+<form method="get" class="row card">
+  <div><label for="repo">Repository</label>
+    <select id="repo" name="repo" data-autosubmit>
+      <option value="">all</option>
+      {% for p in repos %}<option value="{{ p.id }}" {{ 'selected' if p.id == repo_id }}>{{ p.name }}</option>{% endfor %}
+    </select></div>
+  <noscript><div><button type="submit">Filter</button></div></noscript>
+</form>
+<p class="muted">Each run's <span class="mono">model.json</span> and <span class="mono">report.md</span> are
+  kept on disk under the data directory's <span class="mono">out/</span>; <b>Open</b> shows the run in the
+  analyzer (graph, repository tree, evidence), read-only.</p>
+{% include "_runs_table.html" %}
+{% endblock %}

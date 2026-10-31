@@ -10,6 +10,8 @@ header {
   padding: 6px 12px; background: #24292f; color: #f6f8fa;
 }
 header h1 { font-size: 15px; margin: 0; }
+header .home { color: #afb8c1; text-decoration: none; }
+header .home:hover { color: #fff; text-decoration: underline; }
 header h1 span { font-weight: normal; color: #afb8c1; }
 #summary { flex: 1; color: #afb8c1; font-size: 12px; }
 button { font: inherit; cursor: pointer; }

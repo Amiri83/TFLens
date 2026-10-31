@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}{{ repo.name }}{% endblock %}
+{% block content %}
+<p><a href="{{ url_for('tfrepos_page') }}" class="back-link">← Repos</a></p>
+<h1>{{ repo.name }}</h1>
+<p class="mono">{% if repo.source == 'git' %}{{ repo.url }}{% if repo.branch %} · {{ repo.branch }}{% endif %}{% else %}{{ repo.path }}{% endif %}{% if repo.subdir %} · {{ repo.subdir }}/{% endif %}</p>
+<p>
+  {% if repo.sync_status %}Last sync: <span class="badge {{ 'ok' if repo.sync_status == 'ok' else 'err' }}">{{ repo.sync_status }}</span>
+    {{ repo.synced_at | localtime }}{% if repo.sync_detail %} · <span class="muted">{{ repo.sync_detail }}</span>{% endif %}
+    {% if repo.commit_sha %} · commit <span class="mono">{{ repo.commit_sha[:12] }}</span>{% endif %}
+  {% else %}<span class="muted">Never synced.</span>{% endif %}
+  {% if repo.source == 'git' and not root_exists %}<span class="badge warn">not cloned yet: Sync first</span>{% endif %}
+</p>
+<form class="inline" method="post" action="{{ url_for('tfrepo_sync', repo_id=repo.id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">Sync</button>
+  <span class="muted small">{% if repo.source == 'git' %}shallow <span class="mono">git clone --depth 1</span> into
+    <span class="mono">{{ repo.path }}</span> (the only network call TFLens makes){% else %}checks the directory and reads its
+    git commit; nothing is written{% endif %}</span>
+</form>
+
+<h2>Environments</h2>
+<table class="envs">
+  <thead><tr><th>Environment</th><th>tfvars files</th><th>Extra variables</th><th></th></tr></thead>
+  <tbody>
+    <tr>
+      <td class="muted">(none)</td><td class="muted">no tfvars</td><td class="muted">none</td>
+      <td class="actions">
+        <form class="inline" method="post" action="{{ url_for('tfrepo_analyze', repo_id=repo.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="open" value="1">
+          <button type="submit">Analyze</button>
+        </form>
+      </td>
+    </tr>
+  {% for e in envs %}
+    <tr>
+      <td><b class="mono">{{ e.env }}</b></td>
+      <td class="mono small">{% for f in e.var_files %}<div>{{ f }}</div>{% else %}<span class="muted">none</span>{% endfor %}</td>
+      <td class="mono small">{% if e.extra_var_keys %}{{ e.extra_var_keys | join(', ') }} <span class="badge ok">encrypted</span>{% else %}<span class="muted">none</span>{% endif %}</td>
+      <td class="actions">
+        <form class="inline" method="post" action="{{ url_for('tfrepo_analyze', repo_id=repo.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="env_id" value="{{ e.id }}">
+          <input type="hidden" name="open" value="1">
+          <button type="submit">Analyze</button>
+        </form>
+        <form class="inline" method="post" action="{{ url_for('tfrepo_env_delete', repo_id=repo.id, env_id=e.id) }}"
+              data-confirm="Delete environment {{ e.env }}? Its runs stay in the history.">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit" class="danger">Delete</button>
+        </form>
+        <details class="env-edit small">
+          <summary>Edit</summary>
+          <form method="post" action="{{ url_for('tfrepo_env_save', repo_id=repo.id, env_id=e.id) }}" autocomplete="off">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <label for="env-{{ e.id }}">Name</label>
+            <input id="env-{{ e.id }}" name="env" value="{{ e.env }}" size="16" class="mono">
+            <label for="vf-{{ e.id }}">tfvars files (one per line)</label>
+            <textarea id="vf-{{ e.id }}" name="var_files" rows="2" cols="40" class="mono">{{ e.var_files | join('\n') }}</textarea>
+            <label for="xv-{{ e.id }}">Extra variables (KEY=VALUE lines)</label>
+            <textarea id="xv-{{ e.id }}" name="extra_vars" rows="3" cols="40" class="mono" spellcheck="false"
+                      placeholder="{{ 'stored: ' ~ (e.extra_var_keys | join(', ')) ~ ' (values never shown; leave empty to keep)' if e.extra_var_keys else 'region=us-east-1' }}"></textarea>
+            {% if e.extra_var_keys %}<label class="check"><input type="checkbox" name="extra_clear" value="1"> clear the stored variables</label>{% endif %}
+            <p><button type="submit">Save</button></p>
+          </form>
+        </details>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<section class="card" id="add-env">
+  <h2 style="margin-top: 0">Add an environment</h2>
+  <form method="post" action="{{ url_for('tfrepo_env_add', repo_id=repo.id) }}" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div><label for="env">Name</label><input id="env" name="env" size="16" class="mono" placeholder="dev"></div>
+      <div><label for="var_files">tfvars files (one per line, relative to the analyzed directory)</label>
+        <textarea id="var_files" name="var_files" rows="2" cols="40" class="mono" placeholder="envs/dev.tfvars"></textarea></div>
+      <div><label for="extra_vars">Extra variables (KEY=VALUE lines, like <span class="mono">-var</span>)</label>
+        <textarea id="extra_vars" name="extra_vars" rows="2" cols="40" class="mono" spellcheck="false" placeholder="region=us-east-1"></textarea></div>
+    </div>
+    <p class="muted small">Extra variable values are stored Fernet-encrypted; only their names are shown.</p>
+    <p><button type="submit">Add environment</button></p>
+  </form>
+</section>
+
+<h2>Recent runs</h2>
+{% include "_runs_table.html" %}
+<p><a href="{{ url_for('runs_page', repo=repo.id) }}">All runs of {{ repo.name }}</a></p>
+
+<section class="card" id="edit">
+  <h2 style="margin-top: 0">Edit</h2>
+  <form method="post" action="{{ url_for('tfrepo_save', repo_id=repo.id) }}" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="row">
+      <div><label for="name">Name</label><input id="name" name="name" value="{{ repo.name }}" size="24" maxlength="64"></div>
+      <div><label for="subdir">Sub-directory</label><input id="subdir" name="subdir" value="{{ repo.subdir }}" size="24" class="mono"></div>
+    </div>
+    {% if repo.source == 'git' %}
+      {% include "_git_fields.html" %}
+    {% else %}
+      <label for="path">Local directory</label>
+      <input id="path" name="path" value="{{ repo.path }}" size="60" class="mono">
+    {% endif %}
+    <p><button type="submit">Save</button></p>
+  </form>
+  <form method="post" action="{{ url_for('tfrepo_delete', repo_id=repo.id) }}"
+        data-confirm="Remove {{ repo.name }} and its environments? {{ 'Its clone is deleted; ' if repo.source == 'git' else 'The directory is not touched; ' }}runs stay in the history.">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit" class="danger">Remove repository</button>
+  </form>
+</section>
+{% endblock %}

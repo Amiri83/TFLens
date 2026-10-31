@@ -1,0 +1,28 @@
+{# Runs table (runs.html, tfrepo.html); `runs` from tfrepo.list_runs. #}
+<table class="runs">
+  <thead><tr><th>Run</th><th>When</th><th>Repository</th><th>Environment</th><th>Commit</th><th>Summary</th><th></th></tr></thead>
+  <tbody>
+  {% for r in runs %}
+    {% set s = r.summary %}
+    <tr>
+      <td><a href="{{ url_for('run_view', run_id=r.id) }}"><b>{{ r.id }}</b></a></td>
+      <td>{{ r.ts | localtime }}</td>
+      <td>{% if r.repo_id %}<a href="{{ url_for('settings_tfrepo', repo_id=r.repo_id) }}">{{ r.repo }}</a>{% else %}{{ r.repo }} <span class="muted small">(removed)</span>{% endif %}</td>
+      <td class="mono">{{ r.env or '—' }}</td>
+      <td class="mono small">{{ r.commit_sha[:12] if r.commit_sha else '—' }}</td>
+      <td class="small counts"><span>{{ s.files or 0 }} files</span><span>{{ r.node_count }} nodes</span><span>{{ r.edge_count }} edges</span>
+        <span>{{ s.unknowns or 0 }} unknowns</span>{% if s.parse_errors %}<span class="badge warn">{{ s.parse_errors }} parse errors</span>{% endif %}</td>
+      <td class="actions">
+        <a class="btn" href="{{ url_for('run_view', run_id=r.id) }}">Open</a>
+        <form class="inline" method="post" action="{{ url_for('run_delete', run_id=r.id) }}" data-confirm="Delete run {{ r.id }} and its files?">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="next" value="{{ request.full_path.rstrip('?') }}">
+          <button type="submit" class="danger">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="7" class="muted">No runs yet: Analyze a repository.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>

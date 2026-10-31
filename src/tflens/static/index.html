@@ -4,10 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TFLens</title>
-  <link rel="stylesheet" href="static/app.css">
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+  <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
   <header>
+    <a id="home" class="home hidden" href="/runs">&larr; Runs</a>
     <h1>TFLens <span id="title"></span></h1>
     <nav>
       <button type="button" class="tab active" data-view="graph">Graph</button>
@@ -40,7 +42,7 @@
       <p class="muted">Click a node or an edge to see its evidence.</p>
     </aside>
   </main>
-  <script src="static/vendor/cytoscape.min.js"></script>
-  <script src="static/app.js"></script>
+  <script src="/static/vendor/cytoscape.min.js"></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>

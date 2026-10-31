@@ -41,6 +41,31 @@ class Model:
         return [u for u in self.data["unknowns"] if u["subject"] == subject]
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """Never touch the real ~/.tflens: HOME and TFLENS_HOME point into a temp dir."""
+    user_home = tmp_path_factory.mktemp("user-home")
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.delenv("TFLENS_HOME", raising=False)
+    monkeypatch.delenv("TFLENS_SECRET_KEY", raising=False)
+    return user_home
+
+
+@pytest.fixture
+def home(tmp_path):
+    """A TFLens data directory (not created yet)."""
+    return tmp_path / "tflens-home"
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    from tflens.db import init_db
+
+    path = tmp_path / "tflens.db"
+    init_db(path)
+    return path
+
+
 @pytest.fixture
 def load():
     def _load(name: str) -> Model:

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Repos{% endblock %}
+{% block content %}
+<h1>Terraform repositories</h1>
+<p class="muted">A repository is a local directory (analyzed in place, never written to) or a git URL
+  that <b>Sync</b> shallow-clones into the data directory. Each one has environments (tfvars files and
+  extra <span class="mono">-var</span> values); <b>Analyze</b> runs the static analyzer and records a run
+  you can open in the analyzer.</p>
+<table class="tf-repos">
+  <thead><tr><th>Repository</th><th>Source</th><th>Environments</th><th>Last sync</th><th>Runs</th><th></th></tr></thead>
+  <tbody>
+  {% for p in repos %}
+    <tr>
+      <td><a href="{{ url_for('settings_tfrepo', repo_id=p.id) }}"><b>{{ p.name }}</b></a>
+        {% if p.subdir %}<div class="muted small mono">{{ p.subdir }}/</div>{% endif %}</td>
+      <td class="mono small">{% if p.source == 'git' %}{{ p.url }}{% if p.branch %} <span class="badge">{{ p.branch }}</span>{% endif %}{% else %}{{ p.path }}{% endif %}</td>
+      <td>{{ p.envs }}</td>
+      <td>{% if p.sync_status %}<span class="badge {{ 'ok' if p.sync_status == 'ok' else 'err' }}">{{ p.sync_status }}</span>
+          <div class="small">{{ p.synced_at | localtime }}</div>
+          {% if p.commit_sha %}<div class="mono small muted">{{ p.commit_sha[:12] }}</div>{% endif %}
+        {% else %}<span class="muted">never</span>{% endif %}</td>
+      <td>{% if p.runs %}<a href="{{ url_for('runs_page', repo=p.id) }}">{{ p.runs }}</a>
+          <div class="small">{{ p.last_run | localtime }}</div>{% else %}<span class="muted">none</span>{% endif %}</td>
+      <td class="actions">
+        <form class="inline" method="post" action="{{ url_for('tfrepo_sync', repo_id=p.id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="next" value="{{ url_for('tfrepos_page') }}">
+          <button type="submit" class="secondary" title="{{ 'Shallow clone (network)' if p.source == 'git' else 'Check the directory (no network)' }}">Sync</button>
+        </form>
+        <a class="btn secondary" href="{{ url_for('settings_tfrepo', repo_id=p.id) }}">Open</a>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="muted">No repositories yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<section class="card" id="add">
+  <h2 style="margin-top: 0">Add a repository</h2>
+  <form method="post" action="{{ url_for('tfrepo_add') }}" autocomplete="off">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    {% for key, label in sources.items() %}
+      <label class="check"><input type="radio" name="source" value="{{ key }}" data-show-group="source"
+        {{ 'checked' if key == 'local' }}> {{ label }}</label>
+    {% endfor %}
+    <div class="row">
+      <div><label for="name">Name <span class="muted">(optional)</span></label>
+        <input id="name" name="name" size="24" maxlength="64" placeholder="repo-a"></div>
+      <div><label for="subdir">Sub-directory <span class="muted">(optional)</span></label>
+        <input id="subdir" name="subdir" size="24" class="mono" placeholder="envs/root-a"></div>
+    </div>
+    <fieldset data-group="source" data-mode="local">
+      <label for="path">Local directory (absolute path)</label>
+      <input id="path" name="path" size="60" class="mono" placeholder="/path/to/repo-a">
+    </fieldset>
+    <fieldset data-group="source" data-mode="git">
+      {% include "_git_fields.html" %}
+    </fieldset>
+    <p><button type="submit">Add</button></p>
+  </form>
+</section>
+{% endblock %}

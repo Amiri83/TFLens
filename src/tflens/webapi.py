@@ -62,9 +62,16 @@ def default_model_path(root: Path) -> Path:
     return root / "tflens-out" / "model.json"
 
 
+class ModelUnavailable(RuntimeError):
+    """A read-only store's model.json is missing or unusable."""
+
+
 class ModelStore:
     """Holds the current model; re-reads model.json when it changes on disk and
-    regenerates it from the repository when it is missing or unusable."""
+    regenerates it from the repository when it is missing or unusable.
+
+    A ``readonly`` store (a recorded run) never regenerates or writes anything: a
+    missing / unusable model.json raises :class:`ModelUnavailable`."""
 
     def __init__(
         self,
@@ -72,8 +79,13 @@ class ModelStore:
         model_path: Path | None = None,
         var_files: list[str] | None = None,
         cli_vars: dict[str, str] | None = None,
+        *,
+        readonly: bool = False,
+        title: str = "",
     ) -> None:
         self.root = root.resolve()
+        self.readonly = readonly
+        self.title = title or self.root.name
         self.model_path = model_path or default_model_path(self.root)
         self.var_files = var_files or []
         self.cli_vars = cli_vars or {}
@@ -91,11 +103,15 @@ class ModelStore:
                 return self._model
             loaded = self._read() if mtime is not None else None
             if loaded is None:
+                if self.readonly:
+                    raise ModelUnavailable(f"model {self.model_path} is missing or unusable")
                 return self.regenerate()
             self._set(loaded, mtime, generated=False)
             return loaded
 
     def regenerate(self) -> dict[str, Any]:
+        if self.readonly:
+            raise ModelUnavailable("a recorded run cannot be regenerated")
         with self._lock:
             model = run_analysis(self.root, self.var_files, self.cli_vars).model
             try:
@@ -529,7 +545,7 @@ def file_detail(model: dict[str, Any], path: str) -> dict[str, Any] | None:
 
 def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
     out = {
-        "title": store.root.name if store else "",
+        "title": store.title if store else "",
         "summary": model["summary"],
         "roots": model["roots"],
         "parse_errors": model["parse_errors"],
@@ -540,6 +556,7 @@ def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict
         out["model_path"] = str(store.model_path)
         out["generated"] = store.generated
         out["note"] = store.note
+        out["readonly"] = store.readonly
     return out
 
 
@@ -573,6 +590,8 @@ class Api:
         query = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
         if method == "POST":
             if path == "/api/regenerate":
+                if self.store.readonly:
+                    return json_response({"error": "a recorded run is read-only"}, 405)
                 return json_response(summary_view(self.store.regenerate(), self.store))
             return _not_found(path) if path.startswith("/api/") else _method_not_allowed()
         if method not in ("GET", "HEAD"):
@@ -583,7 +602,10 @@ class Api:
             return static_file(path[len("/static/") :])
         if not path.startswith("/api/"):
             return _not_found(path)
-        return self._api(path, query)
+        try:
+            return self._api(path, query)
+        except ModelUnavailable as exc:
+            return json_response({"error": "model unavailable", "detail": str(exc)}, 404)
 
     def _api(self, path: str, query: dict[str, str]) -> Response:
         model = self.store.model()
@@ -603,7 +625,7 @@ class Api:
                 ]
             )
         if path == "/api/tree":
-            return json_response(repo_tree(model, self.store.root.name))
+            return json_response(repo_tree(model, self.store.title))
         if path == "/api/node":
             detail = node_detail(model, query.get("id", ""), self.store.lines)
             return json_response(detail) if detail else _not_found(f"node {query.get('id')!r}")

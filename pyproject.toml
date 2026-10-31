@@ -11,6 +11,10 @@ requires-python = ">=3.10"
 license = { text = "Proprietary" }
 dependencies = [
     "python-hcl2>=4.3",
+    # tflens serve: web UI, WSGI server, encryption of stored secrets
+    "flask>=3.0",
+    "waitress>=3.0",
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
@@ -26,7 +30,14 @@ tflens = "tflens.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-tflens = ["static/*.html", "static/*.css", "static/*.js", "static/vendor/*"]
+tflens = [
+    "static/*.html",
+    "static/*.css",
+    "static/*.js",
+    "static/*.svg",
+    "static/vendor/*",
+    "templates/*.html",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

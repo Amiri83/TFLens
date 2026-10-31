@@ -1,5 +1,6 @@
 /* TFLens web UI: graph (Cytoscape, vendored), repository tree, detail panel.
-   All data comes from the local /api/* endpoints; no external requests. */
+   All data comes from the local api/* endpoints next to this page (/api/* for
+   `tflens serve --dir`, /runs/<id>/api/* for a recorded run); no external requests. */
 "use strict";
 
 (function () {
@@ -78,7 +79,7 @@
     const panel = document.getElementById("detail");
     let d;
     try {
-      d = await api(`/api/${type}?id=${encodeURIComponent(id)}`);
+      d = await api(`api/${type}?id=${encodeURIComponent(id)}`);
     } catch (err) {
       panel.replaceChildren(el("p", { class: "muted" }, `${type} ${id}: ${err.message}`));
       return;
@@ -394,7 +395,7 @@
       a.classList.toggle("active", a.dataset.path === path);
     }
     const box = document.getElementById("file");
-    const d = await api(`/api/file?path=${encodeURIComponent(path)}`);
+    const d = await api(`api/file?path=${encodeURIComponent(path)}`);
     const parts = [el("h2", {}, d.path)];
     if (d.modules.length) parts.push(el("p", { class: "muted" }, `Module instances: ${d.modules.join(", ")}`));
     if (!d.resources.length) {
@@ -420,8 +421,11 @@
 
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree] = await Promise.all([api("/api/summary"), api("/api/graph"), api("/api/tree")]);
+    const [summary, graph, tree] = await Promise.all([api("api/summary"), api("api/graph"), api("api/tree")]);
     document.getElementById("title").textContent = summary.title;
+    // a recorded run (managed mode) is read-only: no Regenerate, a way back to the runs
+    document.getElementById("regenerate").classList.toggle("hidden", Boolean(summary.readonly));
+    document.getElementById("home").classList.toggle("hidden", !location.pathname.startsWith("/runs/"));
     const s = summary.summary;
     const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
     const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
@@ -446,7 +450,7 @@
     regen.addEventListener("click", async () => {
       regen.disabled = true;
       try {
-        await api("/api/regenerate", { method: "POST", headers: { "X-TFLens": "1" } });
+        await api("api/regenerate", { method: "POST", headers: { "X-TFLens": "1" } });
         await loadAll();
       } finally {
         regen.disabled = false;
