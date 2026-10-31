@@ -19,6 +19,7 @@ from tflens.shapes import (
     build_root_view,
     build_shapes,
     classify_root,
+    default_root,
     render_shapes_markdown,
     root_model,
 )
@@ -366,7 +367,7 @@ def test_shapes_and_root_view_api(tmp_path):
     api = _api(tmp_path)
     shapes = json.loads(api.handle("GET", "/api/shapes").body)
     assert shapes["mixed"] and len(shapes["groups"]) == 4
-    assert shapes["default_root"] == "modules/naming"
+    assert shapes["default_root"] == "services/app"
     v = json.loads(api.handle("GET", "/api/root-view?root=stacks/network").body)
     assert v["view"] == "network" and v["shape"]["shape"] == "network"
     v = json.loads(api.handle("GET", "/api/root-view?root=stacks/network&view=catalog").body)
@@ -409,6 +410,36 @@ def test_root_view_is_the_landing_tab_with_switchers(tmp_path):
     assert 'flowParts(d.flow, "rv", `&root=${encodeURIComponent(root)}`)' in js
     css = api.handle("GET", "/static/app.css").body.decode()
     assert "#roots .diagram img { display: block; max-width: none;" in css
+
+
+@pytest.mark.parametrize(
+    ("fixture", "expected"),
+    [
+        ("mixed", "services/app"),  # app wins over library / network / platform listed first
+        ("app_pipeline", "."),
+        ("platform_bootstrap", "."),
+        ("network", "."),
+        ("module_library", "modules/queue"),  # the first library root
+    ],
+)
+def test_default_root_per_fixture(fixture, expected):
+    assert build_shapes(_model(fixture))["default_root"] == expected
+
+
+@pytest.mark.parametrize(
+    ("shapes", "expected"),
+    [
+        (["library", "network", "platform", "app", "app"], "r3"),
+        (["library", "network", "platform", "platform"], "r2"),
+        (["other", "library", "network", "network"], "r2"),
+        (["other", "library", "library"], "r1"),
+        (["other", "other"], "r0"),
+        ([], None),
+    ],
+)
+def test_default_root_priority(shapes, expected):
+    roots = [{"dir": f"r{i}", "shape": s} for i, s in enumerate(shapes)]
+    assert default_root(roots) == expected
 
 
 def test_classify_root_handles_a_root_missing_from_the_model():

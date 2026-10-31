@@ -450,8 +450,18 @@ def build_shapes(model: dict[str, Any]) -> dict[str, Any]:
         "groups": groups,
         "mixed": len(groups) > 1,
         "lines": lines,
-        "default_root": roots[0]["dir"] if roots else None,
+        "default_root": default_root(roots),
     }
+
+
+def default_root(roots: list[dict[str, Any]]) -> str | None:
+    """The root the Root view opens on: the first app / pipeline root, else the first
+    platform, network, then module library root (SHAPE_ORDER); "other" roots last."""
+    for shape in SHAPE_ORDER:
+        for r in roots:
+            if r["shape"] == shape:
+                return r["dir"]
+    return None
 
 
 def render_shapes_markdown(shapes: dict[str, Any], level: int = 1) -> str:
