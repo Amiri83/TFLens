@@ -93,4 +93,29 @@ table.inventory { margin: 4px 0 12px; max-width: 720px; }
 /* natural size: never shrink the SVG to the panel; the viewport scrolls instead */
 #diagrams .diagram img { display: block; max-width: none; height: auto; cursor: zoom-in; }
 details.drilldown { border: 1px solid #d0d7de; border-radius: 6px; padding: 4px 10px; margin: 6px 0; }
+#flow { padding: 12px 16px; overflow: auto; height: 100%; }
+#flow .start-here { margin: 0 0 14px; padding: 8px 12px; background: #ddf4ff; border: 1px solid #54aeff; border-radius: 6px; }
+#flow .start-here h2 { margin-top: 0; }
+#flow .flow-metrics { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 12px; }
+#flow .flow-metrics span { padding: 2px 8px; background: #fff; border: 1px solid #d0d7de; border-radius: 12px; }
+#flow .flow-metrics .warn { border-color: #d4a72c; color: #9a6700; }
+#flow h2.flow-title { margin-top: 20px; padding-top: 8px; border-top: 1px solid #d0d7de; font-size: 15px; }
+#flow ol.flow-steps { padding-left: 28px; margin: 4px 0 8px; font-size: 14px; }
+#flow ol.flow-steps li { padding: 2px 0; }
+#flow ol.flow-steps .link { font-family: ui-monospace, monospace; font-size: 12px; }
+#flow .st-unverified { color: #9a6700; }
+#flow .st-iam_only { color: #57606a; }
+#flow ul.flow-side { margin: 2px 0 8px; padding-left: 28px; color: #57606a; }
+#flow details.all-resources { margin-top: 24px; border: 1px solid #d0d7de; border-radius: 6px; padding: 4px 10px; background: #fff; }
+#flow details.all-resources > summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+#flow .diagram-panel { margin-bottom: 10px; }
+#flow .diagram-toolbar { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
+#flow .diagram-toolbar button { min-width: 28px; padding: 1px 8px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; color: #1f2328; }
+#flow .diagram-scale { min-width: 4em; font-size: 12px; }
+#flow .diagram { overflow: auto; max-height: 70vh; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; }
+#flow .diagram-sizer { overflow: hidden; }
+#flow .diagram-zoom { width: max-content; transform-origin: 0 0; }
+/* natural size (fonts >= 14px): the viewport scrolls left to right instead of shrinking */
+#flow .diagram img { display: block; max-width: none; height: auto; cursor: zoom-in; }
+details.all-resources-ov > summary { cursor: pointer; font-weight: 600; font-size: 14px; }
 details.drilldown > summary { cursor: pointer; font-weight: 600; }

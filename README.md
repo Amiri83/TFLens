@@ -64,7 +64,21 @@ Nothing has to be configured before a first analysis:
   and Terragrunt layouts (`live/<env>/...`, `env.hcl`). In the managed app they
   are created automatically (on add / Sync / **Detect environments**), bound to
   their root, and can be edited; an edited environment is never overwritten.
-- **Overview** (the analyzer's first tab, `overview.md` of each run): what the
+- **Flow** (the analyzer's first tab, the `## Flows` section of `handoff.md`): how
+  data moves, entry point to sink. Entry points are the declared triggers nothing in
+  the repository writes to (Kafka / MSK / SQS / Kinesis / DynamoDB event source
+  mappings, SNS subscriptions, S3 notifications, EventBridge rules, API Gateway
+  integrations, load balancer listeners → target groups → ECS services). A compute
+  **sends to** / **reads from** a queue, topic, table, bucket, stream or secret when it
+  has both a reference to it (environment variable, ECS container `environment` /
+  `secrets`) and an IAM write / read action on it; a reference alone is *unverified*,
+  an IAM grant alone *can write* / *can read*. Each chain is numbered, every step with
+  the `file:line` of each piece of evidence, and drawn left to right (fonts ≥ 14px, the
+  panel scrolls). Dead-letter queues, alarms and log groups are side branches. A
+  *Start here* box lists the root, the entry files and the modules / files in flow
+  order; the metrics (flows, steps, unverified links) are in the header. The resource
+  inventory follows, collapsed under *All resources*.
+- **Overview** (the analyzer's second tab, `overview.md` of each run): what the
   repository deploys and, per root, backend, providers, modules, resources by
   service, the top ACCESS / TRIGGER / NETWORK relationships and the unknowns.
   Every line links to its `file:line`.
@@ -129,7 +143,7 @@ same repository and environment, or any other run: added / removed / changed res
 first), environments, backends and files. Runs recorded before snapshots existed are
 back-filled from their `model.json`.
 
-Every run also writes `handoff.md` (overview + the three diagrams as Mermaid + the
+Every run also writes `handoff.md` (flows + overview + the three diagrams as Mermaid + the
 changes since the previous run) and `diagrams/` next to its `model.json`; both can be
 downloaded from the Runs table. `handoff.md` is meant to be given to Claude Code as
 context (`@handoff.md`).
@@ -250,11 +264,15 @@ Edge kinds:
 - **ACCESS**: IAM action → resource, from identity policies (role/user/group,
   inline or attached) and resource policies (trust, bucket, queue, topic,
   endpoint, lambda permission). Access granted to a role is also attributed to
-  the Lambda functions and EC2 instances (via instance profile) that run as it.
-- **TRIGGER**: event source mappings, SNS subscriptions, S3 notifications.
+  the Lambda functions, EC2 instances (via instance profile) and ECS services (via
+  task definition and task role) that run as it.
+- **TRIGGER**: event source mappings (self-managed Kafka topics included), SNS
+  subscriptions, S3 notifications, EventBridge rule targets, API Gateway
+  integrations, load balancer listener → target group → ECS service / attachment.
 - **NETWORK**: security group ingress/egress rules, SG membership, VPC endpoints.
 - **CONFIG**: attribute references between resources, including Lambda
-  environment variables.
+  environment variables and ECS container environment / secrets (each pointing at
+  the line that sets the variable).
 - **RUNS_ON**: instance → AMI, Lambda → runtime or container image.
 
 ## model.json

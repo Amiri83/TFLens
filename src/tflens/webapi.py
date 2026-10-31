@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .flow import build_flows, chain_svg
 from .model import EDGE_KINDS, SCHEMA_VERSION
 from .output import dumps, run_analysis
 from .overview import build_overview
@@ -610,6 +611,7 @@ def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict
         "status": disc.get("status", "ok"),
         "reason": disc.get("reason", ""),
         "skipped": disc.get("skipped", []),
+        "flow": build_flows(model)["metrics"],
     }
     if store is not None:
         out["model_path"] = str(store.model_path)
@@ -687,8 +689,16 @@ class Api:
             return json_response(repo_tree(model, self.store.title))
         if path == "/api/overview":
             return json_response(build_overview(model, self.store.title, self.store.lines))
+        if path == "/api/flow":
+            return json_response(build_flows(model))
         if path == "/api/diagram":
             name, fmt = query.get("name", ""), query.get("format", "svg")
+            if name.startswith("flow-") and fmt == "svg":
+                # one chain of the Flow view (not exported: it is built from the model)
+                body = chain_svg(model, name, self.store.title)
+                if body is None:
+                    return _not_found(f"flow diagram {name!r}")
+                return _download(body, "image/svg+xml; charset=utf-8", f"{name}.svg", query)
             if name not in DIAGRAMS or fmt not in ("svg", "mmd"):
                 return _not_found(f"diagram {name!r} ({fmt})")
             if fmt == "mmd":

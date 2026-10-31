@@ -1,4 +1,5 @@
-/* TFLens web UI: graph (Cytoscape, vendored), repository tree, detail panel.
+/* TFLens web UI: flow (the landing view), overview, graph (Cytoscape, vendored),
+   diagrams, repository tree, detail panel.
    All data comes from the local api/* endpoints next to this page (/api/* for
    `tflens serve --dir`, /runs/<id>/api/* for a recorded run); no external requests. */
 "use strict";
@@ -65,7 +66,7 @@
   }
 
   // ------------------------------------------------------------ views
-  const VIEWS = ["overview", "graph", "repo", "diagrams"];
+  const VIEWS = ["flow", "overview", "graph", "repo", "diagrams"];
   let graphFitted = false; // the graph is laid out while hidden: fit it when first shown
 
   function setView(view) {
@@ -150,10 +151,8 @@
       }
     });
     if (ov.resources && ov.resources.length) {
-      toc.push(["ov-res", "Resources"]);
-      parts.push(el("h2", { id: "ov-res" }, "Resources"),
-        el("p", { class: "muted" }, "What each resource is, what triggers it, what it can access and what accesses it."),
-        ...ov.resources.map(drilldown));
+      toc.push(["ov-res", "All resources"]);
+      parts.push(allResources(ov, "all-resources-ov", "ov-res", false));
     }
     if (ov.environments.length) {
       toc.push(["ov-envs", "Environments"]);
@@ -182,6 +181,65 @@
     box.replaceChildren(...parts);
     document.getElementById("toc").replaceChildren(...toc.map(([id, label]) =>
       el("a", { class: "file link", onclick: () => document.getElementById(id).scrollIntoView() }, label)));
+  }
+
+  // The resource inventory, collapsed: the flows come first.
+  function allResources(ov, cls, id, withSummary) {
+    const res = ov.resources || [];
+    const parts = [el("summary", {}, `All resources (${res.length})`)];
+    if (withSummary) parts.push(el("h3", {}, "What this repository deploys"), overviewList(ov.summary));
+    parts.push(el("p", { class: "muted" }, "What each resource is, what triggers it, what it can access and what accesses it."),
+      ...res.map(drilldown));
+    return el("details", { class: cls, id }, ...parts);
+  }
+
+  // ------------------------------------------------------------ flow (the landing view)
+  function flowStep(s) {
+    const parts = [s.summary, " ("];
+    s.evidence.forEach((ev, i) => {
+      if (i) parts.push(" + ");
+      parts.push(ev.what, " ", locLink(ev.location) || "?");
+    });
+    if (s.note) parts.push(`; ${s.note}`);
+    parts.push(")");
+    return el("li", { value: s.n, class: s.status ? `st-${s.status}` : "", "data-step": s.n }, ...parts);
+  }
+
+  function renderFlow(fl, ov) {
+    const box = document.getElementById("flow");
+    const m = fl.metrics;
+    const toc = [["fl-start", "Start here"]];
+    const parts = [
+      el("div", { class: "start-here", id: "fl-start" },
+        el("h2", {}, "Start here"), overviewList(fl.start_here)),
+      el("div", { class: "flow-metrics", id: "flow-metrics" },
+        el("span", {}, `${m.flows} flows found`),
+        el("span", {}, `${m.steps} steps`),
+        el("span", { class: m.unverified ? "warn" : "" }, `${m.unverified} unverified links`),
+        el("span", {}, `${m.iam_only} IAM-only (can write / can read)`)),
+    ];
+    if (!fl.chains.length) {
+      parts.push(el("p", { class: "muted" },
+        "No flows found: no trigger, subscription, notification, rule, API or load balancer is declared for the code here."));
+    }
+    for (const c of fl.chains) {
+      const id = `fl-${c.id}`;
+      toc.push([id, `Flow ${c.n}: ${c.entry_label}`]);
+      parts.push(el("h2", { id, class: "flow-title" }, `Flow ${c.n}: ${c.title}`),
+        el("p", { class: "muted" }, `Entry point: ${c.entry_label} (${c.entry_kind}). `,
+          el("a", { class: "link", href: `api/diagram?name=${c.id}&format=svg&download=1`, download: `${c.id}.svg` }, "SVG")),
+        diagramPanel(c.id, `Flow ${c.n}`),
+        el("ol", { class: "flow-steps" }, ...c.steps.map(flowStep)));
+      if (c.side.length) {
+        parts.push(el("h3", {}, "Side branches (dead-letter queues, alarms, logs)"),
+          el("ul", { class: "flow-side" }, ...c.side.map((s) => el("li", {}, s.text, " ", locLink(s.location)))));
+      }
+    }
+    toc.push(["fl-all", "All resources"]);
+    parts.push(allResources(ov, "all-resources", "fl-all", true));
+    box.replaceChildren(...parts);
+    document.getElementById("flow-toc").replaceChildren(...toc.map(([tid, label]) =>
+      el("a", { class: "file link", onclick: () => document.getElementById(tid).scrollIntoView() }, label)));
   }
 
   function inventoryTable(inv) {
@@ -657,9 +715,10 @@
 
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree, ov] = await Promise.all(
-      [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview")]);
+    const [summary, graph, tree, ov, fl] = await Promise.all(
+      [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview"), api("api/flow")]);
     renderOverview(ov);
+    renderFlow(fl, ov);
     renderFailure(summary, ov);
     document.getElementById("title").textContent = summary.title;
     // a recorded run (managed mode) is read-only: no Regenerate, a way back to the runs
@@ -671,7 +730,9 @@
     const s = summary.summary;
     const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
     const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
+    const f = summary.flow;
     document.getElementById("summary").textContent =
+      `${f.flows} flows · ${f.steps} steps · ${f.unverified} unverified links · ` +
       `${s.files} files · ${s.modules} modules · ${nodes} nodes · edges: ${edges} · ` +
       `${s.unknowns} unknowns · ${s.parse_errors} parse errors`;
     document.getElementById("tree").replaceChildren(treeNode(tree));
