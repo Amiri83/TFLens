@@ -8,18 +8,20 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
 from conftest import FIXTURES
 
-from tflens import tfrepo
+from tflens import tfrepo, visuals
 from tflens.cli import main
 from tflens.db import SCHEMA_VERSION, closing, init_db, schema_version
 from tflens.handoff import render_handoff
 from tflens.output import listing_text, run_analysis
 from tflens.overview import build_overview, purpose_text, render_overview_markdown
+from tflens.report import render_report
 from tflens.snapshots import (
     TABLES,
     diff_runs,
@@ -35,6 +37,7 @@ from tflens.visuals import (
     export_diagrams,
     mermaid,
     module_tree,
+    png_renderer,
     svg,
     validate_mermaid,
 )
@@ -421,6 +424,54 @@ def test_every_overview_line_links_to_file_line(name):
     assert md == render_overview_markdown(build_overview(a.model, "repo-a", a.repo.lines))
 
 
+def _section(md: str, heading: str) -> str:
+    """The body of a Markdown section, up to the next heading of any level."""
+    body = md.split(f"\n{heading}\n", 1)[1]
+    return re.split(r"\n#+ ", body, maxsplit=1)[0].strip()
+
+
+@pytest.mark.parametrize("name", ANALYZABLE)
+def test_report_and_overview_share_the_structure_section(name):
+    a = run_analysis(FIXTURES / name)
+    overview = _section(
+        render_overview_markdown(build_overview(a.model, "repo-a", a.repo.lines)), "## Structure"
+    )
+    report = _section(render_report(a.model, "repo-a", a.repo.lines), "### Structure")
+    assert overview and overview == report
+
+
+def test_structure_section_explains_terragrunt_units():
+    a = run_analysis(FIXTURES / "terragrunt_only")
+    report = _section(render_report(a.model, "repo-a", a.repo.lines), "### Structure")
+    assert "- live/dev/app/ — Terragrunt unit, deployable (`live/dev/app/terragrunt.hcl:1-17`)" in (
+        report
+    )
+    assert "  - backend: s3 (terragrunt remote_state" in report
+    assert (
+        "  - module terraform.source: registry tfr:///terraform-aws-modules/lambda/aws"
+        "?version=7.2.0 @ 7.2.0; not analyzed:" in report
+    )
+    assert report.count("  - not analyzed: terraform.source ") == 4  # why each unit was skipped
+
+
+def test_python_dash_m_tflens_runs_the_cli(tmp_path):
+    out = tmp_path / "model.json"
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")}
+    proc = subprocess.run(
+        [sys.executable, "-m", "tflens", "--dir", str(FIXTURES / "lambda"), "--out", str(out)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(out.read_text())["nodes"]
+    help_text = subprocess.run(
+        [sys.executable, "-m", "tflens", "--help"], capture_output=True, text=True, env=env
+    ).stdout
+    assert help_text.startswith("usage: tflens")
+
+
 # -- 6. visuals ------------------------------------------------------------------------------------
 
 
@@ -448,8 +499,72 @@ def test_visual_exporters_produce_valid_mmd_and_svg(name, tmp_path):
     for diagram in DIAGRAMS:
         assert (tmp_path / "d" / f"{diagram}.mmd").read_text() == mermaid(m, diagram)
         _check_svg((tmp_path / "d" / f"{diagram}.svg").read_text())
-    assert out["files"][:6] == [f"{d}.{x}" for d in DIAGRAMS for x in ("mmd", "svg")]
-    assert out["png"]  # either the renderer used or why there is no PNG
+    # whatever is installed here: a .png per diagram iff an offline renderer exists
+    pngs = [f for f in out["files"] if f.endswith(".png")]
+    assert [f for f in out["files"] if not f.endswith(".png")] == [
+        f"{d}.{x}" for d in DIAGRAMS for x in ("mmd", "svg")
+    ]
+    if png_renderer() is None:
+        assert pngs == [] and out["png"].startswith("PNG not produced")
+    else:
+        assert pngs == [f"{d}.png" for d in DIAGRAMS] or "failed" in out["png"]
+
+
+def test_visual_exporter_without_png_renderer(tmp_path, monkeypatch):
+    monkeypatch.setattr(visuals, "png_renderer", lambda: None)
+    m = run_analysis(FIXTURES / "app_flows", git=False).model
+    out = export_diagrams(m, tmp_path / "d", "repo-a")
+    assert out["files"] == [f"{d}.{x}" for d in DIAGRAMS for x in ("mmd", "svg")]
+    assert not list((tmp_path / "d").glob("*.png"))
+    assert out["png"] == (
+        "PNG not produced: no offline SVG renderer (rsvg-convert, cairosvg or inkscape) "
+        "is installed; the SVG files are complete"
+    )
+
+
+def test_visual_exporter_with_png_renderer(tmp_path, monkeypatch):
+    rendered = []
+
+    def fake_png(svg_path, png_path, renderer):
+        assert renderer == "fake-renderer" and svg_path.exists()
+        png_path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        rendered.append(png_path.name)
+
+    monkeypatch.setattr(visuals, "png_renderer", lambda: "fake-renderer")
+    monkeypatch.setattr(visuals, "_png", fake_png)
+    m = run_analysis(FIXTURES / "app_flows", git=False).model
+    out = export_diagrams(m, tmp_path / "d", "repo-a")
+    assert out["files"] == [f"{d}.{x}" for d in DIAGRAMS for x in ("mmd", "svg", "png")]
+    assert rendered == [f"{d}.png" for d in DIAGRAMS]
+    assert out["png"] == "PNG rendered with fake-renderer"
+
+
+def _label_boxes(root: ET.Element) -> list[tuple[str, float, float, float, float]]:
+    """(text, left, right, top, bottom) of the architecture edge labels (9px, centered)."""
+    boxes = []
+    for t in root.iter(f"{SVG_NS}text"):
+        if t.get("font-size") == "9" and t.get("text-anchor") == "middle":
+            x, y, w = float(t.get("x")), float(t.get("y")), len(t.text) * 6.6 * 9 / 11
+            boxes.append((t.text, x - w / 2, x + w / 2, y - 9, y + 2))
+    return boxes
+
+
+def test_architecture_svg_fits_and_parallel_labels_do_not_overlap():
+    m = run_analysis(FIXTURES / "app_flows").model
+    root = _check_svg(svg(m, "architecture", "repo-a"))
+    assert "max-width:100%" in root.get("style")  # scales down to its panel
+    width = float(root.get("width"))
+    boxes = _label_boxes(root)
+    # app_flows has two parallel pairs: jobs <-> worker and uploads <-> ingest
+    assert len(boxes) == 5
+    for i, a in enumerate(boxes):
+        assert a[1] >= 0 and a[2] <= width, a  # never clipped by the drawing's edge
+        for b in boxes[i + 1 :]:
+            overlap = a[1] < b[2] and b[1] < a[2] and a[3] < b[4] and b[3] < a[4]
+            assert not overlap, (a, b)
+    # the two edges of a parallel pair are drawn as distinct curves
+    paths = [p.get("d") for p in root.iter(f"{SVG_NS}path") if p.get("marker-end")]
+    assert len(paths) == len(set(paths)) == 5
 
 
 def test_architecture_view_flows_and_icons():

@@ -47,6 +47,7 @@ COMPUTE_TYPES = frozenset(
 FONT = "Helvetica, Arial, sans-serif"
 CHAR_W = 6.6  # average glyph width at 11px, for layout only
 MAX_LABEL = 30
+LABEL_H = 12  # line height of a 9px edge label: stacked labels never overlap
 
 _MERMAID_UNSAFE = re.compile(r'["\[\]{}()<>|#;`]')
 
@@ -56,6 +57,11 @@ _MERMAID_UNSAFE = re.compile(r'["\[\]{}()<>|#;`]')
 
 def _cut(text: str, n: int = MAX_LABEL) -> str:
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _text_w(text: str, size: int = 11) -> float:
+    """Estimated rendered width of a text, for layout only."""
+    return len(text) * CHAR_W * size / 11
 
 
 def _mlabel(text: str) -> str:
@@ -96,10 +102,13 @@ def _svg(width: float, height: float, title: str, body: list[str], icons: set[st
         for k, c in sorted(KIND_COLOURS.items())
     )
     w, h = round(width), round(height)
+    # the viewBox lets the drawing scale down to its container instead of being clipped;
+    # width/height keep the natural size for standalone viewers and PNG renderers
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" '
         f'xmlns:xlink="http://www.w3.org/1999/xlink" width="{w}" height="{h}" '
-        f'viewBox="0 0 {w} {h}" font-family="{FONT}" font-size="11">\n'
+        f'viewBox="0 0 {w} {h}" preserveAspectRatio="xMinYMin meet" '
+        f'style="max-width:100%;height:auto" font-family="{FONT}" font-size="11">\n'
         f"<title>{_x(title)}</title>\n<defs>{defs}{markers}</defs>\n"
         f'<rect x="0" y="0" width="{w}" height="{h}" fill="#ffffff"/>\n'
         + "\n".join(body)
@@ -305,10 +314,23 @@ def architecture_svg(model: dict[str, Any], title: str = "") -> str:
         body.append(_text(pad + 10, top + 18, f"root {label}", 12, "700", colour("terraform")))
         y += 12
     edge_svg, label_svg = [], []
-    for e in g["edges"]:
+    # parallel edges (same pair of nodes, either direction) would draw the same curve and
+    # put their labels on the same spot: spread their ends and stack their labels
+    pairs: dict[frozenset[str], list[int]] = {}
+    for i, e in enumerate(g["edges"]):
+        pairs.setdefault(frozenset((e["source"], e["target"])), []).append(i)
+    lane: dict[int, float] = {}  # offset of the edge's ends from the node middles
+    stack: dict[int, float] = {}  # offset of its label from the shared label spot
+    for members in pairs.values():
+        step = min(12.0, (node_h - 14) / max(len(members) - 1, 1))
+        for j, i in enumerate(members):
+            lane[i] = (j - (len(members) - 1) / 2) * step
+            stack[i] = (j - (len(members) - 1) / 2) * LABEL_H
+    right = float(width)
+    for i, e in enumerate(g["edges"]):
         (sx, sy), (tx, ty) = pos[e["source"]], pos[e["target"]]
         c = KIND_COLOURS[e["kind"]]
-        y1, y2 = sy + node_h / 2, ty + node_h / 2
+        y1, y2 = sy + node_h / 2 + lane[i], ty + node_h / 2 + lane[i]
         if tx > sx:
             x1, x2 = sx + node_w, tx
             d = f"M{x1:.0f},{y1:.0f} C{x1 + 50:.0f},{y1:.0f} {x2 - 50:.0f},{y2:.0f} {x2:.0f},{y2:.0f}"
@@ -322,8 +344,12 @@ def architecture_svg(model: dict[str, Any], title: str = "") -> str:
         edge_svg.append(
             f'<path d="{d}" fill="none" stroke="{c}" stroke-width="1.6"{dash} marker-end="url(#arrow-{e["kind"]})"/>'
         )
-        mx, my = (x1 + x2) / 2 + (40 if x1 == x2 else 0), (y1 + y2) / 2 - 4
-        label_svg.append(_text(mx, my, f"{e['kind']}: {e['label']}", 9, fill=c, anchor="middle"))
+        text = f"{e['kind']}: {e['label']}"
+        mx = (x1 + x2) / 2 + (40 if x1 == x2 else 0)
+        my = (sy + ty + node_h) / 2 - 4 + stack[i]
+        label_svg.append(_text(mx, my, text, 9, fill=c, anchor="middle"))
+        right = max(right, mx + _text_w(text, 9) / 2 + pad)
+    width = right  # a label beside the last column must not be cut off
     legend_y = y + 6
     for i, k in enumerate(FLOW_KINDS):
         lx = pad + i * 130

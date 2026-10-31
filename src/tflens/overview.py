@@ -130,6 +130,7 @@ def build_overview(
         "reason": discovery.get("reason", ""),
         "purpose": [],
         "summary": [],
+        "structure": [],
         "roots": [],
         "resources": [],
         "environments": [],
@@ -146,6 +147,7 @@ def build_overview(
     roots = structure["roots"]
     out["purpose"] = purpose_lines(model, nodes)
     out["summary"] = _summary(model, roots, structure["environments"], nodes)
+    out["structure"] = structure_lines(model)
     out["roots"] = [_root_section(model, r, nodes) for r in roots]
     out["resources"] = drilldowns(model, nodes, source)
     out["environments"] = [
@@ -500,6 +502,45 @@ def _summary(
     return lines
 
 
+def structure_lines(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """The repository structure, one entry per root (Terragrunt units included): its
+    backend, the modules it calls with their source, and why it was not analyzed.
+    Rendered identically in overview.md and report.md (:func:`render_structure_markdown`)."""
+    roots = (model.get("structure") or {}).get("roots", [])
+    lines = []
+    for r in roots:
+        fallback = _first_signal(r)
+        kind = "Terragrunt unit" if r["kind"] == "terragrunt" else f"{r['kind']} root"
+        role = f", {r['role']}" if r.get("role") else ""
+        lines.append(_line(f"{r['dir']}/ — {kind}{role}", fallback))
+        b = r["backend"]
+        settings = ", ".join(f"{s['key']} = {s['value']}" for s in b["settings"])
+        lines.append(
+            _line(
+                f"backend: {b['type']} ({b['origin']})" + (f"; {settings}" if settings else ""),
+                b["location"] or fallback,
+                1,
+            )
+        )
+        for m in r["modules"]:
+            text = f"module {m['address']}: {m['kind']} {m['source'] or '(no literal source)'}"
+            if m["version"]:
+                text += f" @ {m['version']}"
+            if not m["analyzed"]:
+                text += f"; not analyzed: {m['status']}"
+            lines.append(_line(text, m["location"], 1, status="" if m["analyzed"] else "unknown"))
+        if not r["analyzed"]:
+            lines.append(_line(f"not analyzed: {r['status']}", fallback, 1, status="unknown"))
+    if not lines:
+        lines.append(_line("No roots detected", None, status="unknown"))
+    return lines
+
+
+def render_structure_markdown(lines: list[dict[str, Any]], level: int = 1) -> list[str]:
+    """The structure section as Markdown lines (``level`` as in render_overview_markdown)."""
+    return [f"{'#' * level}# Structure", "", *_md_lines(lines), ""]
+
+
 def _root_section(
     model: dict[str, Any], root: dict[str, Any], nodes: dict[str, dict[str, Any]]
 ) -> dict[str, Any]:
@@ -792,6 +833,8 @@ def render_overview_markdown(ov: dict[str, Any], inventory_text: str = "", level
     if ov.get("purpose"):
         out += [f"{h}# Purpose (guess)", "", *_md_lines(ov["purpose"]), ""]
     out += [f"{h}# What this repository deploys", "", *_md_lines(ov["summary"]), ""]
+    if ov.get("structure"):
+        out += render_structure_markdown(ov["structure"], level)
     for r in ov["roots"]:
         out += [f"{h}# Root {r['title']}", ""]
         for s in r["sections"]:
