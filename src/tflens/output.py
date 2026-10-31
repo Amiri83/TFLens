@@ -50,6 +50,7 @@ def _module_tree(inst: ModuleInstance) -> dict[str, Any]:
                 "address": addr,
                 "dir": None,
                 "source": inst.child_source.get(name),
+                "remote": None,
                 "location": call.loc.to_dict(),
                 "analyzed": False,
                 "status": inst.child_status.get(name, "not analyzed"),
@@ -66,6 +67,10 @@ def _module_tree(inst: ModuleInstance) -> dict[str, Any]:
                 inputs[name] = to_json(inst.parent.eval_attr(inst.call.attrs[name]))
     resources = [inst.node_id(t, n) for t, n in sorted(inst.src.resources)]
     resources += [inst.node_id(t, n, data=True) for t, n in sorted(inst.src.data)]
+    remote = None
+    if inst.call is not None and inst.parent is not None:
+        entry = inst.parent.child_remote.get(inst.call.labels[0])
+        remote = entry.to_dict() if entry else None
     return {
         "id": inst.module_id or f"{inst.prefix}(root)",
         "address": inst.address,
@@ -73,6 +78,7 @@ def _module_tree(inst: ModuleInstance) -> dict[str, Any]:
         "source": inst.parent.child_source.get(inst.call.labels[0])
         if inst.call and inst.parent
         else None,
+        "remote": remote,
         "location": inst.call.loc.to_dict() if inst.call else None,
         "analyzed": True,
         "status": "analyzed",
@@ -129,6 +135,9 @@ def build_model(repo: RepoSource, engine: Engine, graph: Graph) -> dict[str, Any
             for e in sorted(repo.errors, key=lambda e: e.file)
         ],
         "roots": [i.root_dir for i in roots],
+        "remote_modules": [
+            r.to_dict() for root in sorted(repo.remote) for r in repo.remote[root].values()
+        ],
         "modules": [_module_tree(i) for i in roots],
         "variables": _variables(engine),
         "nodes": nodes,

@@ -7,6 +7,7 @@ __pycache__/
 build/
 dist/
 .terraform/
+!tests/fixtures/*/.terraform/
 *.tfstate
 *.tfstate.*
 tflens-out/

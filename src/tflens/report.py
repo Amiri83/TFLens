@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+from .snippets import SourceLines, format_snippet, location_label, snippet_lines
 
 TYPE_DESCRIPTIONS = {
     "aws_instance": "EC2 instance",
@@ -42,12 +45,7 @@ def _code(s: Any) -> str:
     return f"`{str(s).replace('`', '')}`"
 
 
-def _loc(loc: dict[str, Any] | None) -> str:
-    if not loc:
-        return "?"
-    if loc["start_line"] == loc["end_line"]:
-        return f"{loc['file']}:{loc['start_line']}"
-    return f"{loc['file']}:{loc['start_line']}-{loc['end_line']}"
+_loc = location_label
 
 
 def _value(v: Any) -> str:
@@ -71,7 +69,9 @@ def _evidence(edge: dict[str, Any]) -> str:
     return ", ".join(_code(_loc(e)) for e in edge["evidence"])
 
 
-def _edge_line(edge: dict[str, Any], other: str, nodes: dict[str, dict[str, Any]]) -> str:
+def _edge_line(
+    edge: dict[str, Any], other: str, nodes: dict[str, dict[str, Any]], refs: dict[str, int]
+) -> str:
     name = nodes.get(other, {}).get("name", other)
     who = _code(other) if not other.startswith("external:") else f"{_code(name)} (external)"
     parts = [f"- {who} — {edge['label']}"]
@@ -84,10 +84,13 @@ def _edge_line(edge: dict[str, Any], other: str, nodes: dict[str, dict[str, Any]
     if attrs.get("conditions"):
         parts.append(" [conditional]")
     parts.append(f" — evidence {_evidence(edge)}")
+    if edge["id"] in refs:
+        n = refs[edge["id"]]
+        parts.append(f" [E{n}](#evidence-e{n})")
     return "".join(parts)
 
 
-def _describe(node: dict[str, Any]) -> str:
+def describe_node(node: dict[str, Any]) -> str:
     desc = TYPE_DESCRIPTIONS.get(node["type"], node["type"])
     if node["kind"] == "data":
         desc = f"data source {node['type']}"
@@ -99,7 +102,52 @@ def _describe(node: dict[str, Any]) -> str:
     return f"{desc} {_code(ident)}" if ident else desc
 
 
-def render_report(model: dict[str, Any], title: str = "Terraform repository") -> str:
+def _fence(body: str) -> str:
+    longest = max((len(m) for m in re.findall(r"`+", body)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def _evidence_section(
+    model: dict[str, Any], refs: dict[str, int], source: SourceLines | None
+) -> list[str]:
+    lines = [
+        "## Evidence",
+        "",
+        "Source lines backing each relationship. Lines marked `>` are the evidence; "
+        "unmarked lines are surrounding context.",
+        "",
+    ]
+    for e in model["edges"]:
+        if e["id"] not in refs:
+            continue
+        n = refs[e["id"]]
+        lines += [
+            f'<a id="evidence-e{n}"></a>',
+            "",
+            f"### E{n}: {e['kind']} {_code(e['source'])} → {_code(e['target'])}",
+            "",
+            e["label"],
+            "",
+        ]
+        for ev in e["evidence"]:
+            note = f" — {ev['note']}" if ev.get("note") else ""
+            body = format_snippet(snippet_lines(ev, source))
+            fence = _fence(body)
+            lines += [f"{_code(_loc(ev))}{note}", "", f"{fence}hcl", body, fence, ""]
+    return lines
+
+
+def render_report(
+    model: dict[str, Any],
+    title: str = "Terraform repository",
+    source: SourceLines | None = None,
+) -> str:
+    """Render report.md. ``source(file)`` returns a repository file's lines, used to
+    add context around evidence snippets; without it only the evidence lines show."""
+    refs: dict[str, int] = {}
+    for e in model["edges"]:
+        if e["evidence"]:
+            refs[e["id"]] = len(refs) + 1
     nodes = {n["id"]: n for n in model["nodes"]}
     out_edges: dict[str, list[dict[str, Any]]] = {}
     in_edges: dict[str, list[dict[str, Any]]] = {}
@@ -140,6 +188,10 @@ def render_report(model: dict[str, Any], title: str = "Terraform repository") ->
     def tree(m: dict[str, Any], depth: int) -> None:
         label = m["address"] or "(root)"
         where = f"dir {_code(m['dir'])}" if m["dir"] else f"source {_code(m['source'])}"
+        remote = m.get("remote")
+        if remote and m["analyzed"]:
+            version = f" {remote['version']}" if remote["version"] else ""
+            where += f", remote {_code(remote['source'])}{version} from `modules.json`"
         status = "" if m["analyzed"] else f" — not analyzed: {m['status']}"
         lines.append(
             f"{'  ' * depth}- {_code(label)} ({where}, {len(m['resources'])} blocks){status}"
@@ -175,7 +227,7 @@ def render_report(model: dict[str, Any], title: str = "Terraform repository") ->
     for n in primary:
         nid = n["id"]
         lines += [f"### {_code(nid)}", ""]
-        lines.append(f"**What it is:** {_describe(n)}.")
+        lines.append(f"**What it is:** {describe_node(n)}.")
         props = {k: v for k, v in n["properties"].items()}
         if props:
             lines.append("")
@@ -195,7 +247,7 @@ def render_report(model: dict[str, Any], title: str = "Terraform repository") ->
             if edges:
                 found = True
                 lines.append(f"*{heading}*")
-                lines += [_edge_line(e, e["target"], nodes) for e in edges]
+                lines += [_edge_line(e, e["target"], nodes, refs) for e in edges]
                 lines.append("")
         if not found:
             lines += ["- nothing found in the code", ""]
@@ -208,7 +260,7 @@ def render_report(model: dict[str, Any], title: str = "Terraform repository") ->
             if edges:
                 found = True
                 lines.append(f"*{heading}*")
-                lines += [_edge_line(e, e["source"], nodes) for e in edges]
+                lines += [_edge_line(e, e["source"], nodes, refs) for e in edges]
                 lines.append("")
         exposure = []
         for e in out_edges.get(nid, []):
@@ -216,7 +268,7 @@ def render_report(model: dict[str, Any], title: str = "Terraform repository") ->
                 for ing in in_edges.get(e["target"], []):
                     if ing["kind"] == "NETWORK" and ing["attributes"].get("direction") == "ingress":
                         exposure.append(
-                            _edge_line(ing, ing["source"], nodes)
+                            _edge_line(ing, ing["source"], nodes, refs)
                             + f" (through {_code(e['target'])})"
                         )
         if exposure:
@@ -265,4 +317,6 @@ def render_report(model: dict[str, Any], title: str = "Terraform repository") ->
                 f"| {_code(_loc(u['location']))} |"
             )
         lines.append("")
+    if refs:
+        lines += _evidence_section(model, refs, source)
     return "\n".join(lines).rstrip() + "\n"

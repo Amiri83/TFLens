@@ -28,6 +28,52 @@ tflens --dir path/to/terraform --out model.json --report report.md
 
 With neither `--out` nor `--report`, the model JSON goes to stdout.
 
+The report ends with an **Evidence** section: every relationship gets an entry
+(`E1`, `E2`, ... linked from the resource sections) with file, line range and
+the source lines, evidence lines marked `>` and two lines of context around them.
+
+## Web UI
+
+```sh
+tflens serve --dir path/to/terraform            # http://127.0.0.1:8765/
+tflens serve --dir path/to/terraform --port 0 --no-browser
+```
+
+| Option | Meaning |
+| --- | --- |
+| `--dir PATH` | repository (required) |
+| `--host HOST` / `--port N` | bind address (default `127.0.0.1:8765`; `--port 0` picks a free port) |
+| `--model FILE` | model.json to serve (default `<dir>/tflens-out/model.json`) |
+| `--regenerate` | re-analyze at startup even if the model exists |
+| `--no-browser` | do not open a browser |
+| `--allow-remote` | required to bind a non-loopback `--host` |
+| `--var-file`, `--var` | as for the analyzer, used when (re)generating the model |
+
+The server (standard library `http.server`, no extra dependencies) re-reads
+model.json when it changes and regenerates it when it is missing or unusable;
+the **Regenerate** button re-analyzes on demand. It makes no external requests:
+pages are served with a `default-src 'self'` CSP and the graph library is
+vendored (copy `cytoscape.min.js` into `src/tflens/static/vendor/`).
+
+- **Graph**: nodes colored by service, edges by kind (CONFIG dashed, RUNS_ON
+  dotted); filters by edge kind, service and module; search by name or id.
+- **Repository**: file/module tree; selecting a file lists what it defines.
+- **Detail panel** (click a node or edge): summary, the defining block, evidence
+  snippets with highlighted line numbers, and unknowns with their reasons.
+
+JSON API (all GET): `/api/summary`, `/api/graph`, `/api/nodes`, `/api/edges`,
+`/api/node?id=`, `/api/edge?id=`, `/api/tree`, `/api/file?path=`, `/api/model`;
+`POST /api/regenerate` (needs header `X-TFLens: 1`).
+
+## Remote modules
+
+If `<root>/.terraform/modules/modules.json` exists (written by a previous
+`terraform init`), TFLens reads the modules it lists from their materialized
+directories under `.terraform/modules/` and analyzes them like local modules
+(inputs, outputs, nested modules). Nothing is downloaded. Calls with no
+manifest, no manifest entry, or a missing directory stay unknown with the
+reason. `model.json` lists the manifest entries under `remote_modules`.
+
 ## What it extracts
 
 Resources: `aws_instance`, `aws_lambda_function` (+ event source mappings,
@@ -53,8 +99,8 @@ Edge kinds:
 
 ## model.json
 
-`schema_version`, `summary`, `files`, `parse_errors`, `roots`, `modules` (module
-tree with inputs and outputs), `variables` (value and where it came from),
+`schema_version`, `summary`, `files`, `parse_errors`, `roots`, `remote_modules`,
+`modules` (module tree with inputs, outputs and remote source/version), `variables` (value and where it came from),
 `nodes`, `edges` (with `evidence` and `via`), `unknowns` (subject, attribute,
 reason, location). Symbolic values are encoded explicitly: `{"$ref": ...}`,
 `{"$unknown": reason}`, `{"$template": ...}`, `{"$json": ...}`.

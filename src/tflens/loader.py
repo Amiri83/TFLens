@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import posixpath
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,6 +74,28 @@ class ParseError:
     message: str
 
 
+@dataclass(frozen=True)
+class RemoteModule:
+    """One entry of ``<root>/.terraform/modules/modules.json`` (written by terraform init)."""
+
+    key: str  # "net" or "net.subnets" for nested calls
+    source: str
+    version: str | None
+    dir: str  # repo-relative directory of the materialized module
+    manifest: str  # repo-relative path of modules.json
+    status: str = "ok"  # "ok" or the reason the directory cannot be used
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.key,
+            "source": self.source,
+            "version": self.version,
+            "dir": self.dir,
+            "manifest": self.manifest,
+            "status": self.status,
+        }
+
+
 @dataclass
 class RepoSource:
     root: Path
@@ -79,7 +103,15 @@ class RepoSource:
     tfvars: dict[str, dict[str, Attr]] = field(default_factory=dict)
     files: list[str] = field(default_factory=list)
     errors: list[ParseError] = field(default_factory=list)
+    # root module dir -> modules.json key -> entry
+    remote: dict[str, dict[str, RemoteModule]] = field(default_factory=dict)
     _lines: dict[str, list[str]] = field(default_factory=dict, repr=False)
+
+    @property
+    def remote_dirs(self) -> set[str]:
+        return {
+            r.dir for entries in self.remote.values() for r in entries.values() if r.status == "ok"
+        }
 
     def lines(self, file: str) -> list[str]:
         if file not in self._lines:
@@ -115,7 +147,70 @@ def load_repo(root: Path) -> RepoSource:
             elif fname.endswith(".tfvars"):
                 repo.files.append(rel)
                 _load_tfvars(repo, rel)
+    for mod_dir in sorted(repo.modules):
+        _load_manifest(repo, mod_dir)
     return repo
+
+
+def _load_manifest(repo: RepoSource, mod_dir: str) -> None:
+    """Load the remote modules that ``terraform init`` materialized for a root module.
+
+    Only reads ``.terraform/modules/modules.json`` and the ``.tf`` files of the
+    directories it lists; nothing is downloaded.
+    """
+    prefix = "" if mod_dir == "." else mod_dir + "/"
+    manifest = f"{prefix}.terraform/modules/modules.json"
+    path = repo.root / manifest
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        entries = data["Modules"]
+        if not isinstance(entries, list):
+            raise TypeError("'Modules' is not a list")
+    except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+        repo.errors.append(ParseError(manifest, f"cannot read module manifest: {exc}"))
+        return
+    out: dict[str, RemoteModule] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        key, source, rel_dir = entry.get("Key"), entry.get("Source"), entry.get("Dir")
+        if not isinstance(key, str) or not key or not isinstance(rel_dir, str):
+            continue
+        version = entry.get("Version")
+        version = version if isinstance(version, str) and version else None
+        source = source if isinstance(source, str) else ""
+        target = posixpath.normpath(posixpath.join(mod_dir, rel_dir))
+        status = "ok"
+        if rel_dir.startswith("/") or target == ".." or target.startswith("../"):
+            status = f"directory {rel_dir!r} in {manifest} is outside the repository"
+        elif target not in repo.modules:
+            tf_files = _module_files(repo, target)
+            if not tf_files:
+                status = (
+                    f"directory {target!r} listed in {manifest} is missing or has no .tf files "
+                    "(re-run terraform init)"
+                )
+            else:
+                mod = repo.modules.setdefault(target, ModuleSource(dir=target))
+                for rel in tf_files:
+                    repo.files.append(rel)
+                    mod.files.append(rel)
+                    _load_tf(repo, mod, rel)
+        out[key] = RemoteModule(key, source, version, target, manifest, status)
+    repo.remote[mod_dir] = {k: out[k] for k in sorted(out)}
+    repo.files.sort()
+
+
+def _module_files(repo: RepoSource, rel_dir: str) -> list[str]:
+    path = repo.root / rel_dir
+    try:
+        path.resolve().relative_to(repo.root)
+        names = sorted(p.name for p in path.iterdir() if p.is_file() and p.name.endswith(".tf"))
+    except (OSError, ValueError):
+        return []
+    return [f"{rel_dir}/{n}" if rel_dir != "." else n for n in names]
 
 
 def _read(repo: RepoSource, rel: str) -> tuple[dict[str, Any], LocBlock] | None:

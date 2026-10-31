@@ -1,0 +1,1 @@
+{"Modules":[{"Key":"","Source":"","Dir":"."},{"Key":"notify","Source":"git::https://example.com/notify.git?ref=v1","Dir":".terraform/modules/notify"},{"Key":"queues","Source":"registry.terraform.io/example-org/queues/aws","Version":"1.2.0","Dir":".terraform/modules/queues"},{"Key":"queues.dlq","Source":"./modules/dlq","Dir":".terraform/modules/queues/modules/dlq"}]}

@@ -25,6 +25,9 @@ tflens = "tflens.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+tflens = ["static/*.html", "static/*.css", "static/*.js", "static/vendor/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .evaluate import Ops, apply_ops, evaluate
-from .loader import Attr, Block, ModuleSource, RepoSource
+from .loader import Attr, Block, ModuleSource, RemoteModule, RepoSource
 from .values import JsonEncoded, Location, Ref, Unknown, is_known, render
 
 # Provider-documented identities: these computed attributes equal a configured argument.
@@ -67,6 +67,7 @@ class ModuleInstance:
     children: dict[str, ModuleInstance | None] = field(default_factory=dict)
     child_status: dict[str, str] = field(default_factory=dict)
     child_source: dict[str, Any] = field(default_factory=dict)
+    child_remote: dict[str, RemoteModule] = field(default_factory=dict)
     var_info: dict[str, VarInfo] = field(default_factory=dict)
     _memo: dict[tuple[Any, ...], Any] = field(default_factory=dict)
 
@@ -358,8 +359,23 @@ class Engine:
                 src = _literal_source(call)
                 if src is not None and _is_local(src):
                     referenced.add(posixpath.normpath(posixpath.join(mod.dir, src)))
-        roots = sorted(d for d in self.repo.modules if d not in referenced)
+        remote = self.repo.remote_dirs
+        roots = sorted(d for d in self.repo.modules if d not in referenced and d not in remote)
         return roots
+
+    def _remote(self, root_dir: str, address: str) -> tuple[RemoteModule | None, str]:
+        """Materialized directory of a remote module call, from the root's modules.json."""
+        manifest = self.repo.remote.get(root_dir)
+        if manifest is None:
+            return None, "remote modules are not fetched (no .terraform/modules/modules.json)"
+        key = ".".join(address.split(".")[1::2])  # module.a.module.b -> a.b
+        entry = manifest.get(key)
+        if entry is None:
+            path = f"{'' if root_dir == '.' else root_dir + '/'}.terraform/modules/modules.json"
+            return None, f"no entry {key!r} in {path} (re-run terraform init)"
+        if entry.status != "ok":
+            return None, entry.status
+        return entry, ""
 
     def run(self) -> list[ModuleInstance]:
         self.roots = self.discover_roots()
@@ -391,13 +407,17 @@ class Engine:
                 inst.child_status[name] = f"module.{name} source is missing or not a literal string"
                 continue
             if not _is_local(source):
-                inst.children[name] = None
-                inst.child_status[name] = (
-                    f"module.{name} uses non-local source {source!r}; "
-                    "remote modules are not fetched (no terraform init)"
-                )
-                continue
-            child_dir = posixpath.normpath(posixpath.join(src.dir, source))
+                remote, reason = self._remote(root_dir, child_addr)
+                if remote is None:
+                    inst.children[name] = None
+                    inst.child_status[name] = (
+                        f"module.{name} uses non-local source {source!r}; {reason}"
+                    )
+                    continue
+                inst.child_remote[name] = remote
+                child_dir = remote.dir
+            else:
+                child_dir = posixpath.normpath(posixpath.join(src.dir, source))
             child_src = self.repo.modules.get(child_dir)
             if child_src is None:
                 inst.children[name] = None

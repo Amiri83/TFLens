@@ -212,6 +212,14 @@ class Analyzer:
         if inst.module_id is not None:
             call = inst.call
             assert call is not None and inst.parent is not None
+            props: dict[str, Any] = {
+                "source": inst.parent.child_source.get(call.labels[0]),
+                "dir": inst.src.dir,
+            }
+            remote = inst.parent.child_remote.get(call.labels[0])
+            if remote is not None:
+                props["remote_source"] = remote.source
+                props["remote_version"] = remote.version
             self.graph.add_node(
                 Node(
                     id=inst.module_id,
@@ -223,10 +231,7 @@ class Analyzer:
                     parent=inst.parent.module_id,
                     module=inst.parent.module_id or "",
                     location=call.loc,
-                    properties={
-                        "source": inst.parent.child_source.get(call.labels[0]),
-                        "dir": inst.src.dir,
-                    },
+                    properties=props,
                 )
             )
         for name in sorted(inst.child_status):
