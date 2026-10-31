@@ -64,7 +64,22 @@ Nothing has to be configured before a first analysis:
   and Terragrunt layouts (`live/<env>/...`, `env.hcl`). In the managed app they
   are created automatically (on add / Sync / **Detect environments**), bound to
   their root, and can be edited; an edited environment is never overwritten.
-- **Flow** (the analyzer's first tab, the `## Flows` section of `handoff.md`): how
+- **Root view** (the analyzer's first tab, the `## Roots by shape` section of
+  `handoff.md`): each root is classified by shape, with the reason (resource counts and
+  backend) spelled out, and shown in the view that shape calls for:
+  *app / pipeline* (compute fed by triggers or queues) → **Flow**;
+  *platform / bootstrap* (ECR, DNS, certificates, KMS, IAM, log buckets, SSM
+  parameters, little to no compute) → **Provides**: what it creates, the outputs it
+  exposes, who reads them (`terraform_remote_state` sources whose backend settings name
+  its state, `aws_ssm_parameter` data sources) and its environments;
+  *network* (VPC, subnets, security groups, endpoints, transit gateways) → **Network**:
+  VPC → subnets → what is placed in them, security groups, endpoints, and what can
+  reach what; *module library* (no backend, no provider, nothing calls it) →
+  **Module catalog**: inputs, outputs, resources, an example `module` block and who
+  calls it. A mixed repository lists its roots grouped by shape, each with a one-line
+  description; a root switcher and a view switcher pick any root and any view.
+  `/api/shapes`, `/api/root-view?root=<dir>&view=<flow|provides|network|catalog>`.
+- **Flow** (the analyzer's second tab, the `## Flows` section of `handoff.md`): how
   data moves, entry point to sink. Entry points are the declared triggers nothing in
   the repository writes to (Kafka / MSK / SQS / Kinesis / DynamoDB event source
   mappings, SNS subscriptions, S3 notifications, EventBridge rules, API Gateway
@@ -78,7 +93,7 @@ Nothing has to be configured before a first analysis:
   *Start here* box lists the root, the entry files and the modules / files in flow
   order; the metrics (flows, steps, unverified links) are in the header. The resource
   inventory follows, collapsed under *All resources*.
-- **Overview** (the analyzer's second tab, `overview.md` of each run): what the
+- **Overview** (the analyzer's third tab, `overview.md` of each run): what the
   repository deploys and, per root, backend, providers, modules, resources by
   service, the top ACCESS / TRIGGER / NETWORK relationships and the unknowns.
   Every line links to its `file:line`.

@@ -247,16 +247,18 @@ def _api(tmp_path):
     return Api(ModelStore(repo))
 
 
-def test_flow_is_the_default_tab(tmp_path):
+def test_flow_tab_follows_the_root_view(tmp_path):
+    # the landing tab is the Root view (an app root shows its Flow there, see
+    # test_shapes.py); the Flow tab keeps the repository-wide flows right after it
     api = _api(tmp_path)
     html = api.handle("GET", "/").body.decode()
     tabs = re.findall(r'<button type="button" class="([^"]+)" data-view="(\w+)"', html)
-    assert tabs[0] == ("tab active", "flow")
-    assert [v for c, v in tabs if "active" in c] == ["flow"]
-    assert '<div id="flow" class="view-flow">' in html
+    assert tabs[:2] == [("tab active", "roots"), ("tab", "flow")]
+    assert [v for c, v in tabs if "active" in c] == ["roots"]
+    assert '<div id="flow" class="view-flow hidden">' in html
     assert '<div id="overview" class="view-overview hidden">' in html
     js = api.handle("GET", "/static/app.js").body.decode()
-    assert 'const VIEWS = ["flow",' in js and "renderFlow(fl, ov)" in js
+    assert 'const VIEWS = ["roots", "flow",' in js and "renderFlow(fl, ov)" in js
     assert 'api("api/flow")' in js
     # the inventory is still there, collapsed, after the flows
     assert 'allResources(ov, "all-resources", "fl-all", true)' in js

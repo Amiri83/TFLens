@@ -21,6 +21,7 @@ from .model import EDGE_KINDS, SCHEMA_VERSION
 from .output import dumps, run_analysis
 from .overview import build_overview
 from .report import describe_node
+from .shapes import build_root_view, build_shapes, root_entries, root_model
 from .snippets import SourceLines, snippet_lines
 from .visuals import DIAGRAMS, mermaid, svg
 
@@ -612,6 +613,10 @@ def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict
         "reason": disc.get("reason", ""),
         "skipped": disc.get("skipped", []),
         "flow": build_flows(model)["metrics"],
+        "shapes": [
+            {"dir": r["dir"], "shape": r["shape"], "view": r["view"]}
+            for r in build_shapes(model)["roots"]
+        ],
     }
     if store is not None:
         out["model_path"] = str(store.model_path)
@@ -691,11 +696,25 @@ class Api:
             return json_response(build_overview(model, self.store.title, self.store.lines))
         if path == "/api/flow":
             return json_response(build_flows(model))
+        if path == "/api/shapes":
+            return json_response(build_shapes(model))
+        if path == "/api/root-view":
+            root, view = query.get("root", ""), query.get("view", "")
+            data = build_root_view(model, root, view)
+            if data is None:
+                return _not_found(f"root {root!r} / view {view!r}")
+            return json_response(data)
         if path == "/api/diagram":
             name, fmt = query.get("name", ""), query.get("format", "svg")
             if name.startswith("flow-") and fmt == "svg":
-                # one chain of the Flow view (not exported: it is built from the model)
-                body = chain_svg(model, name, self.store.title)
+                # one chain of the Flow view (not exported: it is built from the model);
+                # with root=<dir>, a chain of that root's own Flow view
+                source = model
+                if "root" in query:
+                    if query["root"] not in {r["dir"] for r in root_entries(model)}:
+                        return _not_found(f"root {query['root']!r}")
+                    source = root_model(model, query["root"])
+                body = chain_svg(source, name, self.store.title)
                 if body is None:
                     return _not_found(f"flow diagram {name!r}")
                 return _download(body, "image/svg+xml; charset=utf-8", f"{name}.svg", query)

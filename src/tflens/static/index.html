@@ -12,7 +12,8 @@
     <a id="home" class="home hidden" href="/runs">&larr; Runs</a>
     <h1>TFLens <span id="title"></span></h1>
     <nav>
-      <button type="button" class="tab active" data-view="flow">Flow</button>
+      <button type="button" class="tab active" data-view="roots">Root view</button>
+      <button type="button" class="tab" data-view="flow">Flow</button>
       <button type="button" class="tab" data-view="overview">Overview</button>
       <button type="button" class="tab" data-view="graph">Graph</button>
       <button type="button" class="tab" data-view="diagrams">Diagrams</button>
@@ -25,7 +26,13 @@
   <div id="failure" class="failure hidden"></div>
   <main>
     <aside id="sidebar">
-      <section class="view-flow">
+      <section class="view-roots">
+        <h3>Roots</h3>
+        <div id="root-list"></div>
+        <h3>Contents</h3>
+        <div id="roots-toc"></div>
+      </section>
+      <section class="view-flow hidden">
         <h3>Flows</h3>
         <div id="flow-toc"></div>
       </section>
@@ -54,7 +61,8 @@
       </section>
     </aside>
     <section id="center">
-      <div id="flow" class="view-flow"><p class="muted">Loading the flows…</p></div>
+      <div id="roots" class="view-roots"><p class="muted">Loading the roots…</p></div>
+      <div id="flow" class="view-flow hidden"><p class="muted">Loading the flows…</p></div>
       <div id="overview" class="view-overview hidden"><p class="muted">Loading the overview…</p></div>
       <div id="graph" class="view-graph hidden"></div>
       <div id="diagrams" class="view-diagrams hidden"><p class="muted">Loading the diagrams…</p></div>
