@@ -48,6 +48,8 @@ FONT = "Helvetica, Arial, sans-serif"
 CHAR_W = 6.6  # average glyph width at 11px, for layout only
 MAX_LABEL = 30
 LABEL_H = 12  # line height of a 9px edge label: stacked labels never overlap
+LABEL_GAP = 180  # space between architecture columns: edge labels live there, never on a box
+LABEL_PAD = 4  # clearance between an edge label's background and the boxes beside it
 
 _MERMAID_UNSAFE = re.compile(r'["\[\]{}()<>|#;`]')
 
@@ -248,7 +250,8 @@ def architecture_mermaid(model: dict[str, Any]) -> str:
 
 def architecture_svg(model: dict[str, Any], title: str = "") -> str:
     g = architecture_graph(model)
-    pad, lane_w, col_w, node_w, node_h, gap = 16, 170, 250, 210, 50, 12
+    pad, lane_w, node_w, node_h, gap = 16, 170, 210, 50, 12
+    col_w = node_w + LABEL_GAP
     width = pad * 2 + lane_w + col_w * len(TIERS)
     body: list[str] = []
     icons: set[str] = set()
@@ -326,7 +329,8 @@ def architecture_svg(model: dict[str, Any], title: str = "") -> str:
         for j, i in enumerate(members):
             lane[i] = (j - (len(members) - 1) / 2) * step
             stack[i] = (j - (len(members) - 1) / 2) * LABEL_H
-    right = float(width)
+    right, bottom = float(width), float(y)
+    placed: list[tuple[float, float, float, float]] = []  # label boxes drawn so far
     for i, e in enumerate(g["edges"]):
         (sx, sy), (tx, ty) = pos[e["source"]], pos[e["target"]]
         c = KIND_COLOURS[e["kind"]]
@@ -344,13 +348,38 @@ def architecture_svg(model: dict[str, Any], title: str = "") -> str:
         edge_svg.append(
             f'<path d="{d}" fill="none" stroke="{c}" stroke-width="1.6"{dash} marker-end="url(#arrow-{e["kind"]})"/>'
         )
-        text = f"{e['kind']}: {e['label']}"
-        mx = (x1 + x2) / 2 + (40 if x1 == x2 else 0)
-        my = (sy + ty + node_h) / 2 - 4 + stack[i]
-        label_svg.append(_text(mx, my, text, 9, fill=c, anchor="middle"))
-        right = max(right, mx + _text_w(text, 9) / 2 + pad)
+        # the label sits in the column gap the edge leaves from (beside the loop of a
+        # same-column edge), so it never covers a box; too long for that slot, it is
+        # shortened and the full text is the hover title
+        if x1 == x2:
+            left, slot_end = x1 + 44, x1 + LABEL_GAP
+        elif tx > sx:
+            left, slot_end = x1, x1 + LABEL_GAP
+        else:
+            left, slot_end = x1 - LABEL_GAP, x1
+        full = f"{e['kind']}: {e['label']}"
+        fit = int((slot_end - left - 2 * LABEL_PAD - 6) / _text_w("x", 9))
+        text = _cut(full, fit)
+        w = _text_w(text, 9)
+        mx = (left + slot_end) / 2
+        spans = abs(tx - sx) > col_w  # skips a column: label next to its start
+        my = (sy + node_h / 2 if spans else (sy + ty + node_h) / 2) - 4 + stack[i]
+        # labels of other edges in the same gap: move down until its background is free
+        bl, br = round(mx - w / 2 - 3), round(mx + w / 2 + 3)
+        while any(bl < b[1] and b[0] < br and my - 9 < b[3] and b[2] < my + 3 for b in placed):
+            my += LABEL_H
+        placed.append((bl, br, my - 9, my + 3))
+        label_svg.append(
+            f"<g><title>{_x(full)}</title>"
+            f'<rect x="{bl}" y="{my - 9:.0f}" width="{br - bl}" height="{LABEL_H}" '
+            f'rx="3" fill="#ffffff" fill-opacity="0.9"/>'
+            + _text(mx, my, text, 9, fill=c, anchor="middle")
+            + "</g>"
+        )
+        right = max(right, mx + w / 2 + pad)
+        bottom = max(bottom, my + 3)
     width = right  # a label beside the last column must not be cut off
-    legend_y = y + 6
+    legend_y = bottom + 6
     for i, k in enumerate(FLOW_KINDS):
         lx = pad + i * 130
         dash = ' stroke-dasharray="5 3"' if k == "ACCESS" else ""
