@@ -493,3 +493,40 @@ def test_favicon_and_index_assets(client, repo_dir):
     html = app.test_client().get("/").data.decode()
     assert 'src="/static/app.js"' in html and 'href="/static/favicon.svg"' in html
     assert json.loads(app.test_client().get("/api/summary").data)["readonly"] is False
+
+
+def test_architecture_diagram_panel_hooks(repo_dir):
+    """The Diagrams tab shows each SVG at natural size in a scrolling viewport, with zoom
+    buttons and a full-size link; the served SVG itself is the exported one, unchanged."""
+    from tflens.visuals import svg
+
+    store = ModelStore(repo_dir)
+    c = create_app(store=store, testing=True).test_client()
+    js = c.get("/static/app.js").get_data(as_text=True)
+    css = c.get("/static/app.css").get_data(as_text=True)
+    assert '["architecture", "Architecture (flows)"' in js and "diagramPanel(name, title)" in js
+    # wrapper + viewport classes, zoom via CSS transform, never below 100%
+    for hook in (
+        'class: "diagram-panel"',
+        'class: "diagram"',
+        'class: "diagram-sizer"',
+        'class: "diagram-zoom"',
+        "transform = `scale(${scale})`",
+        "Math.max(1, s)",
+    ):
+        assert hook in js, hook
+    for zoom in ("in", "out", "fit"):
+        assert f'"data-zoom": "{zoom}"' in js
+    # fit-to-width only when the natural width fits the panel
+    assert "w <= room ? room / w : 1" in js
+    # full-size SVG in a new tab (both the image and the toolbar link)
+    assert js.count('href: url, target: "_blank", rel: "noopener"') == 2
+    assert "const url = `api/diagram?name=${name}&format=svg`" in js
+    rules = dict(re.findall(r"^#diagrams (\.[\w\- ]+?) \{ (.*?) \}$", css, re.M))
+    assert "overflow: auto" in rules[".diagram"]
+    assert "max-width: none" in rules[".diagram img"]  # natural size, not shrunk
+    assert "transform-origin: 0 0" in rules[".diagram-zoom"]
+    assert "max-width: 100%" not in css.split("#diagrams", 1)[1]
+    resp = c.get("/api/diagram?name=architecture&format=svg")
+    assert resp.mimetype == "image/svg+xml"
+    assert resp.get_data(as_text=True) == svg(store.model(), "architecture", store.title)

@@ -605,9 +605,54 @@
           el("a", { class: "link", href: `api/diagram?name=${name}&format=mmd&download=1`, download: `${name}.mmd` }, "Mermaid (.mmd)"),
           " · ",
           el("a", { class: "link", href: `api/diagram?name=${name}&format=svg&download=1`, download: `${name}.svg` }, "SVG")),
-        el("div", { class: "diagram" }, el("img", { src: `api/diagram?name=${name}&format=svg`, alt: title })));
+        diagramPanel(name, title));
     }
     box.replaceChildren(...parts);
+  }
+
+  // A diagram at its natural size (never below 100%) in a scrolling viewport:
+  // wide diagrams scroll; only one narrower than the panel is fitted to its width.
+  // Zoom is a CSS transform on .diagram-zoom; .diagram-sizer carries the scaled
+  // size so the viewport's scrollbars match what is drawn.
+  const ZOOM_STEP = 1.25, ZOOM_MAX = 4;
+
+  function diagramPanel(name, title) {
+    const url = `api/diagram?name=${name}&format=svg`;
+    const img = el("img", { src: url, alt: title, title: "Open the full-size SVG in a new tab" });
+    const zoom = el("div", { class: "diagram-zoom" },
+      el("a", { href: url, target: "_blank", rel: "noopener" }, img));
+    const sizer = el("div", { class: "diagram-sizer" }, zoom);
+    const view = el("div", { class: "diagram", "data-diagram": name }, sizer);
+    const label = el("span", { class: "diagram-scale muted" }, "100%");
+    let scale = 1, fitted = true;
+
+    function apply(s) {
+      const w = img.naturalWidth, h = img.naturalHeight;
+      if (!w || !h) return;
+      scale = Math.min(ZOOM_MAX, Math.max(1, s));
+      zoom.style.transform = `scale(${scale})`;
+      sizer.style.width = `${w * scale}px`;
+      sizer.style.height = `${h * scale}px`;
+      label.textContent = `${Math.round(scale * 100)}%`;
+    }
+    function fit() {
+      fitted = true;
+      const w = img.naturalWidth, room = view.clientWidth;
+      apply(w && room && w <= room ? room / w : 1);
+    }
+    function zoomBy(f) { fitted = false; apply(scale * f); }
+
+    img.addEventListener("load", fit);
+    // the Diagrams tab may be hidden (zero width) when the image loads; refit on show/resize
+    new ResizeObserver(() => { if (fitted) fit(); }).observe(view);
+
+    const bar = el("div", { class: "diagram-toolbar" },
+      el("button", { type: "button", "data-zoom": "in", title: "Zoom in", onclick: () => zoomBy(ZOOM_STEP) }, "+"),
+      el("button", { type: "button", "data-zoom": "out", title: "Zoom out (not below 100%)", onclick: () => zoomBy(1 / ZOOM_STEP) }, "−"),
+      el("button", { type: "button", "data-zoom": "fit", title: "Reset: natural size, or fit the width if it is narrower than the panel", onclick: fit }, "Fit"),
+      label,
+      el("a", { class: "link", href: url, target: "_blank", rel: "noopener" }, "Open full size ↗"));
+    return el("div", { class: "diagram-panel" }, bar, view);
   }
 
   // ------------------------------------------------------------ boot

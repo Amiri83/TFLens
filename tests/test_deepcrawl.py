@@ -567,6 +567,100 @@ def test_architecture_svg_fits_and_parallel_labels_do_not_overlap():
     assert len(paths) == len(set(paths)) == 5
 
 
+def _hits(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    """Do two (left, right, top, bottom) boxes intersect?"""
+    return a[0] < b[1] and b[0] < a[1] and a[2] < b[3] and b[2] < a[3]
+
+
+def _dense_flows_tf(n: int = 4, fns: int = 3) -> str:
+    """n queues, tables and buckets, each wired to every one of `fns` lambdas: many labels
+    compete for the same column gaps."""
+    out = []
+    for i in range(n):
+        out.append(f'resource "aws_sqs_queue" "q{i}" {{\n  name = "queue-{i}"\n}}')
+        out.append(f'resource "aws_dynamodb_table" "t{i}" {{\n  name = "table-{i}"\n}}')
+        out.append(f'resource "aws_s3_bucket" "b{i}" {{\n  bucket = "bucket-{i}"\n}}')
+    for f in range(fns):
+        stmts = ",\n".join(
+            f'{{ Effect = "Allow", Action = ["sqs:ReceiveMessage", "sqs:DeleteMessage"], '
+            f"Resource = aws_sqs_queue.q{i}.arn }},\n"
+            f'{{ Effect = "Allow", Action = ["dynamodb:PutItem"], '
+            f"Resource = aws_dynamodb_table.t{i}.arn }}"
+            for i in range(n)
+        )
+        out.append(f'resource "aws_iam_role" "r{f}" {{\n  name = "fn-{f}-role"\n}}')
+        out.append(
+            f'resource "aws_iam_role_policy" "p{f}" {{\n  role = aws_iam_role.r{f}.id\n'
+            f'  policy = jsonencode({{ Version = "2012-10-17", Statement = [\n{stmts}\n] }})\n}}'
+        )
+        out.append(
+            f'resource "aws_lambda_function" "f{f}" {{\n  function_name = "fn-{f}"\n'
+            f"  role = aws_iam_role.r{f}.arn\n}}"
+        )
+        for i in range(n):
+            out.append(
+                f'resource "aws_lambda_event_source_mapping" "m{f}_{i}" {{\n'
+                f"  event_source_arn = aws_sqs_queue.q{i}.arn\n"
+                f"  function_name = aws_lambda_function.f{f}.arn\n}}"
+            )
+    for i in range(n):
+        hooks = "".join(
+            f"  lambda_function {{\n    lambda_function_arn = aws_lambda_function.f{f}.arn\n"
+            f'    events = ["s3:ObjectCreated:*"]\n  }}\n'
+            for f in range(fns)
+        )
+        out.append(
+            f'resource "aws_s3_bucket_notification" "n{i}" {{\n'
+            f"  bucket = aws_s3_bucket.b{i}.id\n{hooks}}}"
+        )
+    return "\n\n".join(out) + "\n"
+
+
+@pytest.mark.parametrize("name", ["app_flows", "multi_root_envs", "lambda", "dense"])
+def test_architecture_edge_labels_never_overlap_node_boxes(name, tmp_path):
+    if name == "dense":
+        (tmp_path / "main.tf").write_text(_dense_flows_tf())
+        m = run_analysis(tmp_path, git=False).model
+        assert len(architecture_graph(m)["edges"]) >= 30
+    else:
+        m = run_analysis(FIXTURES / name, git=False).model
+    text = svg(m, "architecture", "repo-a")
+    assert text == svg(m, "architecture", "repo-a")  # deterministic
+    root = _check_svg(text)
+    nodes = [
+        (x, x + float(r.get("width")), y, y + float(r.get("height")))
+        for g in root.iter(f"{SVG_NS}g")
+        for r in g.findall(f"{SVG_NS}rect")
+        if r.get("stroke-width") == "1.5"
+        for x, y in [(float(r.get("x")), float(r.get("y")))]
+    ]
+    assert len(nodes) == len(architecture_graph(m)["nodes"])
+    # the columns leave at least 160px between boxes for the labels
+    xs = sorted({n[0] for n in nodes})
+    assert all(b - a - 210 >= 160 for a, b in zip(xs, xs[1:], strict=False))
+    labels = []
+    for g in root.iter(f"{SVG_NS}g"):
+        t, bg, title = g.find(f"{SVG_NS}text"), g.find(f"{SVG_NS}rect"), g.find(f"{SVG_NS}title")
+        if t is None or t.get("font-size") != "9":
+            continue
+        x, y = float(bg.get("x")), float(bg.get("y"))
+        bg_box = (x, x + float(bg.get("width")), y, y + float(bg.get("height")))
+        assert bg.get("fill") == "#ffffff"  # readable over the curves it crosses
+        # a shortened label keeps its full text as the hover title
+        assert title.text == t.text or title.text.startswith(t.text[:-1]), (t.text, title.text)
+        labels.append((t.text, bg_box))
+    assert len(labels) == len(architecture_graph(m)["edges"]) > 0
+    text_boxes = [(t, (left, right, top, bot)) for t, left, right, top, bot in _label_boxes(root)]
+    for lab, box in labels + text_boxes:  # neither the text nor its background
+        for n in nodes:
+            assert not _hits(box, n), (lab, n)
+    for i, (la, a) in enumerate(labels):
+        for lb, b in labels[i + 1 :]:
+            assert not _hits(a, b), (la, lb)
+    if name == "app_flows":  # its s3 notification label is wider than the gap
+        assert any(t.endswith("…") for t, _ in labels)
+
+
 def test_architecture_view_flows_and_icons():
     m = run_analysis(FIXTURES / "app_flows").model
     g = architecture_graph(m)
