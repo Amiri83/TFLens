@@ -521,7 +521,7 @@ def test_architecture_diagram_panel_hooks(repo_dir):
     assert "w <= room ? room / w : 1" in js
     # full-size SVG in a new tab (both the image and the toolbar link)
     assert js.count('href: url, target: "_blank", rel: "noopener"') == 2
-    assert "const url = `api/diagram?name=${name}&format=svg`" in js
+    assert 'const url = `api/diagram?name=${name}&format=svg${query || ""}`' in js
     rules = dict(re.findall(r"^#diagrams (\.[\w\- ]+?) \{ (.*?) \}$", css, re.M))
     assert "overflow: auto" in rules[".diagram"]
     assert "max-width: none" in rules[".diagram img"]  # natural size, not shrunk

@@ -502,6 +502,19 @@ def module_tree_svg(model: dict[str, Any], title: str = "") -> str:
 # ------------------------------------------------------------------ environment matrix
 
 
+def backend_text(b: dict[str, Any]) -> str:
+    """``s3 bucket-a/app/terraform.tfstate``: a backend's type, store and key."""
+    settings = {s["key"]: s["value"] for s in b["settings"]}
+    where = settings.get("key") or settings.get("prefix") or settings.get("path") or ""
+    store = (
+        settings.get("bucket")
+        or settings.get("organization")
+        or settings.get("storage_account_name")
+        or ""
+    )
+    return b["type"] + (f" {store}" if store else "") + (f"/{where}" if where else "")
+
+
 def env_matrix(model: dict[str, Any]) -> dict[str, Any]:
     """Rows (roots with their backend) x columns (environment names) -> cell text."""
     structure = model.get("structure") or {"roots": [], "environments": []}
@@ -509,16 +522,7 @@ def env_matrix(model: dict[str, Any]) -> dict[str, Any]:
     names = sorted({e["name"] for e in envs}, key=str.lower) or ["(default)"]
     rows = []
     for r in structure["roots"]:
-        b = r["backend"]
-        settings = {s["key"]: s["value"] for s in b["settings"]}
-        where = settings.get("key") or settings.get("prefix") or settings.get("path") or ""
-        store = (
-            settings.get("bucket")
-            or settings.get("organization")
-            or settings.get("storage_account_name")
-            or ""
-        )
-        backend = b["type"] + (f" {store}" if store else "") + (f"/{where}" if where else "")
+        backend = backend_text(r["backend"])
         cells = {}
         for name in names:
             covering = [

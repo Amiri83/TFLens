@@ -243,9 +243,66 @@ def classify_module_dirs(repo: RepoSource, engine: Engine) -> list[dict[str, Any
                 "module_calls": len(mod.module_calls),
                 "variables": len(mod.variables),
                 "outputs": len(mod.outputs),
+                "interface": _interface(repo, mod),
             }
         )
     return out
+
+
+def _source_text(repo: RepoSource, attr: Attr | None) -> str | None:
+    """An argument's expression as written (``list(string)``), first line only."""
+    if attr is None or attr.loc is None:
+        return None
+    lines = repo.lines(attr.loc.file)
+    if not 1 <= attr.loc.start_line <= len(lines):
+        return None
+    line = lines[attr.loc.start_line - 1]
+    sep = ":" if attr.loc.file.endswith(".json") else "="
+    text = line.partition(sep)[2].strip().rstrip(",").strip()
+    if attr.loc.file.endswith(".json"):
+        text = text.strip('"')
+    if attr.loc.end_line > attr.loc.start_line:
+        text += " …"
+    return text or None
+
+
+def _description(block: Block) -> str | None:
+    attr = block.attrs.get("description")
+    value = _static(attr.raw) if attr else None
+    return value if isinstance(value, str) else None
+
+
+def _interface(repo: RepoSource, mod: ModuleSource) -> dict[str, list[dict[str, Any]]]:
+    """A module's inputs (variables) and outputs, each with where it is declared."""
+    variables = []
+    for name in sorted(mod.variables):
+        b = mod.variables[name]
+        default = b.attrs.get("default")
+        value = _static(default.raw) if default is not None else None
+        hcl = None
+        if default is not None and is_known(value):
+            hcl = json.dumps(to_plain(value), sort_keys=True)
+        variables.append(
+            {
+                "name": name,
+                "type": _source_text(repo, b.attrs.get("type")),
+                "required": default is None,
+                "default": short(value) if default is not None else None,
+                "default_hcl": hcl if hcl is None or len(hcl) <= MAX_VALUE else None,
+                "description": _description(b),
+                "location": _loc(b.loc),
+            }
+        )
+    outputs = [
+        {
+            "name": name,
+            "value": _source_text(repo, mod.outputs[name].attrs.get("value")),
+            "description": _description(mod.outputs[name]),
+            "location": _loc(mod.outputs[name].loc),
+        }
+        for name in sorted(mod.outputs)
+    ]
+    return {"variables": variables, "outputs": outputs}
 
 
 def _tree(engine: Engine, root: str) -> list[ModuleInstance]:

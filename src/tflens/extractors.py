@@ -10,7 +10,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from .policy import as_list
-from .values import JsonEncoded, Location, display, render, unwrap
+from .values import JsonEncoded, Location, collect_refs, display, render, unwrap
 
 if TYPE_CHECKING:
     from .analyze import Analyzer, Item
@@ -110,14 +110,22 @@ def lambda_function(a: Analyzer, it: Item) -> None:
 
 @extractor("aws_lambda_event_source_mapping")
 def lambda_event_source_mapping(a: Analyzer, it: Item) -> None:
-    sources = a.resolve(
-        it,
-        a.get(it, "event_source_arn"),
-        "event_source_arn",
-        a.attr_loc(it, "event_source_arn"),
-        None,
-        "event_source",
-    )
+    topics = [t for t in (render(v) for v in as_list(a.get(it, "topics"))) if t]
+    kafka = "self_managed_event_source" in it.block.blocks
+    if kafka:
+        # self-managed Kafka: no ARN, the topics are the event source
+        sources = [a.external("kafka_topic", t) for t in topics]
+        if not topics:
+            a.unknown(it.id, "topics", "Kafka topics are not known statically", it.loc)
+    else:
+        sources = a.resolve(
+            it,
+            a.get(it, "event_source_arn"),
+            "event_source_arn",
+            a.attr_loc(it, "event_source_arn"),
+            None,
+            "event_source",
+        )
     functions = a.resolve(
         it,
         a.get(it, "function_name"),
@@ -136,9 +144,12 @@ def lambda_event_source_mapping(a: Analyzer, it: Item) -> None:
         )
         if (v := a.get(it, k)) is not None
     }
+    if topics:
+        attrs["topics"] = topics
+    label = "event source mapping (self-managed Kafka)" if kafka else "event source mapping"
     for s in sources:
         for f in functions:
-            a.edge("TRIGGER", s, f, "event source mapping", [a.ev(it.loc)], attrs, [it.id])
+            a.edge("TRIGGER", s, f, label, [a.ev(it.loc)], attrs, [it.id])
 
 
 @extractor("aws_lambda_permission")
@@ -583,3 +594,158 @@ def vpc_endpoint(a: Analyzer, it: Item) -> None:
         _attach_sgs(a, it, a.get(it, "security_group_ids"), a.attr_loc(it, "security_group_ids"))
     if "policy" in it.block.attrs:
         a.grant_resource(it.id, it, a.get(it, "policy"), a.attr_loc(it, "policy"), [])
+
+
+# ------------------------------------------------------------------------ ECS
+
+TASK_DEF = {"aws_ecs_task_definition"}
+TARGET_GROUP = {"aws_lb_target_group", "aws_alb_target_group"}
+LOAD_BALANCER = {"aws_lb", "aws_alb"}
+
+
+@extractor("aws_ecs_task_definition")
+def ecs_task_definition(a: Analyzer, it: Item) -> None:
+    _props(a, it, "family", "network_mode", "cpu", "memory")
+    if "task_role_arn" in it.block.attrs:
+        loc = a.attr_loc(it, "task_role_arn")
+        for r in a.resolve(it, a.get(it, "task_role_arn"), "task_role_arn", loc, ROLE, "iam_role"):
+            a.runs_as.setdefault(it.id, []).append((r, [a.ev(loc, "task role")], []))
+
+
+@extractor("aws_ecs_service")
+def ecs_service(a: Analyzer, it: Item) -> None:
+    _props(a, it, "name", "desired_count", "launch_type")
+    if "task_definition" in it.block.attrs:
+        loc = a.attr_loc(it, "task_definition")
+        for t in a.resolve(
+            it, a.get(it, "task_definition"), "task_definition", loc, TASK_DEF, "task_definition"
+        ):
+            a.runs_as.setdefault(it.id, []).append((t, [a.ev(loc, "task definition")], []))
+    for blk, lb in a.nested(it, "load_balancer"):
+        attrs = {k: display(lb[k]) for k in ("container_name", "container_port") if k in lb}
+        for tg in a.resolve(
+            it, lb.get("target_group_arn"), "load_balancer.target_group_arn", blk.loc, TARGET_GROUP
+        ):
+            a.edge("TRIGGER", tg, it.id, "load balancer target", [a.ev(blk.loc)], attrs)
+
+
+# ---------------------------------------------------------------- load balancer
+
+
+@extractor("aws_lb", "aws_alb")
+def load_balancer(a: Analyzer, it: Item) -> None:
+    _props(a, it, "name", "load_balancer_type", "internal")
+
+
+def _forward_targets(action: dict[str, Any]) -> list[Any]:
+    """target_group_arn of a listener action, plus each ``forward.target_group.arn``."""
+    values = [action.get("target_group_arn")]
+    for fwd in as_list(action.get("forward")):
+        fwd = unwrap(fwd)
+        if isinstance(fwd, dict):
+            for tg in as_list(fwd.get("target_group")):
+                tg = unwrap(tg)
+                if isinstance(tg, dict):
+                    values.append(tg.get("arn"))
+    return [v for v in values if v is not None]
+
+
+@extractor("aws_lb_listener", "aws_alb_listener")
+def lb_listener(a: Analyzer, it: Item) -> None:
+    lbs = a.resolve(
+        it,
+        a.get(it, "load_balancer_arn"),
+        "load_balancer_arn",
+        a.attr_loc(it, "load_balancer_arn"),
+        LOAD_BALANCER,
+        "load_balancer",
+    )
+    protocol, port = render(a.get(it, "protocol")), render(a.get(it, "port"))
+    label = f"listener {protocol or '?'} {port or '?'}"
+    attrs = {"protocol": protocol, "port": port}
+    for blk, action in a.nested(it, "default_action"):
+        targets: list[str] = []
+        for v in _forward_targets(action):
+            targets += a.resolve(it, v, "default_action.target_group_arn", blk.loc, TARGET_GROUP)
+        for lb in lbs:
+            for tg in dict.fromkeys(targets):
+                a.edge("TRIGGER", lb, tg, label, [a.ev(blk.loc)], attrs, [it.id])
+
+
+@extractor("aws_lb_target_group_attachment")
+def lb_target_group_attachment(a: Analyzer, it: Item) -> None:
+    tgs = a.resolve(
+        it,
+        a.get(it, "target_group_arn"),
+        "target_group_arn",
+        a.attr_loc(it, "target_group_arn"),
+        TARGET_GROUP,
+        "target_group",
+    )
+    loc = a.attr_loc(it, "target_id")
+    targets = a.resolve(it, a.get(it, "target_id"), "target_id", loc, None, "lb_target")
+    for tg in tgs:
+        for t in targets:
+            a.edge("TRIGGER", tg, t, "load balancer target", [a.ev(it.loc)], {}, [it.id])
+
+
+# ---------------------------------------------------------------- EventBridge
+
+
+@extractor("aws_cloudwatch_event_rule")
+def event_rule(a: Analyzer, it: Item) -> None:
+    _props(a, it, "name", "schedule_expression", "event_bus_name")
+    if "event_pattern" in it.block.attrs:
+        a.props(it.id, event_pattern=True)
+
+
+@extractor("aws_cloudwatch_event_target")
+def event_target(a: Analyzer, it: Item) -> None:
+    rules = a.resolve(
+        it,
+        a.get(it, "rule"),
+        "rule",
+        a.attr_loc(it, "rule"),
+        {"aws_cloudwatch_event_rule"},
+        "event_rule",
+    )
+    targets = a.resolve(it, a.get(it, "arn"), "arn", a.attr_loc(it, "arn"), None, "arn")
+    for r in rules:
+        for t in targets:
+            a.edge("TRIGGER", r, t, "EventBridge rule target", [a.ev(it.loc)], {}, [it.id])
+
+
+# ---------------------------------------------------------------- API Gateway
+
+
+@extractor("aws_apigatewayv2_api", "aws_api_gateway_rest_api")
+def apigw_api(a: Analyzer, it: Item) -> None:
+    _props(a, it, "name", "protocol_type")
+
+
+@extractor("aws_apigatewayv2_integration", "aws_api_gateway_integration")
+def apigw_integration(a: Analyzer, it: Item) -> None:
+    v2 = it.type == "aws_apigatewayv2_integration"
+    api_attr, uri_attr = ("api_id", "integration_uri") if v2 else ("rest_api_id", "uri")
+    apis = a.resolve(
+        it,
+        a.get(it, api_attr),
+        api_attr,
+        a.attr_loc(it, api_attr),
+        {"aws_apigatewayv2_api", "aws_api_gateway_rest_api"},
+        "api",
+    )
+    if uri_attr not in it.block.attrs:
+        return
+    loc = a.attr_loc(it, uri_attr)
+    # an integration URI is an invoke ARN (Lambda) or a URL: only resource references count
+    targets = [
+        r.target
+        for r in collect_refs(a.get(it, uri_attr))
+        if r.target in a.graph.nodes and r.target != it.id
+    ]
+    if not targets:
+        a.unknown(it.id, uri_attr, "the integration target is not a resource here", loc)
+    for api in apis:
+        for t in dict.fromkeys(targets):
+            a.edge("TRIGGER", api, t, "API integration", [a.ev(it.loc)], {}, [it.id])

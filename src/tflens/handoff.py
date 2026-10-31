@@ -1,6 +1,8 @@
 """handoff.md: one Markdown file to hand a repository over to Claude Code (or a person).
 
-It holds the overview (every line with its ``file:line``), the three diagrams as Mermaid
+It holds the roots grouped by shape (each with its reason and one-line description),
+the flows (numbered chains, entry point to sink), the overview (every line with
+its ``file:line``), the three diagrams as Mermaid
 blocks, and, when a previous run exists, what changed since. Built from model.json and
 the repository files only: deterministic, offline, no LLM.
 """
@@ -10,8 +12,10 @@ from __future__ import annotations
 from typing import Any
 
 from . import __version__
+from .flow import build_flows, render_flows_markdown
 from .output import listing_text
 from .overview import build_overview, render_overview_markdown
+from .shapes import build_shapes, render_shapes_markdown
 from .snapshots import changes_markdown
 from .snippets import SourceLines
 from .visuals import DIAGRAMS, TITLES, mermaid
@@ -46,6 +50,12 @@ def render_handoff(
         "- Purpose lines marked *Guess* are heuristics from the README and resource "
         "counts, not facts.",
         "- The diagrams are Mermaid: they render on GitHub / GitLab or with `mmdc`.",
+        "- Flow steps marked *unverified* have a reference but no IAM grant; *can write* / "
+        "*can read* have an IAM grant but no reference.",
+        "",
+        render_shapes_markdown(build_shapes(model), level=2).rstrip(),
+        "",
+        render_flows_markdown(build_flows(model), level=2).rstrip(),
         "",
         render_overview_markdown(build_overview(model, title, source), listing, level=2).rstrip(),
         "",

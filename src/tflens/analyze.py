@@ -9,6 +9,7 @@ is propagated to the compute resources that run as those roles.
 from __future__ import annotations
 
 import fnmatch
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -19,6 +20,7 @@ from .model import Edge, Evidence, Graph, Node
 from .policy import Statement, as_list, parse_policy, statement_spans
 from .values import (
     Interp,
+    JsonEncoded,
     Location,
     Ref,
     Unknown,
@@ -71,6 +73,7 @@ IDENTITY: dict[str, IdentitySpec] = {
     "aws_sns_topic": IdentitySpec("name", "sns", lambda r: r.split(":", 1)[0]),
     "aws_dynamodb_table": IdentitySpec("name", "dynamodb", _dynamodb),
     "aws_lambda_function": IdentitySpec("function_name", "lambda", _lambda),
+    "aws_cloudwatch_event_rule": IdentitySpec("name", "events", _after("rule/")),
     "aws_iam_role": IdentitySpec("name", "iam", _after("role/")),
     "aws_iam_user": IdentitySpec("name", "iam", _after("user/")),
     "aws_iam_group": IdentitySpec("name", "iam", _after("group/")),
@@ -99,6 +102,11 @@ RELATIONSHIP_TYPES = {
     "aws_iam_policy_attachment",
     "aws_lambda_event_source_mapping",
     "aws_lambda_permission",
+    "aws_lb_listener",
+    "aws_lb_target_group_attachment",
+    "aws_cloudwatch_event_target",
+    "aws_apigatewayv2_integration",
+    "aws_api_gateway_integration",
     "aws_sns_topic_subscription",
     "aws_sns_topic_policy",
     "aws_sqs_queue_policy",
@@ -312,6 +320,8 @@ class Analyzer:
             for k in sorted(value):
                 self._config_refs(item, f"{path}.{k}", value[k], loc)
             return
+        if path == "container_definitions" and item.type == "aws_ecs_task_definition":
+            value = self._container_env_refs(item, value, loc)
         by_target: dict[str, list[str]] = {}
         for ref in collect_refs(value):
             if ref.target != item.id and ref.target in self.graph.nodes:
@@ -319,11 +329,56 @@ class Analyzer:
         for target in sorted(by_target):
             attrs: dict[str, Any] = {"attribute": path, "refs": sorted(set(by_target[target]))}
             label = path
+            ev_loc = loc
             if path.startswith("environment.variables."):
                 env = path[len("environment.variables.") :]
                 attrs["env_var"] = env
                 label = f"env {env}"
-            self.edge("CONFIG", item.id, target, label, [self.ev(loc)], attrs)
+                ev_loc = self.narrow(loc, env)
+            self.edge("CONFIG", item.id, target, label, [self.ev(ev_loc)], attrs)
+
+    def _container_env_refs(self, item: Item, value: Any, loc: Location) -> Any:
+        """ECS ``container_definitions``: one CONFIG edge per environment variable / secret
+        that references a resource (labelled like Lambda env vars); returns the rest."""
+        containers = unwrap(value)
+        if isinstance(containers, JsonEncoded):
+            containers = unwrap(containers.value)
+        if not isinstance(containers, list):
+            return value
+        rest: list[Any] = []
+        for c in containers:
+            c = unwrap(c)
+            if not isinstance(c, dict):
+                rest.append(c)
+                continue
+            for key, value_key, kind in (
+                ("environment", "value", "env"),
+                ("secrets", "valueFrom", "secret"),
+            ):
+                for entry in as_list(c.get(key)):
+                    entry = unwrap(entry)
+                    name = render(entry.get("name")) if isinstance(entry, dict) else None
+                    if name is None:
+                        rest.append(entry)
+                        continue
+                    targets = sorted(
+                        {
+                            r.target
+                            for r in collect_refs(entry.get(value_key))
+                            if r.target != item.id and r.target in self.graph.nodes
+                        }
+                    )
+                    for target in targets:
+                        attrs = {
+                            "attribute": f"container_definitions.{key}",
+                            "refs": sorted({r.expr() for r in collect_refs(entry)}),
+                            "env_var": name,
+                            "container": render(c.get("name")) or "?",
+                        }
+                        ev = [self.ev(self.narrow(loc, name))]
+                        self.edge("CONFIG", item.id, target, f"{kind} {name}", ev, attrs)
+            rest.append({k: v for k, v in c.items() if k not in ("environment", "secrets")})
+        return rest
 
     # ------------------------------------------------------------------ helpers
     def get(self, item: Item, name: str) -> Any:
@@ -345,6 +400,15 @@ class Analyzer:
         for k, v in values.items():
             if v is not None:
                 node.properties[k] = to_json(v)
+
+    def narrow(self, loc: Location, key: str) -> Location:
+        """The line of ``loc`` that sets ``key`` (an env var name, a map key), else ``loc``."""
+        pattern = re.compile(rf'^\s*(?:\{{\s*)?(?:name\s*[=:]\s*)?"?{re.escape(key)}"?\s*[=:,]')
+        lines = self.repo.lines(loc.file)
+        for n in range(loc.start_line, min(loc.end_line, len(lines)) + 1):
+            if pattern.search(lines[n - 1]):
+                return Location(loc.file, n, n)
+        return loc
 
     def ev(self, loc: Location, note: str = "") -> Evidence:
         return Evidence(loc.file, loc.start_line, loc.end_line, self.repo.snippet(loc), note)

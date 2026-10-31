@@ -1,4 +1,6 @@
-/* TFLens web UI: graph (Cytoscape, vendored), repository tree, detail panel.
+/* TFLens web UI: root view (the landing view: each root in the view its shape calls
+   for), flow, overview, graph (Cytoscape, vendored),
+   diagrams, repository tree, detail panel.
    All data comes from the local api/* endpoints next to this page (/api/* for
    `tflens serve --dir`, /runs/<id>/api/* for a recorded run); no external requests. */
 "use strict";
@@ -65,7 +67,7 @@
   }
 
   // ------------------------------------------------------------ views
-  const VIEWS = ["overview", "graph", "repo", "diagrams"];
+  const VIEWS = ["roots", "flow", "overview", "graph", "repo", "diagrams"];
   let graphFitted = false; // the graph is laid out while hidden: fit it when first shown
 
   function setView(view) {
@@ -150,10 +152,8 @@
       }
     });
     if (ov.resources && ov.resources.length) {
-      toc.push(["ov-res", "Resources"]);
-      parts.push(el("h2", { id: "ov-res" }, "Resources"),
-        el("p", { class: "muted" }, "What each resource is, what triggers it, what it can access and what accesses it."),
-        ...ov.resources.map(drilldown));
+      toc.push(["ov-res", "All resources"]);
+      parts.push(allResources(ov, "all-resources-ov", "ov-res", false));
     }
     if (ov.environments.length) {
       toc.push(["ov-envs", "Environments"]);
@@ -182,6 +182,152 @@
     box.replaceChildren(...parts);
     document.getElementById("toc").replaceChildren(...toc.map(([id, label]) =>
       el("a", { class: "file link", onclick: () => document.getElementById(id).scrollIntoView() }, label)));
+  }
+
+  // The resource inventory, collapsed: the flows come first.
+  function allResources(ov, cls, id, withSummary) {
+    const res = ov.resources || [];
+    const parts = [el("summary", {}, `All resources (${res.length})`)];
+    if (withSummary) parts.push(el("h3", {}, "What this repository deploys"), overviewList(ov.summary));
+    parts.push(el("p", { class: "muted" }, "What each resource is, what triggers it, what it can access and what accesses it."),
+      ...res.map(drilldown));
+    return el("details", { class: cls, id }, ...parts);
+  }
+
+  // ------------------------------------------------------------ flow (the landing view)
+  function flowStep(s) {
+    const parts = [s.summary, " ("];
+    s.evidence.forEach((ev, i) => {
+      if (i) parts.push(" + ");
+      parts.push(ev.what, " ", locLink(ev.location) || "?");
+    });
+    if (s.note) parts.push(`; ${s.note}`);
+    parts.push(")");
+    return el("li", { value: s.n, class: s.status ? `st-${s.status}` : "", "data-step": s.n }, ...parts);
+  }
+
+  // The flow content (start here, metrics, one diagram + numbered steps per chain).
+  // `pre` keeps element ids unique when a root's own Flow view is shown next to the
+  // repository's; `diagramQuery` selects that root's chains (`&root=<dir>`).
+  function flowParts(fl, pre, diagramQuery) {
+    const m = fl.metrics;
+    const toc = [[`${pre}-start`, "Start here"]];
+    const parts = [
+      el("div", { class: "start-here", id: `${pre}-start` },
+        el("h2", {}, "Start here"), overviewList(fl.start_here)),
+      el("div", { class: "flow-metrics", id: pre === "fl" ? "flow-metrics" : `${pre}-metrics` },
+        el("span", {}, `${m.flows} flows found`),
+        el("span", {}, `${m.steps} steps`),
+        el("span", { class: m.unverified ? "warn" : "" }, `${m.unverified} unverified links`),
+        el("span", {}, `${m.iam_only} IAM-only (can write / can read)`)),
+    ];
+    if (!fl.chains.length) {
+      parts.push(el("p", { class: "muted" },
+        "No flows found: no trigger, subscription, notification, rule, API or load balancer is declared for the code here."));
+    }
+    for (const c of fl.chains) {
+      const id = `${pre}-${c.id}`;
+      toc.push([id, `Flow ${c.n}: ${c.entry_label}`]);
+      parts.push(el("h2", { id, class: "flow-title" }, `Flow ${c.n}: ${c.title}`),
+        el("p", { class: "muted" }, `Entry point: ${c.entry_label} (${c.entry_kind}). `,
+          el("a", { class: "link", href: `api/diagram?name=${c.id}&format=svg${diagramQuery}&download=1`, download: `${c.id}.svg` }, "SVG")),
+        diagramPanel(c.id, `Flow ${c.n}`, diagramQuery),
+        el("ol", { class: "flow-steps" }, ...c.steps.map(flowStep)));
+      if (c.side.length) {
+        parts.push(el("h3", {}, "Side branches (dead-letter queues, alarms, logs)"),
+          el("ul", { class: "flow-side" }, ...c.side.map((s) => el("li", {}, s.text, " ", locLink(s.location)))));
+      }
+    }
+    return { parts, toc };
+  }
+
+  function tocLinks(toc) {
+    return toc.map(([tid, label]) =>
+      el("a", { class: "file link", onclick: () => document.getElementById(tid).scrollIntoView() }, label));
+  }
+
+  function renderFlow(fl, ov) {
+    const box = document.getElementById("flow");
+    const { parts, toc } = flowParts(fl, "fl", "");
+    toc.push(["fl-all", "All resources"]);
+    parts.push(allResources(ov, "all-resources", "fl-all", true));
+    box.replaceChildren(...parts);
+    document.getElementById("flow-toc").replaceChildren(...tocLinks(toc));
+  }
+
+  // ------------------------------------------------------------ roots (the landing view)
+  // Each root is classified by shape (app / platform / network / module library) and
+  // shown in its primary view; the switchers pick another root or another view.
+  let shapesData = null;
+
+  function renderRoots(shapes) {
+    shapesData = shapes;
+    const list = document.getElementById("root-list");
+    if (!shapes.roots.length) {
+      list.replaceChildren(el("p", { class: "muted" }, "No root found."));
+      document.getElementById("roots").replaceChildren(
+        el("p", { class: "muted" }, "No Terraform or Terragrunt root found: see the Overview."));
+      return;
+    }
+    // the root switcher, grouped by shape
+    list.replaceChildren(...shapes.groups.flatMap((g) => [
+      el("div", { class: "tag shape-group" }, g.label),
+      ...g.roots.map((r) => el("a", { class: "file link root-link", "data-root": r.dir,
+        title: r.summary, onclick: () => showRootView(r.dir, "") }, r.title)),
+    ]));
+    showRootView(shapes.default_root, "");
+  }
+
+  function shapesSummary(shapes) {
+    const head = shapes.mixed
+      ? `Mixed repository: ${shapes.roots.length} roots of ${shapes.groups.length} shapes, each shown in its own view.`
+      : `${shapes.roots.length} root${shapes.roots.length === 1 ? "" : "s"}, all ${shapes.groups[0].label}.`;
+    return el("div", { class: "start-here", id: "rv-shapes" },
+      el("h2", {}, "Roots by shape"), el("p", {}, head), overviewList(shapes.lines));
+  }
+
+  async function showRootView(root, view) {
+    const box = document.getElementById("roots");
+    for (const a of document.querySelectorAll("#root-list .root-link")) {
+      a.classList.toggle("active", a.dataset.root === root);
+    }
+    let d;
+    try {
+      d = await api(`api/root-view?root=${encodeURIComponent(root)}&view=${encodeURIComponent(view)}`);
+    } catch (err) {
+      box.replaceChildren(el("p", { class: "muted" }, `${root}: ${err.message}`));
+      return;
+    }
+    const s = d.shape;
+    const toc = [["rv-shapes", "Roots by shape"], ["rv-root", `Root ${s.title}`]];
+    const parts = [shapesSummary(shapesData),
+      el("h2", { id: "rv-root", class: "rv-root" }, `Root ${s.title} `,
+        el("span", { class: `shape-badge shape-${s.shape}` }, s.shape_label), " ", locLink(s.location)),
+      el("p", { class: "rv-summary" }, s.summary),
+      el("p", { class: "muted rv-reason" }, `Why: ${s.reason}`),
+      el("div", { class: "view-switcher" }, el("span", { class: "muted" }, "View: "),
+        ...s.views.map((v) => el("button", {
+          type: "button", "data-rview": v.view,
+          class: v.view === d.view ? "active" : "",
+          onclick: () => showRootView(root, v.view),
+        }, v.primary ? `${v.label} (primary)` : v.label)))];
+    if (d.view === "flow") {
+      const fp = flowParts(d.flow, "rv", `&root=${encodeURIComponent(root)}`);
+      parts.push(...fp.parts);
+      toc.push(...fp.toc);
+    } else {
+      for (const sec of d.sections) {
+        const id = `rv-${sec.id}`;
+        toc.push([id, sec.title]);
+        parts.push(el("h2", { id, class: "rv-section" }, sec.title, " ", locLink(sec.location)),
+          overviewList(sec.lines));
+        if (sec.code) {
+          parts.push(el("h3", {}, sec.code_title || "Code"), el("pre", { class: "code" }, sec.code));
+        }
+      }
+    }
+    box.replaceChildren(...parts);
+    document.getElementById("roots-toc").replaceChildren(...tocLinks(toc));
   }
 
   function inventoryTable(inv) {
@@ -616,8 +762,8 @@
   // size so the viewport's scrollbars match what is drawn.
   const ZOOM_STEP = 1.25, ZOOM_MAX = 4;
 
-  function diagramPanel(name, title) {
-    const url = `api/diagram?name=${name}&format=svg`;
+  function diagramPanel(name, title, query) {
+    const url = `api/diagram?name=${name}&format=svg${query || ""}`;
     const img = el("img", { src: url, alt: title, title: "Open the full-size SVG in a new tab" });
     const zoom = el("div", { class: "diagram-zoom" },
       el("a", { href: url, target: "_blank", rel: "noopener" }, img));
@@ -657,9 +803,12 @@
 
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree, ov] = await Promise.all(
-      [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview")]);
+    const [summary, graph, tree, ov, fl, shapes] = await Promise.all(
+      [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview"), api("api/flow"),
+        api("api/shapes")]);
     renderOverview(ov);
+    renderFlow(fl, ov);
+    renderRoots(shapes);
     renderFailure(summary, ov);
     document.getElementById("title").textContent = summary.title;
     // a recorded run (managed mode) is read-only: no Regenerate, a way back to the runs
@@ -671,7 +820,9 @@
     const s = summary.summary;
     const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
     const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
+    const f = summary.flow;
     document.getElementById("summary").textContent =
+      `${f.flows} flows · ${f.steps} steps · ${f.unverified} unverified links · ` +
       `${s.files} files · ${s.modules} modules · ${nodes} nodes · edges: ${edges} · ` +
       `${s.unknowns} unknowns · ${s.parse_errors} parse errors`;
     document.getElementById("tree").replaceChildren(treeNode(tree));
