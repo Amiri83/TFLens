@@ -17,7 +17,7 @@ from tflens.output import dumps, run_analysis
 from tflens.report import render_report
 from tflens.server import is_loopback, make_server, url_of
 from tflens.snippets import format_snippet, snippet_lines
-from tflens.webapi import Api, ModelStore
+from tflens.webapi import Api, ModelStore, module_groups, short_name
 
 LAMBDA_ROLE_EDGE = (
     "CONFIG:module.worker.aws_lambda_function.this->module.worker.aws_iam_role.this#1"
@@ -113,6 +113,71 @@ def test_graph_endpoint(api):
     lam = next(n["data"] for n in g["nodes"] if n["data"]["service"] == "lambda")
     assert lam["color"] == g["colors"]["services"]["lambda"]
     assert get(api, "/api/graph") == g  # deterministic
+
+
+def test_meta_data_sources_are_classified_as_meta(api):
+    g = get(api, "/api/graph")
+    by_id = {n["data"]["id"]: n["data"] for n in g["nodes"]}
+    for node_id in (
+        "data.aws_caller_identity.current",
+        "module.worker.data.aws_iam_policy_document.assume",
+        "module.worker.data.aws_iam_policy_document.access",
+    ):
+        assert by_id[node_id]["service"] == "meta"
+        assert by_id[node_id]["color"] == g["colors"]["services"]["meta"]
+        assert get(api, "/api/node?id=" + quote(node_id))["summary"]["service"] == "meta"
+    assert by_id["module.worker.aws_iam_role.this"]["service"] == "iam"
+    assert "meta" in g["filters"]["services"] and "caller" not in g["filters"]["services"]
+    nodes = {n["id"]: n for n in get(api, "/api/nodes")}
+    assert nodes["data.aws_caller_identity.current"]["service"] == "meta"
+    # UI defaults: meta hidden, CONFIG edges off, grouping on
+    assert g["defaults"] == {
+        "kinds": ["ACCESS", "RUNS_ON"],
+        "show_meta": False,
+        "group_by_module": True,
+    }
+
+
+def test_short_names_and_module_groups(api):
+    g = get(api, "/api/graph")
+    by_id = {n["data"]["id"]: n["data"] for n in g["nodes"]}
+    expected = {
+        "module.worker.aws_iam_role.this": "iam_role.this",
+        "module.worker.data.aws_iam_policy_document.assume": "data.iam_policy_document.assume",
+        "aws_sqs_queue.jobs": "sqs_queue.jobs",
+        "data.aws_caller_identity.current": "data.caller_identity.current",
+        "external:runtime:python3.12": "python3.12",
+    }
+    for node_id, short in expected.items():
+        assert by_id[node_id]["short_name"] == short
+        assert by_id[node_id]["label"] == short
+    role = get(api, "/api/node?id=" + quote("module.worker.aws_iam_role.this"))
+    assert role["short_name"] == role["summary"]["short_name"] == "iam_role.this"
+    assert role["title"] == "module.worker.aws_iam_role.this"  # full id stays in the panel
+    assert role["summary"]["module"] == "module.worker"
+
+    groups = {grp["data"]["id"]: grp for grp in g["groups"]}
+    assert set(groups) == {"group:module.storage", "group:module.worker"}
+    assert groups["group:module.worker"]["classes"] == "group"
+    assert groups["group:module.worker"]["data"]["module"] == "module.worker"
+    assert by_id["module.worker.aws_iam_role.this"]["group"] == "group:module.worker"
+    assert by_id["aws_sqs_queue.jobs"]["group"] is None
+
+    edge = next(e["data"] for e in g["edges"] if e["data"]["id"] == S3_ACCESS_EDGE)
+    assert edge["short_label"] == "2 actions"
+    role_edge = next(e["data"] for e in g["edges"] if e["data"]["id"] == LAMBDA_ROLE_EDGE)
+    assert role_edge["short_label"] == "role"
+
+
+def test_short_name_strips_arns_and_nests_module_groups():
+    arn = "arn:aws:iam::123456789012:role/example-thumbs"
+    ext = {"kind": "external", "name": arn, "id": f"external:iam_role:{arn}", "module": ""}
+    assert short_name(ext) == "role/example-thumbs"
+    groups = module_groups({"(root)", "module.a.module.b"})
+    assert [(x["data"]["id"], x["data"]["parent"]) for x in groups] == [
+        ("group:module.a", None),
+        ("group:module.a.module.b", "group:module.a"),
+    ]
 
 
 def test_nodes_and_edges_endpoints(api):

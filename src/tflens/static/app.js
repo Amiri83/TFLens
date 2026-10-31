@@ -84,14 +84,15 @@
       return;
     }
     if (cy) {
-      cy.elements().unselect();
       const ele = cy.getElementById(id);
-      if (ele && ele.length) ele.select();
+      focus(ele.length ? ele : cy.getElementById(`group:${id}`));
     }
     const parts = [el("h2", {}, d.title)];
     const s = d.summary;
     if (type === "node") {
       parts.push(el("dl", {},
+        el("dt", {}, "Name"), el("dd", {}, s.short_name),
+        el("dt", {}, "Id"), el("dd", {}, d.id),
         el("dt", {}, "What"), el("dd", {}, s.description),
         el("dt", {}, "Type"), el("dd", {}, s.type),
         el("dt", {}, "Service"), el("dd", {}, s.service || "—"),
@@ -148,16 +149,52 @@
   }
 
   // ------------------------------------------------------------ graph
-  function checkboxList(container, values, colorOf, line) {
-    container.replaceChildren(...values.map((v) =>
-      el("label", {},
-        el("input", { type: "checkbox", value: v, checked: "", onchange: applyFilters }),
+  const PRESETS = [
+    ["Access", ["ACCESS"]],
+    ["Network", ["NETWORK"]],
+    ["All", null], // every kind
+  ];
+
+  function checkboxList(container, values, colorOf, line, isOn) {
+    container.replaceChildren(...values.map((v) => {
+      const attrs = { type: "checkbox", value: v, onchange: applyFilters };
+      if (!isOn || isOn(v)) attrs.checked = "";
+      return el("label", {},
+        el("input", attrs),
         colorOf ? el("span", { class: line ? "swatch line" : "swatch", style: `background:${colorOf(v)}` }) : null,
-        v)));
+        v);
+    }));
   }
 
   function checked(id) {
     return new Set([...document.querySelectorAll(`#${id} input:checked`)].map((i) => i.value));
+  }
+
+  function setKinds(kinds) {
+    for (const input of document.querySelectorAll("#filter-kinds input")) {
+      input.checked = kinds === null || kinds.includes(input.value);
+    }
+    applyFilters();
+  }
+
+  // Graph controls that index.html does not declare are added here (once).
+  function ensureGraphControls() {
+    if (document.getElementById("group-modules")) return;
+    const isolated = document.getElementById("hide-isolated").closest("label");
+    isolated.after(
+      el("label", { class: "inline" },
+        el("input", { type: "checkbox", id: "group-modules", onchange: () => graphData && buildGraph(graphData, true) }),
+        " Group by module"),
+      el("label", { class: "inline", title: "aws_caller_identity, aws_region, aws_partition, aws_iam_policy_document" },
+        el("input", { type: "checkbox", id: "show-meta", onchange: applyFilters }),
+        " Show meta data sources"));
+    document.getElementById("filter-kinds").before(
+      el("div", { class: "presets" }, ...PRESETS.map(([name, kinds]) =>
+        el("button", { type: "button", onclick: () => setKinds(kinds) }, name))));
+  }
+
+  function visible(ele) {
+    return ele.style("display") !== "none";
   }
 
   function applyFilters() {
@@ -165,42 +202,116 @@
     const kinds = checked("filter-kinds");
     const services = checked("filter-services");
     const modules = checked("filter-modules");
+    const showMeta = document.getElementById("show-meta").checked;
     const hideIsolated = document.getElementById("hide-isolated").checked;
     const q = document.getElementById("search").value.trim().toLowerCase();
+    const members = cy.nodes().not(".group");
+    const groups = cy.nodes(".group");
     cy.batch(() => {
-      cy.nodes().forEach((n) => {
-        const ok = services.has(n.data("service")) && modules.has(n.data("module"));
+      members.forEach((n) => {
+        const service = n.data("service");
+        const ok = (service === "meta" ? showMeta : services.has(service)) && modules.has(n.data("module"));
         n.style("display", ok ? "element" : "none");
       });
       cy.edges().forEach((e) => {
-        const ok = kinds.has(e.data("kind")) &&
-          e.source().style("display") !== "none" && e.target().style("display") !== "none";
+        const ok = kinds.has(e.data("kind")) && visible(e.source()) && visible(e.target());
         e.style("display", ok ? "element" : "none");
       });
       if (hideIsolated) {
-        cy.nodes().forEach((n) => {
-          if (n.style("display") === "none") return;
-          const visible = n.connectedEdges().filter((e) => e.style("display") !== "none");
-          if (!visible.length) n.style("display", "none");
+        members.forEach((n) => {
+          if (visible(n) && !n.connectedEdges().filter(visible).length) n.style("display", "none");
         });
       }
+      // a module group stays visible while any of its members is (deepest groups first)
+      groups.sort((a, b) => b.ancestors().length - a.ancestors().length).forEach((g) => {
+        g.style("display", g.children().filter(visible).length ? "element" : "none");
+      });
       cy.elements().removeClass("faded match");
       if (q) {
-        const hits = cy.nodes().filter((n) =>
-          n.style("display") !== "none" &&
-          (n.id().toLowerCase().includes(q) || String(n.data("name")).toLowerCase().includes(q)));
+        const hits = members.filter((n) =>
+          visible(n) && (n.id().toLowerCase().includes(q) || String(n.data("name")).toLowerCase().includes(q)));
         cy.elements().addClass("faded");
         hits.removeClass("faded").addClass("match");
+        hits.ancestors().removeClass("faded");
         hits.connectedEdges().removeClass("faded");
       }
     });
   }
 
-  function buildGraph(data) {
+  // Highlight an element's neighbourhood and dim everything else (Esc resets).
+  function focus(ele) {
+    clearFocus();
+    if (!cy || !ele || !ele.length) return;
+    let keep;
+    if (ele.isEdge()) keep = ele.union(ele.connectedNodes());
+    else if (ele.hasClass("group")) keep = ele.union(ele.descendants()).union(ele.descendants().connectedEdges());
+    else keep = ele.closedNeighborhood();
+    keep = keep.union(keep.ancestors());
+    cy.batch(() => {
+      cy.elements().not(keep).addClass("dimmed");
+      keep.addClass("focused");
+    });
+    ele.select();
+  }
+
+  function clearFocus() {
+    if (!cy) return;
+    cy.batch(() => cy.elements().removeClass("dimmed focused").unselect());
+  }
+
+  function tooltip() {
+    let tip = document.getElementById("tooltip");
+    if (!tip) {
+      tip = el("div", { id: "tooltip", class: "hidden" });
+      document.getElementById("center").append(tip);
+    }
+    return tip;
+  }
+
+  function showTooltip(evt) {
+    const t = evt.target;
+    const tip = tooltip();
+    if (t.isEdge()) {
+      tip.replaceChildren(el("strong", {}, t.data("kind")), " ", t.data("label"),
+        el("div", { class: "tag" }, `${t.source().id()} → ${t.target().id()}`));
+    } else if (t.hasClass("group")) {
+      tip.replaceChildren(el("strong", {}, t.data("module")),
+        el("div", { class: "tag" }, `${t.descendants().not(".group").length} nodes`));
+    } else {
+      tip.replaceChildren(el("strong", {}, t.id()),
+        el("div", { class: "tag" }, `${t.data("type")} · ${t.data("service")} · module ${t.data("module")}`));
+    }
+    const pos = evt.renderedPosition || t.renderedPosition();
+    tip.style.left = `${pos.x + 12}px`;
+    tip.style.top = `${pos.y + 12}px`;
+    tip.classList.remove("hidden");
+  }
+
+  function hideTooltip() {
+    tooltip().classList.add("hidden");
+  }
+
+  function elements(data, grouped) {
+    // fresh copies: the graph is rebuilt from the same data when grouping is toggled
+    const nodes = data.nodes.map((n) => ({ data: { ...n.data, parent: grouped ? n.data.group : null } }));
+    const groups = data.groups.map((g) => ({ data: { ...g.data }, classes: g.classes }));
+    return { nodes: grouped ? groups.concat(nodes) : nodes, edges: data.edges.map((e) => ({ data: { ...e.data } })) };
+  }
+
+  function buildGraph(data, keepFilters) {
     graphData = data;
-    checkboxList(document.getElementById("filter-kinds"), data.filters.kinds, (k) => data.colors.kinds[k], true);
-    checkboxList(document.getElementById("filter-services"), data.filters.services, (s) => data.colors.services[s]);
-    checkboxList(document.getElementById("filter-modules"), data.filters.modules, null);
+    ensureGraphControls();
+    if (!keepFilters) {
+      const kinds = new Set(data.defaults.kinds);
+      checkboxList(document.getElementById("filter-kinds"), data.filters.kinds,
+        (k) => data.colors.kinds[k], true, (k) => kinds.has(k));
+      checkboxList(document.getElementById("filter-services"),
+        data.filters.services.filter((s) => s !== "meta"), (s) => data.colors.services[s]);
+      checkboxList(document.getElementById("filter-modules"), data.filters.modules, null);
+      document.getElementById("show-meta").checked = data.defaults.show_meta;
+      document.getElementById("group-modules").checked = data.defaults.group_by_module;
+    }
+    hideTooltip();
     const container = document.getElementById("graph");
     if (typeof window.cytoscape !== "function") {
       container.replaceChildren(el("div", { class: "banner" },
@@ -211,29 +322,54 @@
     if (cy) cy.destroy();
     cy = window.cytoscape({
       container,
-      elements: { nodes: data.nodes, edges: data.edges },
+      elements: elements(data, document.getElementById("group-modules").checked),
       wheelSensitivity: 0.3,
       style: [
         { selector: "node", style: {
           "background-color": "data(color)", label: "data(label)", "font-size": 9,
           "text-valign": "bottom", "text-margin-y": 3, width: 18, height: 18,
-          "text-wrap": "ellipsis", "text-max-width": 160 } },
+          "text-wrap": "ellipsis", "text-max-width": 120 } },
         { selector: 'node[kind = "external"]', style: { shape: "diamond" } },
         { selector: 'node[kind = "data"]', style: { shape: "round-rectangle" } },
         { selector: 'node[category = "relationship"], node[category = "policy"]', style: { width: 12, height: 12 } },
+        { selector: "node.group", style: {
+          shape: "round-rectangle", "background-color": "#eaeef2", "background-opacity": 0.5,
+          "border-width": 1, "border-color": "#8c959f", "border-style": "dashed",
+          label: "data(label)", "font-size": 10, "font-weight": 600, color: "#57606a",
+          "text-valign": "top", "text-halign": "center", "text-max-width": 400, padding: 14 } },
         { selector: "edge", style: {
           "line-color": "data(color)", "target-arrow-color": "data(color)",
-          "target-arrow-shape": "triangle", "curve-style": "bezier", width: 1.5, "arrow-scale": 0.8 } },
+          "target-arrow-shape": "triangle", "curve-style": "bezier", "control-point-step-size": 28,
+          width: 1.5, "arrow-scale": 0.9, "font-size": 8, color: "#1f2328",
+          "text-background-color": "#ffffff", "text-background-opacity": 0.85,
+          "text-background-padding": 1, "text-rotation": "autorotate" } },
         { selector: 'edge[kind = "CONFIG"]', style: { "line-style": "dashed", width: 1 } },
         { selector: 'edge[kind = "RUNS_ON"]', style: { "line-style": "dotted" } },
-        { selector: ":selected", style: { "border-width": 3, "border-color": "#0969da", "line-color": "#0969da", "target-arrow-color": "#0969da", width: 3 } },
+        { selector: "edge.hover", style: { label: "data(short_label)", width: 2.5, "z-index": 10 } },
+        { selector: "node:selected", style: { "border-width": 3, "border-color": "#0969da" } },
+        { selector: "edge:selected", style: {
+          "line-color": "#0969da", "target-arrow-color": "#0969da", width: 3, label: "data(short_label)" } },
         { selector: ".faded", style: { opacity: 0.15 } },
         { selector: ".match", style: { "border-width": 3, "border-color": "#bf8700" } },
+        { selector: ".dimmed", style: { opacity: 0.12 } },
       ],
       layout: { name: "grid" },
     });
-    cy.on("tap", "node", (evt) => showDetail("node", evt.target.id()));
-    cy.on("tap", "edge", (evt) => showDetail("edge", evt.target.id()));
+    cy.on("tap", (evt) => {
+      const t = evt.target;
+      if (t === cy) clearFocus();
+      else if (t.hasClass("group")) showDetail("node", t.data("module"));
+      else showDetail(t.isEdge() ? "edge" : "node", t.id());
+    });
+    cy.on("mouseover", "node, edge", (evt) => {
+      if (evt.target.isEdge()) evt.target.addClass("hover");
+      showTooltip(evt);
+    });
+    cy.on("mouseout", "node, edge", (evt) => {
+      evt.target.removeClass("hover");
+      hideTooltip();
+    });
+    cy.on("pan zoom", hideTooltip);
     applyFilters();
     cy.layout({ name: "cose", animate: false, randomize: false, nodeDimensionsIncludeLabels: true,
       eles: cy.elements(":visible") }).run();
@@ -300,6 +436,12 @@
     for (const t of document.querySelectorAll(".tab")) t.addEventListener("click", () => setView(t.dataset.view));
     document.getElementById("search").addEventListener("input", applyFilters);
     document.getElementById("hide-isolated").addEventListener("change", applyFilters);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        clearFocus();
+        hideTooltip();
+      }
+    });
     const regen = document.getElementById("regenerate");
     regen.addEventListener("click", async () => {
       regen.disabled = true;

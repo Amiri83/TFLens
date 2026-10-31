@@ -39,6 +39,7 @@ SERVICE_PALETTE = (
     "#a0cbe8",
 )
 EXTERNAL_COLOR = "#bab0ac"
+META_COLOR = "#d0d7de"
 KIND_COLORS = {
     "ACCESS": "#d62728",
     "TRIGGER": "#ff7f0e",
@@ -47,6 +48,14 @@ KIND_COLORS = {
     "RUNS_ON": "#9467bd",
 }
 ROOT_MODULE = "(root)"
+# Data sources that only supply context (account, region, policy JSON); the UI
+# classifies them as service "meta" and hides them by default.
+META_DATA_TYPES = frozenset(
+    {"aws_caller_identity", "aws_region", "aws_partition", "aws_iam_policy_document"}
+)
+META_SERVICE = "meta"
+DEFAULT_HIDDEN_KINDS = frozenset({"CONFIG"})
+GROUP_PREFIX = "group:"
 
 
 def default_model_path(root: Path) -> Path:
@@ -143,13 +152,39 @@ def _module_of(node: dict[str, Any]) -> str:
     return node["module"] or ROOT_MODULE
 
 
+def _service_of(node: dict[str, Any]) -> str:
+    if node["kind"] == "data" and node["type"] in META_DATA_TYPES:
+        return META_SERVICE
+    return node["service"]
+
+
+def short_name(node: dict[str, Any]) -> str:
+    """Display name without the module path or the ``aws_`` type prefix
+    (``module.worker.aws_iam_role.this`` -> ``iam_role.this``); external ARNs are
+    cut to their resource part (``arn:aws:iam::1:role/x`` -> ``role/x``)."""
+    if node["kind"] == "external":
+        name = node["name"]
+        return name.rsplit(":", 1)[-1] if name.startswith("arn:") else name
+    if node["kind"] == "module":
+        return node["name"]
+    prefix = f"{node['module']}." if node["module"] else ""
+    local = node["id"][len(prefix) :] if prefix and node["id"].startswith(prefix) else node["id"]
+    data = local.startswith("data.")
+    if data:
+        local = local[len("data.") :]
+    if local.startswith("aws_"):
+        local = local[len("aws_") :]
+    return f"data.{local}" if data else local
+
+
 def _compact(node: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": node["id"],
         "name": node["name"],
+        "short_name": short_name(node),
         "type": node["type"],
         "kind": node["kind"],
-        "service": node["service"],
+        "service": _service_of(node),
         "category": node["category"],
         "module": _module_of(node),
         "location": node["location"],
@@ -186,30 +221,76 @@ def _unanalyzed_modules(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def service_colors(model: dict[str, Any]) -> dict[str, str]:
-    services = sorted({n["service"] for n in model["nodes"] if n["service"]})
-    return {s: SERVICE_PALETTE[i % len(SERVICE_PALETTE)] for i, s in enumerate(services)}
+    services = sorted({_service_of(n) for n in model["nodes"] if n["service"]} - {META_SERVICE})
+    colors = {s: SERVICE_PALETTE[i % len(SERVICE_PALETTE)] for i, s in enumerate(services)}
+    colors[META_SERVICE] = META_COLOR
+    return colors
+
+
+def _group_id(module: str) -> str:
+    return GROUP_PREFIX + module
+
+
+def _parent_module(module: str) -> str:
+    """``module.a.module.b`` -> ``module.a``; top-level modules have no parent ("")."""
+    head, sep, _ = module.rpartition(".module.")
+    return head if sep else ""
+
+
+def module_groups(modules: set[str]) -> list[dict[str, Any]]:
+    """Compound parent nodes, one per non-root module (and each enclosing module)."""
+    wanted: set[str] = set()
+    for m in modules:
+        while m and m != ROOT_MODULE and m not in wanted:
+            wanted.add(m)
+            m = _parent_module(m)
+    return [
+        {
+            "data": {
+                "id": _group_id(m),
+                "label": m,
+                "module": m,
+                "parent": _group_id(_parent_module(m)) if _parent_module(m) else None,
+            },
+            "classes": "group",
+        }
+        for m in sorted(wanted)
+    ]
+
+
+def edge_short_label(edge: dict[str, Any]) -> str:
+    actions = edge["attributes"].get("actions")
+    if isinstance(actions, list):
+        return f"{len(actions)} action" + ("" if len(actions) == 1 else "s")
+    label = edge["label"]
+    return label if len(label) <= 24 else label[:23] + "…"
 
 
 def graph_view(model: dict[str, Any]) -> dict[str, Any]:
-    """Cytoscape elements (module call nodes are left to the repo view)."""
+    """Cytoscape elements (module call nodes are left to the repo view). Nodes
+    carry ``group`` (their module's compound parent id, if any); the UI sets
+    ``parent`` from it when grouping by module is enabled."""
     colors = service_colors(model)
     nodes = []
     for n in model["nodes"]:
         if n["kind"] == "module":
             continue
+        service = _service_of(n)
         nodes.append(
             {
                 "data": {
                     "id": n["id"],
-                    "label": n["name"] if n["kind"] == "external" else n["id"],
+                    "label": short_name(n),
+                    "short_name": short_name(n),
                     "name": n["name"],
                     "type": n["type"],
                     "kind": n["kind"],
                     "category": n["category"],
-                    "service": n["service"] or "external",
+                    "service": service or "external",
                     "module": _module_of(n),
+                    "group": _group_id(n["module"]) if n["module"] else None,
                     "file": n["location"]["file"] if n["location"] else "",
-                    "color": colors.get(n["service"], EXTERNAL_COLOR),
+                    "color": colors.get(service, EXTERNAL_COLOR),
                 }
             }
         )
@@ -221,19 +302,28 @@ def graph_view(model: dict[str, Any]) -> dict[str, Any]:
                 "target": e["target"],
                 "kind": e["kind"],
                 "label": e["label"],
+                "short_label": edge_short_label(e),
                 "color": KIND_COLORS.get(e["kind"], "#000000"),
             }
         }
         for e in model["edges"]
     ]
     services = sorted({d["data"]["service"] for d in nodes})
+    kinds = [k for k in EDGE_KINDS if any(e["kind"] == k for e in model["edges"])]
     return {
         "nodes": nodes,
         "edges": edges,
+        "groups": module_groups({d["data"]["module"] for d in nodes}),
         "filters": {
-            "kinds": [k for k in EDGE_KINDS if any(e["kind"] == k for e in model["edges"])],
+            "kinds": kinds,
             "modules": sorted({d["data"]["module"] for d in nodes}),
             "services": services,
+        },
+        # initial UI state: CONFIG edges and meta data sources start hidden
+        "defaults": {
+            "kinds": [k for k in kinds if k not in DEFAULT_HIDDEN_KINDS],
+            "show_meta": False,
+            "group_by_module": True,
         },
         "colors": {
             "services": {s: colors.get(s, EXTERNAL_COLOR) for s in services},
@@ -300,11 +390,13 @@ def node_detail(
         "type": "node",
         "id": node_id,
         "title": node_id,
+        "short_name": short_name(node),
         "summary": {
             "description": description,
+            "short_name": short_name(node),
             "kind": node["kind"],
             "type": node["type"],
-            "service": node["service"],
+            "service": _service_of(node),
             "module": _module_of(node),
             "outgoing": len(out_edges),
             "incoming": len(in_edges),
