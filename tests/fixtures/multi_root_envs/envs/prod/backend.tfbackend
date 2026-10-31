@@ -1,0 +1,2 @@
+key            = "envs/prod/terraform.tfstate"
+dynamodb_table = "repo-a-tflock"

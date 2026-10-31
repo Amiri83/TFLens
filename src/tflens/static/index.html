@@ -12,15 +12,21 @@
     <a id="home" class="home hidden" href="/runs">&larr; Runs</a>
     <h1>TFLens <span id="title"></span></h1>
     <nav>
-      <button type="button" class="tab active" data-view="graph">Graph</button>
+      <button type="button" class="tab active" data-view="overview">Overview</button>
+      <button type="button" class="tab" data-view="graph">Graph</button>
       <button type="button" class="tab" data-view="repo">Repository</button>
     </nav>
     <div id="summary"></div>
     <button type="button" id="regenerate" title="Re-analyze the repository and rewrite model.json">Regenerate</button>
   </header>
+  <div id="failure" class="failure hidden"></div>
   <main>
     <aside id="sidebar">
-      <section class="view-graph">
+      <section class="view-overview">
+        <h3>Contents</h3>
+        <div id="toc"></div>
+      </section>
+      <section class="view-graph hidden">
         <input type="search" id="search" placeholder="Search name or id" autocomplete="off">
         <label class="inline"><input type="checkbox" id="hide-isolated" checked> Hide unconnected nodes</label>
         <h3>Edge kinds</h3>
@@ -35,11 +41,12 @@
       </section>
     </aside>
     <section id="center">
-      <div id="graph" class="view-graph"></div>
+      <div id="overview" class="view-overview"><p class="muted">Loading the overview…</p></div>
+      <div id="graph" class="view-graph hidden"></div>
       <div id="file" class="view-repo hidden"><p class="muted">Select a file to list the resources defined in it.</p></div>
     </section>
     <aside id="detail">
-      <p class="muted">Click a node or an edge to see its evidence.</p>
+      <p class="muted">Click a file:line reference, a node or an edge to see its evidence.</p>
     </aside>
   </main>
   <script src="/static/vendor/cytoscape.min.js"></script>

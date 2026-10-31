@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .analyze import analyze
-from .engine import Engine, ModuleInstance
+from .detect import detect_structure
+from .engine import Engine, ModuleInstance, in_scope
 from .loader import RepoSource, load_repo
 from .model import SCHEMA_VERSION, Graph
 from .values import to_json
@@ -24,15 +26,103 @@ class Analysis:
     graph: Graph
     model: dict[str, Any]
 
+    @property
+    def failure(self) -> str:
+        """Why the run failed ('' if it did not)."""
+        return self.model["discovery"]["reason"] if self.failed else ""
+
+    @property
+    def failed(self) -> bool:
+        return self.model["discovery"]["status"] == "failed"
+
 
 def run_analysis(
-    root: Path, var_files: list[str] | None = None, cli_vars: dict[str, str] | None = None
+    root: Path,
+    var_files: list[str] | None = None,
+    cli_vars: dict[str, str] | None = None,
+    scope: str | None = None,
 ) -> Analysis:
+    """Analyze ``root``. ``scope`` limits the roots to one directory (an environment)."""
     repo = load_repo(root)
-    engine = Engine(repo, var_files, cli_vars)
+    engine = Engine(repo, var_files, cli_vars, scope)
     engine.run()
     graph = analyze(repo, engine)
     return Analysis(repo, engine, graph, build_model(repo, engine, graph))
+
+
+def failure_reason(repo: RepoSource, engine: Engine) -> str:
+    """Why nothing can be analyzed ('' when something can)."""
+    if not repo.analyzable:
+        unreadable = [s for s in repo.skipped if s.kind == "unreadable"]
+        reason = (
+            f"nothing to analyze: no *.tf, *.tf.json or terragrunt.hcl file among the "
+            f"{len(repo.all_files)} file(s) found"
+        )
+        if unreadable:
+            reason += f"; {len(unreadable)} directory(ies) could not be read"
+        return reason
+    if (
+        engine.scope
+        and not engine.roots
+        and not any(in_scope(u, engine.scope) for u in engine.units)
+    ):
+        return f"no root module or terragrunt unit under {engine.scope}/"
+    return ""
+
+
+def inventory(repo: RepoSource) -> dict[str, Any]:
+    """What the repository contains: the top two directory levels, files by extension."""
+    levels: dict[str, Counter[str]] = {}
+    total: Counter[str] = Counter()
+    for d, counts in repo.dir_ext.items():
+        total.update(counts)
+        parts = [] if d == "." else d.split("/")
+        for depth in range(min(len(parts), 2) + 1):
+            key = "/".join(parts[:depth]) or "."
+            levels.setdefault(key, Counter()).update(counts)
+    skipped = {s.path: s for s in repo.skipped if s.path.count("/") < 2}
+    entries = []
+    for path in sorted(set(levels) | set(skipped), key=lambda p: (p != ".", p)):
+        counts = levels.get(path, Counter())
+        entry: dict[str, Any] = {
+            "path": path,
+            "files": sum(counts.values()),
+            "by_extension": {k: counts[k] for k in sorted(counts)},
+        }
+        if path in skipped:
+            entry["skipped"] = skipped[path].reason
+        entries.append(entry)
+    return {
+        "total_files": sum(total.values()),
+        "by_extension": {k: total[k] for k in sorted(total)},
+        "entries": entries,
+    }
+
+
+def listing_text(inv: dict[str, Any]) -> str:
+    """The inventory as plain text (failed runs, the CLI)."""
+    lines = ["Repository contents (top 2 levels; files by extension, sub-directories included):"]
+    for e in inv["entries"]:
+        name = "./" if e["path"] == "." else e["path"] + "/"
+        if "skipped" in e:
+            lines.append(f"  {name:<32} skipped: {e['skipped']}")
+            continue
+        exts = ", ".join(f"{k} {v}" for k, v in e["by_extension"].items()) or "no files"
+        lines.append(f"  {name:<32} {e['files']} file(s): {exts}")
+    return "\n".join(lines)
+
+
+def _discovery(repo: RepoSource, engine: Engine) -> dict[str, Any]:
+    reason = failure_reason(repo, engine)
+    return {
+        "status": "failed" if reason else "ok",
+        "reason": reason,
+        "analyzable": repo.analyzable,
+        "all_files": list(repo.all_files),
+        "truncated": repo.truncated,
+        "skipped": [s.to_dict() for s in repo.skipped],
+        "inventory": inventory(repo),
+    }
 
 
 def _module_tree(inst: ModuleInstance) -> dict[str, Any]:
@@ -109,6 +199,9 @@ def _variables(engine: Engine) -> list[dict[str, Any]]:
 
 
 def build_model(repo: RepoSource, engine: Engine, graph: Graph) -> dict[str, Any]:
+    # first: detection may add the files it reads (env.hcl, *.tfbackend) to repo.files
+    structure = detect_structure(repo, engine)
+    discovery = _discovery(repo, engine)
     nodes = [graph.nodes[k].to_dict() for k in sorted(graph.nodes)]
     edges = [e.to_dict() for e in graph.edges]
     edge_counts: dict[str, int] = {}
@@ -143,6 +236,8 @@ def build_model(repo: RepoSource, engine: Engine, graph: Graph) -> dict[str, Any
         "nodes": nodes,
         "edges": edges,
         "unknowns": [u.to_dict() for u in graph.unknowns],
+        "discovery": discovery,
+        "structure": structure,
     }
 
 

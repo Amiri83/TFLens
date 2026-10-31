@@ -20,11 +20,17 @@
 </form>
 
 <h2>Environments</h2>
+<form class="inline" method="post" action="{{ url_for('tfrepo_discover', repo_id=repo.id) }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit">Detect environments</button>
+  <span class="muted small">from tfvars files, envs/ or env-named directories and Terragrunt layouts{% if repo.discovered_at %} · last detected {{ repo.discovered_at | localtime }}{% endif %}.
+    Detected environments can be edited; edited ones are never overwritten.</span>
+</form>
 <table class="envs">
-  <thead><tr><th>Environment</th><th>tfvars files</th><th>Extra variables</th><th></th></tr></thead>
+  <thead><tr><th>Environment</th><th>Root</th><th>Found by</th><th>tfvars files</th><th>Extra variables</th><th></th></tr></thead>
   <tbody>
     <tr>
-      <td class="muted">(none)</td><td class="muted">no tfvars</td><td class="muted">none</td>
+      <td class="muted">(none)</td><td class="muted">all roots</td><td class="muted">—</td><td class="muted">no tfvars</td><td class="muted">none</td>
       <td class="actions">
         <form class="inline" method="post" action="{{ url_for('tfrepo_analyze', repo_id=repo.id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -35,7 +41,9 @@
     </tr>
   {% for e in envs %}
     <tr>
-      <td><b class="mono">{{ e.env }}</b></td>
+      <td><b class="mono">{{ e.env }}</b>{% if not e.present %} <span class="badge warn">no longer found</span>{% endif %}</td>
+      <td class="mono small">{% if e.kinds and e.kinds != 'manual' and e.root_rel != '.' %}{{ e.root_rel }}/{% else %}<span class="muted">all roots</span>{% endif %}</td>
+      <td class="small">{% if e.kinds and e.kinds != 'manual' %}{{ e.kinds | replace(',', ', ') }}{% if e.confirmed %} <span class="muted">(edited)</span>{% endif %}{% else %}<span class="muted">added by hand</span>{% endif %}</td>
       <td class="mono small">{% for f in e.var_files %}<div>{{ f }}</div>{% else %}<span class="muted">none</span>{% endfor %}</td>
       <td class="mono small">{% if e.extra_var_keys %}{{ e.extra_var_keys | join(', ') }} <span class="badge ok">encrypted</span>{% else %}<span class="muted">none</span>{% endif %}</td>
       <td class="actions">

@@ -34,6 +34,31 @@ def scan(text: str) -> LocBlock:
     return root
 
 
+def object_keys(text: str, start_line: int, end_line: int) -> dict[str, tuple[int, int]]:
+    """Line spans of the keys of the object literal on lines ``start_line..end_line``
+    (an ``inputs = {...}`` / ``config = {...}`` attribute): key -> (start, end)."""
+    try:
+        toks = [t for t in lex(text) if start_line <= t.line <= end_line or t.kind == "eof"]
+    except ValueError:
+        return {}
+    out: dict[str, tuple[int, int]] = {}
+    depth, i = 0, 0
+    while i < len(toks) and toks[i].kind != "eof":
+        t = toks[i]
+        if t.kind == "op" and t.value in _OPEN:
+            depth += 1
+        elif t.kind == "op" and t.value in _CLOSE:
+            depth -= 1
+        elif depth == 1 and t.kind in ("ident", "str"):
+            nxt = toks[i + 1]
+            if nxt.kind == "op" and nxt.value in ("=", ":"):
+                i, end = _skip_expression(toks, i + 2, t.line)
+                out.setdefault(t.value, (t.line, end))
+                continue
+        i += 1
+    return out
+
+
 def _parse_body(toks: list[Tok], i: int, block: LocBlock) -> int:
     """Parse body tokens into ``block``; return index of closing ``}`` (or eof)."""
     n = len(toks)

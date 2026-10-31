@@ -343,24 +343,49 @@ class Engine:
         repo: RepoSource,
         var_files: list[str] | None = None,
         cli_vars: dict[str, str] | None = None,
+        scope: str | None = None,
     ) -> None:
         self.repo = repo
         self.var_files = var_files or []
         self.cli_vars = cli_vars or {}
+        # only roots at or below this directory (an environment's directory)
+        self.scope = None if scope in (None, "", ".") else scope
         self.instances: list[ModuleInstance] = []
         self.roots: list[str] = []
+        # root directory -> directory of the module instantiated as that root (they
+        # differ for a Terragrunt unit whose terraform.source is a local module)
+        self.root_modules: dict[str, str] = {}
+        self.units: dict[str, Any] = {}  # root directory -> terragrunt.Unit
         self._root_vars: dict[str, dict[str, tuple[Any, str, Location]]] = {}
 
     # ------------------------------------------------------------ discovery
-    def discover_roots(self) -> list[str]:
+    def referenced_dirs(self) -> set[str]:
+        """Directories called as local modules (by a module block or a Terragrunt unit)."""
         referenced: set[str] = set()
         for mod in self.repo.modules.values():
             for call in mod.module_calls.values():
                 src = _literal_source(call)
                 if src is not None and _is_local(src):
                     referenced.add(posixpath.normpath(posixpath.join(mod.dir, src)))
+        for unit in self.repo.units:
+            if unit.module_dir and unit.module_dir != unit.dir:
+                referenced.add(unit.module_dir)
+        return referenced
+
+    def discover_roots(self) -> list[str]:
+        referenced = self.referenced_dirs()
         remote = self.repo.remote_dirs
-        roots = sorted(d for d in self.repo.modules if d not in referenced and d not in remote)
+        self.root_modules = {
+            d: d for d in self.repo.modules if d not in referenced and d not in remote
+        }
+        self.units = {}
+        for unit in self.repo.units:
+            self.units[unit.dir] = unit
+            if unit.module_dir:
+                self.root_modules[unit.dir] = unit.module_dir
+        roots = sorted(self.root_modules)
+        if self.scope:
+            roots = [r for r in roots if in_scope(r, self.scope)]
         return roots
 
     def _remote(self, root_dir: str, address: str) -> tuple[RemoteModule | None, str]:
@@ -382,7 +407,8 @@ class Engine:
         multi = len(self.roots) > 1
         for root in self.roots:
             prefix = f"{root}::" if multi else ""
-            self._instantiate(self.repo.modules[root], "", prefix, root, None, None, ())
+            src = self.repo.modules[self.root_modules[root]]
+            self._instantiate(src, "", prefix, root, None, None, ())
         return self.instances
 
     def _instantiate(
@@ -443,16 +469,30 @@ class Engine:
     def _load_root_vars(self, root_dir: str) -> dict[str, tuple[Any, str, Location]]:
         out: dict[str, tuple[Any, str, Location]] = {}
         prefix = "" if root_dir == "." else root_dir + "/"
-        auto = []
-        if f"{prefix}terraform.tfvars" in self.repo.tfvars:
-            auto.append(f"{prefix}terraform.tfvars")
+        # terraform's order: terraform.tfvars, terraform.tfvars.json, *.auto.tfvars(.json)
+        auto = [
+            f
+            for f in (f"{prefix}terraform.tfvars", f"{prefix}terraform.tfvars.json")
+            if f in self.repo.tfvars
+        ]
         auto += sorted(
             f
             for f in self.repo.tfvars
-            if f.startswith(prefix) and "/" not in f[len(prefix) :] and f.endswith(".auto.tfvars")
+            if f.startswith(prefix)
+            and "/" not in f[len(prefix) :]
+            and f.endswith((".auto.tfvars", ".auto.tfvars.json"))
         )
         files = auto + [f for f in self.var_files if f in self.repo.tfvars]
         empty = _EmptyScope(self)
+        unit = self.units.get(root_dir)
+        if unit is not None:
+            # Terragrunt passes inputs as TF_VAR_* variables: the lowest precedence.
+            empty.what = "terragrunt inputs"
+            for name, attr in unit.inputs.items():
+                empty.location = attr.loc
+                label = f"terragrunt inputs ({attr.loc.file})"
+                out[name] = (evaluate(attr.expr, empty), label, attr.loc)
+            empty.what = "tfvars"
         for f in files:
             for name, attr in self.repo.tfvars[f].items():
                 empty.location = attr.loc
@@ -480,12 +520,19 @@ class Engine:
         return None
 
 
+def in_scope(root: str, scope: str) -> bool:
+    return root == scope or root.startswith(scope.rstrip("/") + "/")
+
+
 class _EmptyScope:
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
         self.location: Location | None = None
+        self.what = "tfvars"
 
     def resolve(self, name: str, ops: Ops) -> tuple[Any, Ops]:
+        if self.what != "tfvars":
+            return Unknown(f"{name}.* in {self.what} is only known when terragrunt runs"), []
         return Unknown(f"references are not allowed in tfvars ({name})"), []
 
     def read_file(self, path: str) -> str | None:

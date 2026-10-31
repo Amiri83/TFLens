@@ -65,13 +65,117 @@
   }
 
   // ------------------------------------------------------------ views
+  const VIEWS = ["overview", "graph", "repo"];
+  let graphFitted = false; // the graph is laid out while hidden: fit it when first shown
+
   function setView(view) {
     for (const t of document.querySelectorAll(".tab")) {
       t.classList.toggle("active", t.dataset.view === view);
     }
-    for (const n of document.querySelectorAll(".view-graph")) n.classList.toggle("hidden", view !== "graph");
-    for (const n of document.querySelectorAll(".view-repo")) n.classList.toggle("hidden", view !== "repo");
-    if (view === "graph" && cy) cy.resize();
+    for (const v of VIEWS) {
+      for (const n of document.querySelectorAll(`.view-${v}`)) n.classList.toggle("hidden", view !== v);
+    }
+    if (view === "graph" && cy) {
+      cy.resize();
+      if (!graphFitted) {
+        graphFitted = true;
+        layoutGraph();
+      }
+    }
+  }
+
+  // ------------------------------------------------------------ file:line references
+  function locLink(loc) {
+    if (!loc) return null;
+    if (!loc.start_line) return el("span", { class: "tag" }, `${loc.file}/`);
+    return link(locText(loc), () => showSource(loc));
+  }
+
+  async function showSource(loc) {
+    const panel = document.getElementById("detail");
+    let d;
+    try {
+      d = await api(`api/source?file=${encodeURIComponent(loc.file)}&start=${loc.start_line}&end=${loc.end_line}`);
+    } catch (err) {
+      panel.replaceChildren(el("p", { class: "muted" }, `${locText(loc)}: ${err.message}`));
+      return;
+    }
+    panel.replaceChildren(el("h2", {}, locText(d)), evidenceBlock(locText(d), d.lines));
+    panel.scrollTop = 0;
+  }
+
+  // ------------------------------------------------------------ overview
+  function overviewLine(ln) {
+    const parts = [ln.text];
+    if (ln.location) parts.push(" ", locLink(ln.location));
+    if (ln.node) parts.push(" ", link("details", () => showDetail("node", ln.node)));
+    if (ln.edge) parts.push(" ", link("evidence", () => showDetail("edge", ln.edge)));
+    const cls = ["ov-line", `lvl-${Math.min(ln.level || 0, 3)}`];
+    if (ln.status) cls.push(`st-${ln.status}`);
+    return el("li", { class: cls.join(" ") }, ...parts);
+  }
+
+  function overviewList(lines) {
+    return el("ul", { class: "overview-lines" }, ...lines.map(overviewLine));
+  }
+
+  function renderOverview(ov) {
+    const box = document.getElementById("overview");
+    const toc = [];
+    const parts = [el("h2", { id: "ov-top" }, "What this repository deploys"), overviewList(ov.summary)];
+    toc.push(["ov-top", "What it deploys"]);
+    if (ov.inventory) {
+      parts.push(el("h3", {}, "What is in the repository"), inventoryTable(ov.inventory));
+    }
+    ov.roots.forEach((r, i) => {
+      const id = `ov-root-${i}`;
+      toc.push([id, r.title]);
+      parts.push(el("h2", { id, class: "ov-root" }, `Root ${r.title}`, " ", locLink(r.location)));
+      if (!r.analyzed) parts.push(el("p", { class: "unknown" }, `Not analyzed: ${r.status}`));
+      for (const s of r.sections) {
+        parts.push(el("h3", {}, s.title), overviewList(s.lines));
+      }
+    });
+    if (ov.environments.length) {
+      toc.push(["ov-envs", "Environments"]);
+      parts.push(el("h2", { id: "ov-envs" }, "Environments"), overviewList(ov.environments));
+    }
+    toc.push(["ov-disc", "Discovery"]);
+    parts.push(el("h2", { id: "ov-disc" }, "Discovery"), overviewList(ov.discovery));
+    box.replaceChildren(...parts);
+    document.getElementById("toc").replaceChildren(...toc.map(([id, label]) =>
+      el("a", { class: "file link", onclick: () => document.getElementById(id).scrollIntoView() }, label)));
+  }
+
+  function inventoryTable(inv) {
+    return el("table", { class: "inventory" },
+      el("tr", {}, el("th", {}, "Directory"), el("th", {}, "Files"), el("th", {}, "By extension")),
+      ...inv.entries.map((e) => el("tr", {},
+        el("td", { class: "mono" }, e.path === "." ? "./" : `${e.path}/`),
+        el("td", {}, e.skipped ? "—" : e.files),
+        el("td", {}, e.skipped ? `skipped: ${e.skipped}` :
+          Object.entries(e.by_extension).map(([k, v]) => `${k} ${v}`).join(", ") || "no files"))));
+  }
+
+  function renderFailure(summary, ov) {
+    const box = document.getElementById("failure");
+    const unreadable = (summary.skipped || []).filter((s) => s.kind === "unreadable");
+    if (summary.status !== "failed" && !unreadable.length) {
+      box.classList.add("hidden");
+      return;
+    }
+    const parts = [];
+    if (summary.status === "failed") {
+      parts.push(el("strong", {}, "Analysis failed: "), summary.reason, ". ",
+        "The Repository tab lists every file found; the Overview shows what is in the repository.");
+    }
+    if (unreadable.length) {
+      parts.push(el("div", {}, el("strong", {}, `${unreadable.length} directory(ies) could not be read: `),
+        unreadable.map((s) => `${s.path}/ (${s.reason})`).join("; ")));
+    }
+    box.replaceChildren(...parts);
+    box.classList.remove("hidden");
+    if (ov && summary.status === "failed") setView("overview");
   }
 
   // ------------------------------------------------------------ detail panel
@@ -372,6 +476,12 @@
     });
     cy.on("pan zoom", hideTooltip);
     applyFilters();
+    graphFitted = !document.getElementById("graph").classList.contains("hidden");
+    if (graphFitted) layoutGraph();
+  }
+
+  function layoutGraph() {
+    if (!cy) return;
     cy.layout({ name: "cose", animate: false, randomize: false, nodeDimensionsIncludeLabels: true,
       eles: cy.elements(":visible") }).run();
     cy.fit(cy.elements(":visible"), 30);
@@ -380,11 +490,23 @@
   // ------------------------------------------------------------ repository
   function treeNode(node) {
     if (node.type === "file") {
-      return el("a", { class: "file link", "data-path": node.path, onclick: () => showFile(node.path) },
-        node.name, " ", el("span", { class: "tag" }, `(${node.resources})`));
+      // analyzed files are links with their resource count; every other file is listed too
+      const analyzed = node.analyzed !== false;
+      return el("a", {
+        class: analyzed ? "file link analyzed" : "file link other",
+        "data-path": node.path,
+        title: analyzed ? "analyzed" : "not analyzed (not a Terraform / Terragrunt file)",
+        onclick: () => showFile(node.path),
+      }, node.name, analyzed ? el("span", { class: "tag" }, ` (${node.resources})`) : null);
     }
     const label = [node.name + "/"];
+    if (node.root) label.push(" ", el("span", { class: "badge-root" }, "root"));
     if (node.modules.length) label.push(" ", el("span", { class: "tag" }, node.modules.join(", ")));
+    if (node.skipped) {
+      label.push(" ", el("span", { class: node.skipped_kind === "unreadable" ? "tag st-failed" : "tag" },
+        `skipped: ${node.skipped}`));
+      return el("div", { class: "dir skipped" }, ...label);
+    }
     return el("details", { class: "dir", open: "" },
       el("summary", {}, ...label),
       el("div", {}, ...node.children.map(treeNode)));
@@ -397,6 +519,11 @@
     const box = document.getElementById("file");
     const d = await api(`api/file?path=${encodeURIComponent(path)}`);
     const parts = [el("h2", {}, d.path)];
+    if (d.analyzed === false) {
+      box.replaceChildren(...parts, el("p", { class: "muted" }, d.note));
+      return;
+    }
+    parts.push(el("p", {}, link("Show the source", () => showSource({ file: d.path, start_line: 1, end_line: 1000000 }))));
     if (d.modules.length) parts.push(el("p", { class: "muted" }, `Module instances: ${d.modules.join(", ")}`));
     if (!d.resources.length) {
       parts.push(el("p", { class: "muted" }, "No resources, data sources or module calls defined here."));
@@ -421,7 +548,10 @@
 
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree] = await Promise.all([api("api/summary"), api("api/graph"), api("api/tree")]);
+    const [summary, graph, tree, ov] = await Promise.all(
+      [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview")]);
+    renderOverview(ov);
+    renderFailure(summary, ov);
     document.getElementById("title").textContent = summary.title;
     // a recorded run (managed mode) is read-only: no Regenerate, a way back to the runs
     document.getElementById("regenerate").classList.toggle("hidden", Boolean(summary.readonly));

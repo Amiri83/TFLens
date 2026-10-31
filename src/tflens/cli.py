@@ -1,6 +1,7 @@
 """Command line.
 
-``tflens --dir PATH [--out model.json] [--report report.md]`` analyzes a repository;
+``tflens --dir PATH [--out model.json] [--report report.md] [--overview overview.md]``
+analyzes a repository (exit status 1 when there is nothing to analyze);
 ``tflens serve --dir PATH`` serves the web UI over that repository's model (no data
 directory, no database); ``tflens serve`` alone runs the full local app (Settings,
 Accounts, Repos, Runs, Logs) over the data directory ``$TFLENS_HOME`` / ``~/.tflens``.
@@ -20,7 +21,8 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .output import dumps, run_analysis
+from .output import dumps, listing_text, run_analysis
+from .overview import build_overview, render_overview_markdown
 from .report import render_report
 from .settings import DEFAULT_HOST, DEFAULT_PORT
 
@@ -61,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dir", required=True, type=Path, help="Terraform repository to analyze")
     parser.add_argument("--out", type=Path, help="write model JSON to this file")
     parser.add_argument("--report", type=Path, help="write the markdown report to this file")
+    parser.add_argument(
+        "--overview", type=Path, help="write the markdown overview (what the repo deploys)"
+    )
     _add_var_options(parser)
     parser.add_argument("--version", action="version", version=f"tflens {__version__}")
     args = parser.parse_args(argv)
@@ -72,12 +77,23 @@ def main(argv: list[str] | None = None) -> int:
 
     analysis = run_analysis(root, args.var_file, dict(args.var))
     text = dumps(analysis.model)
+    title = root.resolve().name
+    listing = listing_text(analysis.model["discovery"]["inventory"])
     if args.out:
         args.out.write_text(text, encoding="utf-8")
     if args.report:
-        report = render_report(analysis.model, root.resolve().name, analysis.repo.lines)
+        report = render_report(analysis.model, title, analysis.repo.lines)
         args.report.write_text(report, encoding="utf-8")
-    if not args.out and not args.report:
+    if args.overview:
+        ov = render_overview_markdown(build_overview(analysis.model, title), listing)
+        args.overview.write_text(ov, encoding="utf-8")
+    for s in analysis.repo.skipped:
+        if s.kind == "unreadable":
+            print(f"tflens: warning: skipped {s.path}/: {s.reason}", file=sys.stderr)
+    if analysis.failed:
+        print(f"tflens: error: {analysis.failure}\n{listing}", file=sys.stderr)
+        return 1
+    if not args.out and not args.report and not args.overview:
         sys.stdout.write(text)
     else:
         s = analysis.model["summary"]
