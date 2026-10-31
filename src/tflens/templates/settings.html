@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+<p class="muted mode-note">Data directory <span class="mono">{{ paths.home }}</span> ·
+  {% if db_ready %}database <span class="mono">{{ paths.db_path.name }}</span>{% else %}no database yet
+  (created on the first save){% endif %} · clones in <span class="mono">{{ paths.repos_dir }}</span> ·
+  runs in <span class="mono">{{ paths.out_dir }}</span></p>
+
+<form class="card" method="post" action="{{ url_for('settings_save') }}" autocomplete="off">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="server_form" value="1">
+  <h2 style="margin-top: 0">Logging</h2>
+  <label for="log_dir">Log directory</label>
+  <input id="log_dir" name="log_dir" value="{{ s.log_dir }}" size="60" class="mono" placeholder="{{ default_log_dir }}">
+
+  <h2 id="server">Server</h2>
+  <div class="row">
+    <div><label for="host">Host</label>
+      <input id="host" name="host" value="{{ s.host }}" size="24" class="mono"></div>
+    <div><label for="port">Port</label>
+      <input id="port" name="port" type="number" value="{{ s.port }}" min="0" max="65535" size="6"></div>
+  </div>
+  <label class="check"><input type="checkbox" name="allow_remote" value="1" {{ 'checked' if s.allow_remote }}>
+    Allow a non-loopback host</label>
+  <p class="muted small">Used by <span class="mono">tflens serve</span> from its next start; the
+    <span class="mono">--host</span>, <span class="mono">--port</span> and <span class="mono">--allow-remote</span>
+    flags override them. TFLens has <b>no authentication</b>: anyone who can reach a non-loopback address can
+    read the analyzed source code, so it refuses to listen on one unless this is ticked (or
+    <span class="mono">--allow-remote</span> is given).</p>
+
+  <h2 id="runs">Runs</h2>
+  <label class="check"><input type="checkbox" name="auto_regenerate" value="1" {{ 'checked' if s.auto_regenerate }}>
+    Auto-regenerate: analyze every environment of a repository after each successful Sync</label>
+  <div class="row">
+    <div><label for="retention_runs">Keep runs per repository × environment</label>
+      <input id="retention_runs" name="retention_runs" type="number" value="{{ s.retention_runs }}"
+             min="{{ retention_limits[0] }}" max="{{ retention_limits[1] }}" size="6"></div>
+  </div>
+  <p class="muted small">Applied after every analysis: older runs are deleted together with their
+    <span class="mono">out/</span> directory. The model JSON of a run is kept on disk only; the database
+    stores its path and summary counts.</p>
+  <p><button type="submit">Save</button></p>
+</form>
+
+<div class="card muted">
+  TFLens analyzes Terraform statically and read-only: no <span class="mono">terraform</span> binary, no
+  AWS API calls, no requests from the browser to anywhere but this server. The only network operation is
+  the <b>Sync</b> of a git repository (a shallow clone), and only when you click it.
+</div>
+{% endblock %}

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}TFLens{% endblock %} · TFLens</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='localtime.js') }}" defer></script>
+  <script src="{{ url_for('static', filename='forms.js') }}" defer></script>
+</head>
+<body>
+<header>
+  <span class="brand">{% if managed %}<a href="{{ url_for('tfrepos_page') }}">TFLens</a>{% else %}TFLens{% endif %}</span>
+  {% if managed %}
+  <nav class="tabs" aria-label="Main">
+    {% set ep = request.endpoint or '' %}
+    {% macro nav_link(endpoint, label, active) -%}
+      <a href="{{ url_for(endpoint) }}"{% if active %} class="active" aria-current="page"{% endif %}>{{ label }}</a>
+    {%- endmacro %}
+    {{ nav_link('tfrepos_page', 'Repos', ep.startswith('tfrepo') or ep == 'settings_tfrepo') }}
+    {{ nav_link('runs_page', 'Runs', ep.startswith('run')) }}
+    {{ nav_link('accounts_page', 'Accounts', ep.startswith('account')) }}
+    {{ nav_link('settings_page', 'Settings', ep.startswith('settings_page') or ep == 'settings_save') }}
+    {{ nav_link('logs', 'Logs', ep == 'logs') }}
+  </nav>
+  <span class="ctx">static, read-only Terraform analysis · no cloud calls · v{{ version }}</span>
+  {% endif %}
+</header>
+<main>
+  {% for category, message in get_flashed_messages(with_categories=true) %}
+    <div class="flash {{ category }}">{{ message }}</div>
+  {% endfor %}
+  {% block content %}{% endblock %}
+</main>
+</body>
+</html>

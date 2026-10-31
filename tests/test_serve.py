@@ -1,4 +1,4 @@
-"""tflens serve: API views, model regeneration, evidence snippets, HTTP wrapper."""
+"""tflens serve: API views, model regeneration, evidence snippets, waitress server, CLI."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from conftest import FIXTURES
 from tflens.cli import main
 from tflens.output import dumps, run_analysis
 from tflens.report import render_report
-from tflens.server import is_loopback, make_server, url_of
+from tflens.server import is_loopback
 from tflens.snippets import format_snippet, snippet_lines
 from tflens.webapi import Api, ModelStore, module_groups, short_name
 
@@ -319,12 +319,13 @@ def test_index_and_static_assets(api):
     index = api.handle("GET", "/")
     assert index.status == 200 and index.content_type.startswith("text/html")
     html = index.body.decode()
-    assert 'src="static/vendor/cytoscape.min.js"' in html
-    assert 'src="static/app.js"' in html
+    assert 'src="/static/vendor/cytoscape.min.js"' in html
+    assert 'src="/static/app.js"' in html
     assert "http://" not in html and "https://" not in html  # no external requests
     js = api.handle("GET", "/static/app.js")
     assert js.status == 200 and "javascript" in js.content_type
-    assert "/api/graph" in js.body.decode()
+    # page-relative API paths: /api/* standalone, /runs/<id>/api/* for a recorded run
+    assert '"api/graph"' in js.body.decode()
 
 
 # ---------------------------------------------------------------- snippets / report
@@ -399,18 +400,32 @@ def test_cli_report_contains_snippets(tmp_path):
 # ---------------------------------------------------------------- HTTP wrapper / CLI
 
 
+def _waitress(app):
+    """A real waitress server on a free loopback port, in a thread."""
+    from waitress import create_server
+
+    server = create_server(app, host="127.0.0.1", port=0, threads=2, ident="")
+    app.extensions["tflens"]["port"] = server.effective_port
+    threading.Thread(target=server.run, daemon=True).start()
+    return server, f"http://127.0.0.1:{server.effective_port}/"
+
+
 def test_http_server_roundtrip(repo):
-    server = make_server(Api(ModelStore(repo)), "127.0.0.1", 0)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    from tflens.web import create_app
+
+    server, base = _waitress(create_app(store=ModelStore(repo)))
     try:
-        base = url_of(server)
         with urllib.request.urlopen(base + "api/graph", timeout=10) as r:
             assert r.status == 200
             assert "default-src 'self'" in r.headers["Content-Security-Policy"]
+            assert "Server" not in r.headers
             assert json.loads(r.read())["filters"]["kinds"]
         with urllib.request.urlopen(base + "api/edge?id=" + quote(S3_ACCESS_EDGE), timeout=10) as r:
             assert json.loads(r.read())["evidence"][0]["start_line"] == 24
+        with urllib.request.urlopen(base, timeout=10) as r:
+            assert b"/static/app.js" in r.read()
+        with urllib.request.urlopen(base + "static/vendor/cytoscape.min.js", timeout=10) as r:
+            assert r.status == 200
         with pytest.raises(urllib.error.HTTPError) as err:
             urllib.request.urlopen(base + "api/node?id=missing", timeout=10)
         assert err.value.code == 404
@@ -426,32 +441,70 @@ def test_http_server_roundtrip(repo):
         req = urllib.request.Request(base + "api/summary", headers={"Host": "evil.example"})
         with pytest.raises(urllib.error.HTTPError) as err:
             urllib.request.urlopen(req, timeout=10)
-        assert err.value.code == 403
+        assert err.value.code == 400
     finally:
-        server.shutdown()
-        server.server_close()
+        server.close()
 
 
 def test_non_loopback_host_requires_allow_remote(repo, capsys):
     assert is_loopback("127.0.0.1") and is_loopback("::1") and is_loopback("localhost")
     assert not is_loopback("0.0.0.0") and not is_loopback("192.0.2.10")
-    with pytest.raises(ValueError, match="--allow-remote"):
-        make_server(Api(ModelStore(repo)), "0.0.0.0", 0)
     assert main(["serve", "--dir", str(repo), "--host", "0.0.0.0", "--no-browser"]) == 2
+    assert "--allow-remote" in capsys.readouterr().err
+    assert main(["serve", "--host", "192.0.2.10", "--no-browser"]) == 2
     assert "--allow-remote" in capsys.readouterr().err
     assert main(["serve", "--dir", str(repo / "missing"), "--no-browser"]) == 2
 
 
-def test_serve_subcommand_starts_and_keeps_dir_cli(repo, monkeypatch):
+@pytest.fixture
+def fake_serve(monkeypatch):
     calls = {}
 
-    def fake_serve_forever(server, open_browser):
-        calls["url"] = url_of(server)
-        calls["open_browser"] = open_browser
-        server.server_close()
+    def fake(app, host, port, ready):
+        calls.update(app=app, host=host, port=port)
+        ready(43210 if port == 0 else port)
 
-    monkeypatch.setattr("tflens.server.serve_forever", fake_serve_forever)
+    monkeypatch.setattr("tflens.cli.serve_waitress", fake)
+    monkeypatch.setattr("tflens.cli.open_browser", lambda url: calls.setdefault("opened", url))
+    monkeypatch.setattr("tflens.cli.desktop_session", lambda: True)
+    return calls
+
+
+def test_serve_dir_starts_standalone_and_keeps_dir_cli(repo, fake_serve, capsys, _isolated_home):
     assert main(["serve", "--dir", str(repo), "--port", "0", "--no-browser"]) == 0
-    assert calls["url"].startswith("http://127.0.0.1:")
-    assert calls["open_browser"] is False
+    assert (fake_serve["host"], fake_serve["port"]) == ("127.0.0.1", 0)
+    assert fake_serve["app"].extensions["tflens"]["managed"] is False
+    assert fake_serve["app"].extensions["tflens"]["port"] == 43210  # Host check: real port
+    assert "opened" not in fake_serve
+    assert "http://127.0.0.1:43210/" in capsys.readouterr().err
     assert (repo / "tflens-out" / "model.json").is_file()
+    assert not (_isolated_home / ".tflens").exists()  # standalone: no data directory
+
+
+def test_serve_without_dir_uses_settings_and_cli_overrides(tmp_path, fake_serve, capsys):
+    from tflens.settings import SettingsStore
+
+    home = tmp_path / "data"
+    assert main(["serve", "--home", str(home)]) == 0
+    assert (fake_serve["host"], fake_serve["port"]) == ("127.0.0.1", 8765)
+    assert fake_serve["app"].extensions["tflens"]["managed"] is True
+    assert fake_serve["opened"] == "http://127.0.0.1:8765/"
+    assert not (home / "tflens.db").exists()  # lazy: serving alone creates no database
+
+    SettingsStore(home / "tflens.db").save(host="0.0.0.0", port=9100)
+    assert main(["serve", "--home", str(home), "--no-browser"]) == 2  # remote not allowed
+    assert "--allow-remote" in capsys.readouterr().err
+    SettingsStore(home / "tflens.db").save(allow_remote=True)
+    assert main(["serve", "--home", str(home), "--no-browser"]) == 0
+    assert (fake_serve["host"], fake_serve["port"]) == ("0.0.0.0", 9100)
+    assert "reachable from other machines" in capsys.readouterr().err
+    # flags win over the stored settings
+    assert main(["serve", "--home", str(home), "--host", "127.0.0.1", "--port", "0"]) == 0
+    assert (fake_serve["host"], fake_serve["port"]) == ("127.0.0.1", 0)
+
+
+def test_serve_dir_only_options_need_dir(tmp_path):
+    with pytest.raises(SystemExit):
+        main(["serve", "--home", str(tmp_path), "--regenerate"])
+    with pytest.raises(SystemExit):
+        main(["serve", "--dir", str(tmp_path), "--home", str(tmp_path)])

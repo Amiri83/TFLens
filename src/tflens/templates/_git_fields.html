@@ -1,0 +1,35 @@
+{# Git source fields; `repo` is set when editing (the token is never rendered). #}
+{% set r = repo if repo is defined else {} %}
+<div class="row">
+  <div><label for="url">Git URL</label>
+    <input id="url" name="url" size="56" class="mono" value="{{ r.url or '' }}"
+           placeholder="git@git.example.com:org/repo-a.git or https://git.example.com/org/repo-a.git"></div>
+  <div><label for="branch">Branch <span class="muted">(optional)</span></label>
+    <input id="branch" name="branch" size="16" class="mono" value="{{ r.branch or '' }}" placeholder="main"></div>
+</div>
+<label>Authentication</label>
+{% for key, label in auth_modes.items() %}
+  <label class="check"><input type="radio" name="git_auth" value="{{ key }}" data-show-group="git_auth"
+    {{ 'checked' if key == (r.git_auth or 'agent') }}> {{ label }}</label>
+{% endfor %}
+<fieldset data-group="git_auth" data-mode="agent">
+  <p class="note muted small">Uses the running SSH agent (<span class="mono">SSH_AUTH_SOCK</span>) for ssh URLs.</p>
+</fieldset>
+<fieldset data-group="git_auth" data-mode="key">
+  <label for="ssh_key_path">SSH private key file (absolute path)</label>
+  <input id="ssh_key_path" name="ssh_key_path" size="50" class="mono" value="{{ r.ssh_key_path or '' }}"
+         placeholder="~/.ssh/id_ed25519">
+  <p class="note muted small">Only the path is stored; the key is read by ssh at Sync time.</p>
+</fieldset>
+<fieldset data-group="git_auth" data-mode="token">
+  <div class="row">
+    <div><label for="token_user">User name <span class="muted">(optional)</span></label>
+      <input id="token_user" name="token_user" size="18" class="mono" value="{{ r.token_user or '' }}"
+             placeholder="x-access-token"></div>
+    <div><label for="token">Access token</label>
+      <input id="token" name="token" type="password" size="40" class="mono" autocomplete="new-password"
+             placeholder="{{ '•••••••• (stored, leave blank to keep)' if r.has_token else '' }}"></div>
+  </div>
+  <p class="note muted small">Stored Fernet-encrypted; passed to git only through its environment
+    (an <span class="mono">http.extraHeader</span>), never on the command line, in a file or in the log.</p>
+</fieldset>

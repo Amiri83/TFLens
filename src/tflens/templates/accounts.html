@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Accounts{% endblock %}
+{% block content %}
+<div class="row" style="justify-content: space-between">
+  <h1>Accounts</h1>
+  <a class="btn" href="{{ url_for('account_new') }}">Add account</a>
+</div>
+<p class="muted">AWS account records, kept in the same form as IPLens's so the two tools can share
+  them. TFLens's analysis never uses them: it makes no AWS calls. Secrets are stored Fernet-encrypted
+  (or kept in memory only) and never shown again.</p>
+<table class="accounts">
+  <thead><tr><th>Account</th><th>Region</th><th>Auth</th><th>Credentials</th><th></th></tr></thead>
+  <tbody>
+  {% for a in accounts %}
+    <tr>
+      <td><b>{{ a.display_name or ('Account ' ~ a.id) }}</b></td>
+      <td class="mono">{{ a.region }}</td>
+      <td>{{ a.mode_label }}{% if a.auth_mode == 'profile' %} <span class="mono">{{ a.profile }}</span>{% endif %}</td>
+      <td>
+        {% if a.auth_mode == 'env' %}<span class="muted">process environment</span>
+        {% elif a.auth_mode == 'profile' %}<span class="muted">~/.aws profile</span>
+        {% else %}
+          {% if a.access_key_id %}<span class="mono">{{ a.access_key_id }}</span>{% endif %}
+          {% if a.memory_only %}<span class="badge">memory only</span>{% else %}<span class="badge">encrypted</span>{% endif %}
+          {% if a.problem %}<span class="badge err">{{ a.problem }}</span>
+          {% elif a.auth_mode == 'temporary' %}<span class="badge warn">{{ a.status }}</span>{% endif %}
+        {% endif %}
+      </td>
+      <td class="actions">
+        <a class="btn secondary" href="{{ url_for('account_edit', account_id=a.id) }}">Edit</a>
+        <form class="inline" method="post" action="{{ url_for('account_delete', account_id=a.id) }}"
+              data-confirm="Delete this account?">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="danger" type="submit">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="5" class="muted">No accounts yet — <a href="{{ url_for('account_new') }}">add one</a>.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endblock %}
