@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Changes · run {{ run.id }}{% endblock %}
+{% block content %}
+<h1>Changes: run {{ run.id }} <span class="muted small">{{ run.repo }}{% if run.env %} ({{ run.env }}){% endif %}</span></h1>
+<form method="get" class="row card">
+  <div><label for="base">Compared with</label>
+    <select id="base" name="base" data-autosubmit>
+      {% for b in bases %}<option value="{{ b.id }}" {{ 'selected' if base and b.id == base.id }}>run {{ b.id }} · {{ b.env or 'no environment' }} · {{ b.commit_sha[:12] if b.commit_sha else 'no commit' }}</option>{% endfor %}
+    </select></div>
+  <noscript><div><button type="submit">Compare</button></div></noscript>
+  <div><a class="btn" href="{{ url_for('run_view', run_id=run.id) }}">Open run {{ run.id }}</a></div>
+</form>
+{% if error %}
+  <p class="flash error">{{ error }}</p>
+{% elif not base %}
+  <p class="muted">No earlier run of this repository produced a model: nothing to compare with.</p>
+{% else %}
+  <p class="muted">Run {{ run.id }} (commit <span class="mono">{{ run.commit_sha[:12] or '—' }}</span>, {{ run.ts | localtime }})
+    compared with run {{ base.id }} (commit <span class="mono">{{ base.commit_sha[:12] or '—' }}</span>, {{ base.ts | localtime }}).</p>
+  {% if diff.empty %}<p><b>No changes.</b></p>{% endif %}
+  {% if diff.versions %}
+    <h2>Module version changes</h2>
+    <ul>{% for c in diff.versions %}<li class="mono">{{ c.key }}: {{ c.changes | join('; ') }}</li>{% endfor %}</ul>
+  {% endif %}
+  {% for key, heading in sections %}
+    {% set sec = diff[key] %}
+    {% set n = diff.counts[key] %}
+    <h2>{{ heading }} <span class="muted small">+{{ n.added }} −{{ n.removed }} ~{{ n.changed }}</span></h2>
+    {% if not (sec.added or sec.removed or sec.changed) %}<p class="muted">No changes.</p>{% else %}
+    <table class="changes">
+      <thead><tr><th></th><th>Item</th><th>Details</th></tr></thead>
+      <tbody>
+      {% for item in sec.added %}<tr><td><span class="badge ok">added</span></td><td class="mono">{{ describe(key, item) }}</td><td class="small mono">{{ item.location or '' }}</td></tr>{% endfor %}
+      {% for item in sec.removed %}<tr><td><span class="badge err">removed</span></td><td class="mono">{{ describe(key, item) }}</td><td class="small mono">{{ item.location or '' }}</td></tr>{% endfor %}
+      {% for c in sec.changed %}<tr><td><span class="badge warn">changed</span></td><td class="mono">{{ describe(key, c.item) }}</td><td class="small"><ul>{% for x in c.changes %}<li>{{ x }}</li>{% endfor %}</ul></td></tr>{% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  {% endfor %}
+{% endif %}
+{% endblock %}

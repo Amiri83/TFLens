@@ -21,6 +21,7 @@ from .output import dumps, run_analysis
 from .overview import build_overview
 from .report import describe_node
 from .snippets import SourceLines, snippet_lines
+from .visuals import DIAGRAMS, mermaid, svg
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -129,7 +130,9 @@ class ModelStore:
         with self._lock:
             if file in self._lines:
                 return self._lines[file]
-            if file not in self.model()["files"]:
+            model = self.model()
+            readable = (model.get("crawl") or {}).get("readable", [])
+            if file not in model["files"] and file not in readable:
                 return None
             path = (self.root / file).resolve()
             try:
@@ -558,11 +561,14 @@ def file_detail(model: dict[str, Any], path: str) -> dict[str, Any] | None:
     if path not in model["files"]:
         if path not in _all_files(model):
             return None
+        readable = path in (model.get("crawl") or {}).get("readable", [])
         return {
             "path": path,
             "analyzed": False,
+            "readable": readable,
             "note": "Not analyzed: TFLens reads *.tf, *.tf.json, *.tfvars(.json) and "
-            "terragrunt.hcl files only.",
+            "terragrunt.hcl files only."
+            + (" Crawled (docs / CI / history): the source can be shown." if readable else ""),
             "modules": [],
             "resources": [],
             "unknowns": [],
@@ -680,7 +686,20 @@ class Api:
         if path == "/api/tree":
             return json_response(repo_tree(model, self.store.title))
         if path == "/api/overview":
-            return json_response(build_overview(model, self.store.title))
+            return json_response(build_overview(model, self.store.title, self.store.lines))
+        if path == "/api/diagram":
+            name, fmt = query.get("name", ""), query.get("format", "svg")
+            if name not in DIAGRAMS or fmt not in ("svg", "mmd"):
+                return _not_found(f"diagram {name!r} ({fmt})")
+            if fmt == "mmd":
+                body = mermaid(model, name)
+                return _download(body, "text/plain; charset=utf-8", f"{name}.mmd", query)
+            body = svg(model, name, self.store.title)
+            return _download(body, "image/svg+xml; charset=utf-8", f"{name}.svg", query)
+        if path == "/api/handoff":
+            return _download(
+                self._handoff(model), "text/markdown; charset=utf-8", "handoff.md", query
+            )
         if path == "/api/source":
             try:
                 start = int(query.get("start", "1"))
@@ -699,6 +718,26 @@ class Api:
             detail = file_detail(model, query.get("path", ""))
             return json_response(detail) if detail else _not_found(f"file {query.get('path')!r}")
         return _not_found(path)
+
+    def _handoff(self, model: dict[str, Any]) -> str:
+        """A recorded run serves the handoff.md written with it (it includes the changes
+        since the previous run); otherwise it is generated from the model."""
+        if self.store.readonly:
+            recorded = self.store.model_path.parent / "handoff.md"
+            try:
+                return recorded.read_text(encoding="utf-8")
+            except OSError:
+                pass
+        from .handoff import render_handoff
+
+        return render_handoff(model, self.store.title, self.store.lines)
+
+
+def _download(body: str, ctype: str, filename: str, query: dict[str, str]) -> Response:
+    headers = {}
+    if query.get("download") == "1":
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return Response(200, ctype, body.encode("utf-8"), headers)
 
 
 def _method_not_allowed() -> Response:

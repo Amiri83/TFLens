@@ -1,0 +1,11 @@
+stages: [validate, plan]
+
+validate:
+  stage: validate
+  script:
+    - terragrunt run-all validate --terragrunt-working-dir live
+
+plan:
+  stage: plan
+  script:
+    - terragrunt run-all plan --terragrunt-working-dir live/dev

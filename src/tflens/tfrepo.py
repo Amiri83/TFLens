@@ -836,9 +836,12 @@ def create_run(
     id. A run whose discovery finds nothing to analyze is recorded as failed, with the
     reason and a listing of what the repository contains (its model is still written, so
     the run opens and shows every file). Precondition errors raise ValueError."""
+    from .handoff import render_handoff
     from .output import dumps, listing_text, run_analysis
     from .overview import build_overview, render_overview_markdown
     from .report import render_report
+    from .snapshots import diff_runs, previous_run, store_snapshot
+    from .visuals import export_diagrams
 
     root = analysis_root(repo)
     if not root.is_dir():
@@ -852,7 +855,11 @@ def create_run(
         if not (root / f).is_file() or not _inside(root / f, root):
             raise ValueError(f"tfvars file {f} not found in the repository")
     analysis = run_analysis(
-        root, var_files, env_vars(env, decrypt) if env else {}, scope=env_scope(env)
+        root,
+        var_files,
+        env_vars(env, decrypt) if env else {},
+        scope=env_scope(env),
+        git_root=Path(repo["path"]),
     )
     listing = listing_text(analysis.model["discovery"]["inventory"])
     error = f"{analysis.failure}\n{listing}" if analysis.failed else ""
@@ -874,10 +881,27 @@ def create_run(
         render_report(analysis.model, title, analysis.repo.lines), encoding="utf-8"
     )
     (run_dir / "overview.md").write_text(
-        render_overview_markdown(build_overview(analysis.model, title), listing),
+        render_overview_markdown(
+            build_overview(analysis.model, title, analysis.repo.lines), listing
+        ),
         encoding="utf-8",
     )
     conn.execute("UPDATE runs SET model_path=? WHERE id=?", (str(model_path), run_id))
+    store_snapshot(conn, run_id, analysis.model)
+    run = get_run(conn, run_id)
+    assert run is not None
+    prev = previous_run(conn, run)
+    changes = None
+    if prev is not None:
+        try:
+            changes = diff_runs(conn, prev, run)
+        except ValueError as exc:  # the previous run's model is gone: no diff, say so
+            log.warning("run %s: no diff against run %s: %s", run_id, prev["id"], exc)
+    export_diagrams(analysis.model, run_dir / "diagrams", title)
+    (run_dir / "handoff.md").write_text(
+        render_handoff(analysis.model, title, analysis.repo.lines, changes, run["commit_sha"]),
+        encoding="utf-8",
+    )
     return run_id
 
 

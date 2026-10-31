@@ -167,9 +167,74 @@ def _baseline(conn: sqlite3.Connection) -> None:
     """Version 1: the schema above; nothing to convert."""
 
 
+# Per-run snapshot of what a run found (snapshots.py), keyed by run (and so by repository +
+# commit, both recorded on the run): the Changes page diffs two runs from these rows.
+SNAPSHOT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS run_files (
+    run_id   INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    path     TEXT NOT NULL,
+    kind     TEXT NOT NULL,             -- analyzed | doc | ci | other
+    PRIMARY KEY (run_id, path)
+);
+CREATE TABLE IF NOT EXISTS run_modules (
+    run_id   INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    root     TEXT NOT NULL,
+    address  TEXT NOT NULL,
+    kind     TEXT NOT NULL,             -- local | registry | git | ...
+    source   TEXT NOT NULL DEFAULT '',
+    version  TEXT NOT NULL DEFAULT '',
+    dir      TEXT NOT NULL DEFAULT '',
+    location TEXT NOT NULL DEFAULT '',  -- file:line of the call
+    PRIMARY KEY (run_id, root, address)
+);
+CREATE TABLE IF NOT EXISTS run_resources (
+    run_id      INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    node_id     TEXT NOT NULL,
+    type        TEXT NOT NULL,
+    service     TEXT NOT NULL DEFAULT '',
+    module      TEXT NOT NULL DEFAULT '',
+    location    TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL,          -- sha256 of properties + attributes (not the location)
+    properties  TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (run_id, node_id)
+);
+CREATE TABLE IF NOT EXISTS run_edges (
+    run_id      INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    edge_id     TEXT NOT NULL,          -- KIND:source->target#n
+    kind        TEXT NOT NULL,
+    source      TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    label       TEXT NOT NULL DEFAULT '',
+    fingerprint TEXT NOT NULL,
+    PRIMARY KEY (run_id, edge_id)
+);
+CREATE TABLE IF NOT EXISTS run_envs (
+    run_id    INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    root      TEXT NOT NULL,
+    env       TEXT NOT NULL,
+    kinds     TEXT NOT NULL DEFAULT '',
+    var_files TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (run_id, root, env)
+);
+CREATE TABLE IF NOT EXISTS run_backends (
+    run_id   INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    root     TEXT NOT NULL,
+    type     TEXT NOT NULL,
+    settings TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (run_id, root)
+);
+CREATE INDEX IF NOT EXISTS ix_runs_repo_commit ON runs(repo_id, commit_sha);
+"""
+
+
+def _snapshots(conn: sqlite3.Connection) -> None:
+    """Version 2: per-run snapshot tables (files, modules, resources, edges, envs, backends)."""
+    conn.executescript(SNAPSHOT_SCHEMA)
+
+
 # Versioned migrations, applied once each and in order: version -> function(conn).
 # Add new ones at the end; never change an applied one.
-MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _baseline}
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {1: _baseline, 2: _snapshots}
 SCHEMA_VERSION = max(MIGRATIONS)
 
 

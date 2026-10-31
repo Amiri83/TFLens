@@ -1,0 +1,11 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: terraform init -input=false
+      - run: terraform apply -auto-approve -input=false

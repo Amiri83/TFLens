@@ -14,8 +14,10 @@
     <nav>
       <button type="button" class="tab active" data-view="overview">Overview</button>
       <button type="button" class="tab" data-view="graph">Graph</button>
+      <button type="button" class="tab" data-view="diagrams">Diagrams</button>
       <button type="button" class="tab" data-view="repo">Repository</button>
     </nav>
+    <a id="changes" class="home hidden" href="changes">Changes</a>
     <div id="summary"></div>
     <button type="button" id="regenerate" title="Re-analyze the repository and rewrite model.json">Regenerate</button>
   </header>
@@ -39,10 +41,17 @@
       <section class="view-repo hidden">
         <div id="tree"></div>
       </section>
+      <section class="view-diagrams hidden">
+        <h3>Diagrams</h3>
+        <a class="file link" href="#dg-architecture">Architecture</a>
+        <a class="file link" href="#dg-module-tree">Module tree</a>
+        <a class="file link" href="#dg-env-matrix">Environment matrix</a>
+      </section>
     </aside>
     <section id="center">
       <div id="overview" class="view-overview"><p class="muted">Loading the overview…</p></div>
       <div id="graph" class="view-graph hidden"></div>
+      <div id="diagrams" class="view-diagrams hidden"><p class="muted">Loading the diagrams…</p></div>
       <div id="file" class="view-repo hidden"><p class="muted">Select a file to list the resources defined in it.</p></div>
     </section>
     <aside id="detail">

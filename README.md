@@ -25,6 +25,9 @@ tflens --dir path/to/terraform --out model.json --report report.md
 | `--out FILE` | write the model JSON |
 | `--report FILE` | write the markdown report |
 | `--overview FILE` | write the markdown overview (see below) |
+| `--handoff FILE` | write `handoff.md`: the overview plus the diagrams as Mermaid (for Claude Code) |
+| `--diagrams DIR` | write the diagrams as `.mmd` and `.svg` (and `.png` when an offline renderer exists) |
+| `--no-git` | do not read the git history |
 | `--var-file FILE` | extra tfvars for root modules (relative to `--dir`), repeatable |
 | `--var NAME=VALUE` | set a root variable, repeatable |
 
@@ -65,6 +68,71 @@ Nothing has to be configured before a first analysis:
   repository deploys and, per root, backend, providers, modules, resources by
   service, the top ACCESS / TRIGGER / NETWORK relationships and the unknowns.
   Every line links to its `file:line`.
+
+## Deep crawl
+
+Besides the Terraform code, every analysis crawls (read-only, offline, no LLM; the only
+I/O is reading files and one `git log`):
+
+- **Docs**: READMEs down to two directory levels and the files at the top of `docs/`:
+  title, headings and the first prose paragraph (badges, HTML, tables and code skipped),
+  each with its `file:line`.
+- **CI**: GitHub Actions (`.github/workflows/*.yml`; `.github`, `.gitlab`, `.circleci`
+  and `.buildkite` are walked although hidden), GitLab CI, Jenkinsfile, Atlantis
+  (`projects` with dir / workspace), CircleCI, Bitbucket and Azure Pipelines: the
+  `terraform` / `terragrunt` / `tofu` / `tflint` / ... commands with their line.
+- **Lock files**: the provider versions of every `.terraform.lock.hcl`.
+- **Git history**: when the analyzed directory is a git checkout (or, for a managed
+  repository with a sub-directory, inside one), the last 200 commits touching it
+  (sha, author, date, message, changed files relative to the analyzed directory), the
+  most-changed files and the authors. Nothing is fetched; `GIT_OPTIONAL_LOCKS=0`. A git
+  repository synced by TFLens is a shallow clone, so it has one commit.
+- Unreadable or oversized files are listed with the reason; a failed `git log` is
+  reported with git's message. Nothing is skipped silently.
+
+The **classification** adds, per root, a role (`deployable`, or `library` for a directory
+nobody calls that has no backend, provider configuration or tfvars), and a catalog of
+every module directory (`root` / `child` / `terragrunt-source` / `remote`) with its call
+sites.
+
+The **Overview** also has: a *Purpose (guess)* (README title and first paragraph, then
+e.g. "deploys 2 Lambda functions, 1 SQS queue, 1 DynamoDB table and 1 S3 bucket", the CI
+that applies it), a drill-down per resource (what it is, triggered by, triggers, can
+access, accessed by, network, and the defining code), the docs, the CI and lock files,
+and the history (recent commits, most-changed files). Every line links to `file:line`.
+
+## Diagrams
+
+Three diagrams, each as Mermaid (`.mmd`) and a standalone SVG computed by TFLens itself
+(deterministic, no browser or renderer needed); the **Diagrams** tab shows them with
+download links:
+
+- **architecture**: the services grouped by root and module, with only the TRIGGER /
+  ACCESS / NETWORK flows, laid out triggers → compute → data, with AWS-style icons
+  (TFLens's own simplified drawings in the AWS category colours; drop `<icon>.svg`
+  files, e.g. the official AWS Architecture Icons under their licence, into
+  `static/vendor/aws-icons/` to replace them, see `icons.py` for the names).
+- **module-tree**: each root and the modules it calls, with kind, source and version.
+- **env-matrix**: root × environment, with each root's backend.
+
+A PNG is written only when an offline SVG renderer is installed (`rsvg-convert`,
+`cairosvg` or `inkscape`); otherwise the run says so and the SVG is the export.
+
+## Run history and Changes
+
+Each managed run stores a snapshot in the database (`run_files`, `run_modules`,
+`run_resources`, `run_edges`, `run_envs`, `run_backends`, keyed by the run, which records
+the repository and the commit). The **Changes** page of a run (`/runs/<id>/changes`,
+linked from the Runs table and the analyzer) diffs it against the previous run of the
+same repository and environment, or any other run: added / removed / changed resources
+(with the changed properties), edges, module calls (source and version changes listed
+first), environments, backends and files. Runs recorded before snapshots existed are
+back-filled from their `model.json`.
+
+Every run also writes `handoff.md` (overview + the three diagrams as Mermaid + the
+changes since the previous run) and `diagrams/` next to its `model.json`; both can be
+downloaded from the Runs table. `handoff.md` is meant to be given to Claude Code as
+context (`@handoff.md`).
 
 The report ends with an **Evidence** section: every relationship gets an entry
 (`E1`, `E2`, ... linked from the resource sections) with file, line range and
@@ -152,7 +220,9 @@ no external requests; the graph library is vendored (copy `cytoscape.min.js` int
 
 JSON API (all GET; under `/runs/<id>/` for a run): `api/summary`, `api/graph`,
 `api/nodes`, `api/edges`, `api/node?id=`, `api/edge?id=`, `api/tree`,
-`api/file?path=`, `api/overview`, `api/source?file=&start=&end=`, `api/model`; `POST api/regenerate` (standalone only, needs the
+`api/file?path=`, `api/overview`, `api/source?file=&start=&end=`, `api/model`,
+`api/diagram?name=architecture|module-tree|env-matrix&format=svg|mmd`, `api/handoff`
+(add `download=1` for an attachment); `POST api/regenerate` (standalone only, needs the
 header `X-TFLens: 1`).
 
 ## Remote modules
@@ -193,8 +263,9 @@ Edge kinds:
 `modules` (module tree with inputs, outputs and remote source/version), `variables` (value and where it came from),
 `nodes`, `edges` (with `evidence` and `via`), `unknowns` (subject, attribute,
 reason, location), `discovery` (status / failure reason, analyzable and all files,
-skipped directories, inventory) and `structure` (roots with backend, providers,
-modules, resources; environments). Symbolic values are encoded explicitly: `{"$ref": ...}`,
+skipped directories, inventory), `structure` (roots with role, backend, providers,
+modules, resources; environments; module directories) and `crawl` (docs, CI, lock
+files, git history, notes, and the extra files the UI may show). Symbolic values are encoded explicitly: `{"$ref": ...}`,
 `{"$unknown": reason}`, `{"$template": ...}`, `{"$json": ...}`.
 
 ## Development

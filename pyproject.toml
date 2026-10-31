@@ -36,6 +36,7 @@ tflens = [
     "static/*.js",
     "static/*.svg",
     "static/vendor/*",
+    "static/vendor/aws-icons/*",
     "templates/*.html",
 ]
 

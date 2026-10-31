@@ -162,7 +162,90 @@ def detect_structure(repo: RepoSource, engine: Engine) -> dict[str, Any]:
     environments = detect_environments(repo, engine)
     shown = [r for r in all_roots if engine.scope is None or in_scope(r, engine.scope)]
     roots = [_root(repo, engine, r, referenced, environments) for r in shown]
-    return {"roots": roots, "environments": environments}
+    return {
+        "roots": roots,
+        "environments": environments,
+        "module_dirs": classify_module_dirs(repo, engine),
+    }
+
+
+def _role(
+    repo: RepoSource, root: str, unit: Unit | None, own: ModuleSource | None, envs: list[str]
+):
+    """``(deployable | library, reason)``: is this root applied, or a reusable module that
+    nothing in the repository calls? Only a label: both are analyzed the same way."""
+    if unit is not None:
+        return "deployable", "terragrunt unit"
+    if own is None:
+        return "deployable", "root"
+    why = []
+    if any(tb.blocks.get("backend") or tb.blocks.get("cloud") for tb in own.terraform):
+        why.append("backend")
+    if own.providers:
+        why.append("provider configuration")
+    prefix = "" if root == "." else root + "/"
+    if any(f.startswith(prefix) and "/" not in f[len(prefix) :] for f in repo.tfvars):
+        why.append("tfvars")
+    if envs:
+        why.append("environments")
+    if why:
+        return "deployable", "has " + ", ".join(why)
+    if own.variables or own.outputs:
+        return (
+            "library",
+            "no backend, provider configuration or tfvars, and nothing in the repository "
+            "calls it: looks like a reusable module",
+        )
+    return "deployable", "no backend configured (local state)"
+
+
+def classify_module_dirs(repo: RepoSource, engine: Engine) -> list[dict[str, Any]]:
+    """Every directory with Terraform code: root / child (called locally) / terragrunt
+    source / remote (materialized by terraform init), who calls it and what it defines."""
+    callers: dict[str, list[dict[str, Any]]] = {}
+    for mod in repo.modules.values():
+        for name, call in sorted(mod.module_calls.items()):
+            attr = call.attrs.get("source")
+            src = _static(attr.raw) if attr else None
+            if isinstance(src, str) and src.startswith(("./", "../")):
+                target = posixpath.normpath(posixpath.join(mod.dir, src))
+                callers.setdefault(target, []).append(
+                    {"caller": mod.dir, "address": f"module.{name}", "location": _loc(call.loc)}
+                )
+    tg_sources: dict[str, list[dict[str, Any]]] = {}
+    for unit in repo.units:
+        if unit.module_dir and unit.module_dir != unit.dir:
+            loc = unit.source_attr.loc if unit.source_attr else unit.config.loc
+            tg_sources.setdefault(unit.module_dir, []).append(
+                {"caller": unit.dir, "address": "terraform.source", "location": _loc(loc)}
+            )
+    remote = repo.remote_dirs
+    out = []
+    for d in sorted(repo.modules):
+        mod = repo.modules[d]
+        if d in remote:
+            role = "remote"
+        elif d in callers:
+            role = "child"
+        elif d in tg_sources:
+            role = "terragrunt-source"
+        else:
+            role = "root"
+        out.append(
+            {
+                "dir": d,
+                "role": role,
+                "files": list(mod.files),
+                "location": _loc(Location(mod.files[0], 1, 1)) if mod.files else None,
+                "called_by": callers.get(d, []) + tg_sources.get(d, []),
+                "resources": len(mod.resources),
+                "data_sources": len(mod.data),
+                "module_calls": len(mod.module_calls),
+                "variables": len(mod.variables),
+                "outputs": len(mod.outputs),
+            }
+        )
+    return out
 
 
 def _tree(engine: Engine, root: str) -> list[ModuleInstance]:
@@ -208,9 +291,13 @@ def _root(
     for inst in insts:
         resources += [inst.node_id(t, n) for t, n in sorted(inst.src.resources)]
         data += [inst.node_id(t, n, data=True) for t, n in sorted(inst.src.data)]
+    env_names = sorted({e["name"] for e in environments if _env_covers(e, root)}, key=str.lower)
+    role, role_reason = _role(repo, root, unit, own, env_names)
     return {
         "dir": root,
         "kind": "terragrunt" if unit is not None else "terraform",
+        "role": role,
+        "role_reason": role_reason,
         "module_dir": mod_dir,
         "analyzed": analyzed,
         "status": status,
@@ -222,9 +309,7 @@ def _root(
         "modules": _modules(repo, engine, root, unit, insts),
         "resources": sorted(resources),
         "data_sources": sorted(data),
-        "environments": sorted(
-            {e["name"] for e in environments if _env_covers(e, root)}, key=str.lower
-        ),
+        "environments": env_names,
     }
 
 
