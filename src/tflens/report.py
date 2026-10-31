@@ -174,6 +174,10 @@ def render_report(
         f"- Parse errors: {s['parse_errors']}",
         "",
     ]
+    # the same section as overview.md (overview imports this module: import here)
+    from .overview import render_structure_markdown, structure_lines
+
+    lines += render_structure_markdown(structure_lines(model), level=2)
     by_service: dict[str, int] = {}
     for n in model["nodes"]:
         if n["kind"] == "resource":

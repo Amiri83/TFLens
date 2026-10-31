@@ -66,6 +66,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--overview", type=Path, help="write the markdown overview (what the repo deploys)"
     )
+    parser.add_argument(
+        "--handoff",
+        type=Path,
+        help="write handoff.md (overview + Mermaid diagrams) for Claude Code",
+    )
+    parser.add_argument(
+        "--diagrams",
+        type=Path,
+        help="write the diagrams (architecture, module-tree, env-matrix) as .mmd and .svg "
+        "into this directory (.png too when an offline SVG renderer is installed)",
+    )
+    parser.add_argument(
+        "--no-git", action="store_true", help="do not read the git history (git log)"
+    )
     _add_var_options(parser)
     parser.add_argument("--version", action="version", version=f"tflens {__version__}")
     args = parser.parse_args(argv)
@@ -75,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tflens: error: --dir {root} is not a directory", file=sys.stderr)
         return 2
 
-    analysis = run_analysis(root, args.var_file, dict(args.var))
+    analysis = run_analysis(root, args.var_file, dict(args.var), git=not args.no_git)
     text = dumps(analysis.model)
     title = root.resolve().name
     listing = listing_text(analysis.model["discovery"]["inventory"])
@@ -85,15 +99,25 @@ def main(argv: list[str] | None = None) -> int:
         report = render_report(analysis.model, title, analysis.repo.lines)
         args.report.write_text(report, encoding="utf-8")
     if args.overview:
-        ov = render_overview_markdown(build_overview(analysis.model, title), listing)
-        args.overview.write_text(ov, encoding="utf-8")
+        ov = build_overview(analysis.model, title, analysis.repo.lines)
+        args.overview.write_text(render_overview_markdown(ov, listing), encoding="utf-8")
+    if args.handoff:
+        from .handoff import render_handoff
+
+        handoff = render_handoff(analysis.model, title, analysis.repo.lines)
+        args.handoff.write_text(handoff, encoding="utf-8")
+    if args.diagrams:
+        from .visuals import export_diagrams
+
+        exported = export_diagrams(analysis.model, args.diagrams, title)
+        print(f"tflens: diagrams in {args.diagrams}: {exported['png']}", file=sys.stderr)
     for s in analysis.repo.skipped:
         if s.kind == "unreadable":
             print(f"tflens: warning: skipped {s.path}/: {s.reason}", file=sys.stderr)
     if analysis.failed:
         print(f"tflens: error: {analysis.failure}\n{listing}", file=sys.stderr)
         return 1
-    if not args.out and not args.report and not args.overview:
+    if not any((args.out, args.report, args.overview, args.handoff, args.diagrams)):
         sys.stdout.write(text)
     else:
         s = analysis.model["summary"]

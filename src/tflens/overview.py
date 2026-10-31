@@ -11,12 +11,65 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from .snippets import location_label
+from .report import describe_node
+from .snippets import SourceLines, format_snippet, location_label, snippet_lines
 
 KEY_KINDS = ("ACCESS", "TRIGGER", "NETWORK")
 TOP_EDGES = 5
 MAX_RESOURCES_PER_SERVICE = 25
 MAX_UNKNOWNS = 10
+MAX_DRILLDOWNS = 60
+MAX_DRILL_EDGES = 8
+MAX_SNIPPET_LINES = 15
+MAX_COMMITS_SHOWN = 20
+
+# Resource types people name when saying what a repository deploys: (singular, plural),
+# in the order they are listed. Helper resources (policies, attachments, mappings, bucket
+# settings) are left out of the purpose sentence.
+FRIENDLY: dict[str, tuple[str, str]] = {
+    "aws_lambda_function": ("Lambda function", "Lambda functions"),
+    "aws_instance": ("EC2 instance", "EC2 instances"),
+    "aws_autoscaling_group": ("Auto Scaling group", "Auto Scaling groups"),
+    "aws_ecs_cluster": ("ECS cluster", "ECS clusters"),
+    "aws_ecs_service": ("ECS service", "ECS services"),
+    "aws_eks_cluster": ("EKS cluster", "EKS clusters"),
+    "aws_sfn_state_machine": ("Step Functions state machine", "Step Functions state machines"),
+    "aws_api_gateway_rest_api": ("API Gateway REST API", "API Gateway REST APIs"),
+    "aws_apigatewayv2_api": ("API Gateway HTTP API", "API Gateway HTTP APIs"),
+    "aws_lb": ("load balancer", "load balancers"),
+    "aws_cloudfront_distribution": ("CloudFront distribution", "CloudFront distributions"),
+    "aws_sqs_queue": ("SQS queue", "SQS queues"),
+    "aws_sns_topic": ("SNS topic", "SNS topics"),
+    "aws_cloudwatch_event_rule": ("EventBridge rule", "EventBridge rules"),
+    "aws_kinesis_stream": ("Kinesis stream", "Kinesis streams"),
+    "aws_dynamodb_table": ("DynamoDB table", "DynamoDB tables"),
+    "aws_s3_bucket": ("S3 bucket", "S3 buckets"),
+    "aws_db_instance": ("RDS instance", "RDS instances"),
+    "aws_rds_cluster": ("RDS cluster", "RDS clusters"),
+    "aws_elasticache_cluster": ("ElastiCache cluster", "ElastiCache clusters"),
+    "aws_efs_file_system": ("EFS file system", "EFS file systems"),
+    "aws_ecr_repository": ("ECR repository", "ECR repositories"),
+    "aws_secretsmanager_secret": ("Secrets Manager secret", "Secrets Manager secrets"),
+    "aws_kms_key": ("KMS key", "KMS keys"),
+    "aws_vpc": ("VPC", "VPCs"),
+    "aws_subnet": ("subnet", "subnets"),
+    "aws_vpc_endpoint": ("VPC endpoint", "VPC endpoints"),
+    "aws_security_group": ("security group", "security groups"),
+    "aws_iam_role": ("IAM role", "IAM roles"),
+    "aws_iam_user": ("IAM user", "IAM users"),
+}
+# Supporting types: counted on their own line, not in the "deploys ..." sentence.
+SUPPORTING = frozenset(
+    {
+        "aws_vpc",
+        "aws_subnet",
+        "aws_vpc_endpoint",
+        "aws_security_group",
+        "aws_iam_role",
+        "aws_iam_user",
+        "aws_kms_key",
+    }
+)
 
 
 def _line(
@@ -61,27 +114,42 @@ def _short(node_id: str, root: str) -> str:
     return node_id[len(prefix) :] if node_id.startswith(prefix) else node_id
 
 
-def build_overview(model: dict[str, Any], title: str = "") -> dict[str, Any]:
+def build_overview(
+    model: dict[str, Any], title: str = "", source: SourceLines | None = None
+) -> dict[str, Any]:
+    """The overview of a model. With ``source`` (file -> lines) the resource drill-downs
+    carry their code snippets."""
     structure = model.get("structure") or {"roots": [], "environments": []}
     discovery = model.get("discovery") or {}
+    crawled = model.get("crawl") or {}
     nodes = {n["id"]: n for n in model["nodes"]}
     failed = discovery.get("status") == "failed"
     out: dict[str, Any] = {
         "title": title,
         "status": discovery.get("status", "ok"),
         "reason": discovery.get("reason", ""),
+        "purpose": [],
         "summary": [],
+        "structure": [],
         "roots": [],
+        "resources": [],
         "environments": [],
+        "docs": _doc_lines(crawled),
+        "ci": _ci_lines(crawled),
+        "history": _history_lines(crawled),
         "discovery": _discovery_lines(model, discovery),
         "inventory": discovery.get("inventory") if failed else None,
     }
     if failed:
         out["summary"].append(_line(f"Analysis failed: {out['reason']}", None, status="failed"))
+        out["purpose"] = _readme_lines(crawled)
         return out
     roots = structure["roots"]
+    out["purpose"] = purpose_lines(model, nodes)
     out["summary"] = _summary(model, roots, structure["environments"], nodes)
+    out["structure"] = structure_lines(model)
     out["roots"] = [_root_section(model, r, nodes) for r in roots]
+    out["resources"] = drilldowns(model, nodes, source)
     out["environments"] = [
         _line(
             f"{e['name']}: {', '.join(e['kinds'])} — "
@@ -91,6 +159,243 @@ def build_overview(model: dict[str, Any], title: str = "") -> dict[str, Any]:
         )
         for e in structure["environments"]
     ]
+    return out
+
+
+def _label(n: dict[str, Any]) -> str:
+    props = n["properties"]
+    for key in ("function_name", "bucket", "name"):
+        if isinstance(props.get(key), str) and props[key]:
+            return props[key]
+    return n["name"]
+
+
+def _friendly(rtype: str, count: int) -> str:
+    one, many = FRIENDLY[rtype]
+    return f"{count} {one if count == 1 else many}"
+
+
+def _join(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def _readme_lines(crawled: dict[str, Any]) -> list[dict[str, Any]]:
+    top = next((d for d in crawled.get("docs") or [] if "/" not in d["path"]), None)
+    if top is None:
+        return []
+    lines = [_line(f"README ({top['path']}): {top['title']}", top["title_location"])]
+    if top["excerpt"] and top["excerpt_location"] != top["title_location"]:
+        lines.append(_line(top["excerpt"], top["excerpt_location"], 1))
+    return lines
+
+
+def resource_counts(model: dict[str, Any]) -> list[tuple[str, list[dict[str, Any]]]]:
+    """Recognized resource types with their nodes, in :data:`FRIENDLY` order."""
+    by_type: dict[str, list[dict[str, Any]]] = {}
+    for n in model["nodes"]:
+        if n["kind"] == "resource" and n["type"] in FRIENDLY and n["location"]:
+            by_type.setdefault(n["type"], []).append(n)
+    return [(t, by_type[t]) for t in FRIENDLY if t in by_type]
+
+
+def purpose_text(model: dict[str, Any]) -> str:
+    """``deploys 2 Lambda functions, 1 SQS queue and 1 S3 bucket`` ('' if nothing known)."""
+    main = [_friendly(t, len(ns)) for t, ns in resource_counts(model) if t not in SUPPORTING]
+    return f"deploys {_join(main)}" if main else ""
+
+
+def purpose_lines(model: dict[str, Any], nodes: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """A guess at what the repository is for: README + what it deploys + how."""
+    crawled = model.get("crawl") or {}
+    lines = _readme_lines(crawled)
+    counts = resource_counts(model)
+    main = [(t, ns) for t, ns in counts if t not in SUPPORTING]
+    support = [(t, ns) for t, ns in counts if t in SUPPORTING]
+    if main:
+        text = f"Guess: this repository {purpose_text(model)}"
+        if support:
+            text += ", with " + _join([_friendly(t, len(ns)) for t, ns in support])
+        lines.append(_line(text + ".", main[0][1][0]["location"], node=main[0][1][0]["id"]))
+    elif counts:
+        text = "Guess: supporting infrastructure only: " + _join(
+            [_friendly(t, len(ns)) for t, ns in counts]
+        )
+        lines.append(_line(text + ".", counts[0][1][0]["location"]))
+    for t, ns in main + support:
+        names = ", ".join(_label(n) for n in ns[:5]) + (
+            f", … {len(ns) - 5} more" if len(ns) > 5 else ""
+        )
+        lines.append(
+            _line(f"{_friendly(t, len(ns))}: {names}", ns[0]["location"], 1, node=ns[0]["id"])
+        )
+    resources = [n for n in nodes.values() if n["kind"] == "resource" and n["location"]]
+    if not resources:
+        roots = (model.get("structure") or {}).get("roots", [])
+        calls = [m for r in roots for m in r["modules"]]
+        if calls:
+            kinds = Counter(m["kind"] for m in calls)
+            lines.append(
+                _line(
+                    f"Guess: defines no resources itself; it composes {_plural(len(calls), 'module')} ("
+                    + ", ".join(f"{c} {k}" for k, c in sorted(kinds.items()))
+                    + ")",
+                    calls[0]["location"],
+                    status="unknown",
+                )
+            )
+            for m in calls[:10]:
+                text = f"{m['address']}: {m['kind']} {m['source'] or '?'}"
+                text += f" @ {m['version']}" if m["version"] else ""
+                lines.append(_line(text, m["location"], 1))
+        else:
+            first = roots[0]["signals"][0]["location"] if roots and roots[0]["signals"] else None
+            lines.append(
+                _line("Guess: defines no resources and calls no modules", first, status="unknown")
+            )
+    ci = crawled.get("ci") or []
+    if ci:
+        systems: dict[str, list[str]] = {}
+        for c in ci:
+            label = c["name"]
+            if c.get("projects"):
+                label = _plural(len(c["projects"]), "project")
+            systems.setdefault(c["system"], []).append(label)
+        text = "Applied by CI: " + "; ".join(f"{s} ({', '.join(v)})" for s, v in systems.items())
+        lines.append(_line(text, ci[0]["location"]))
+    return lines
+
+
+def drilldowns(
+    model: dict[str, Any], nodes: dict[str, dict[str, Any]], source: SourceLines | None = None
+) -> list[dict[str, Any]]:
+    """Per recognized resource: what it is, triggered by, triggers, can access, accessed
+    by, network, and (with ``source``) the code that defines it."""
+    ins: dict[str, list[dict[str, Any]]] = {}
+    outs: dict[str, list[dict[str, Any]]] = {}
+    for e in model["edges"]:
+        if e["kind"] in KEY_KINDS:
+            outs.setdefault(e["source"], []).append(e)
+            ins.setdefault(e["target"], []).append(e)
+    order = {t: i for i, t in enumerate(FRIENDLY)}
+    items = [n for t, ns in resource_counts(model) for n in ns]
+    items.sort(key=lambda n: (order[n["type"]], n["id"]))
+    out = []
+    for n in items[:MAX_DRILLDOWNS]:
+        what = describe_node(n).replace("`", "")
+        if n["module"]:
+            what += f", in {n['module']}"
+        lines = [_line(f"What: {what}", n["location"], node=n["id"])]
+        groups = (
+            ("Triggered by", [e for e in ins.get(n["id"], []) if e["kind"] == "TRIGGER"], "source"),
+            ("Triggers", [e for e in outs.get(n["id"], []) if e["kind"] == "TRIGGER"], "target"),
+            ("Can access", [e for e in outs.get(n["id"], []) if e["kind"] == "ACCESS"], "target"),
+            ("Accessed by", [e for e in ins.get(n["id"], []) if e["kind"] == "ACCESS"], "source"),
+            ("Network", [e for e in ins.get(n["id"], []) if e["kind"] == "NETWORK"], "source"),
+            ("Network to", [e for e in outs.get(n["id"], []) if e["kind"] == "NETWORK"], "target"),
+        )
+        related = False
+        for title, edges, end in groups:
+            for e in edges[:MAX_DRILL_EDGES]:
+                related = True
+                other = nodes.get(e[end])
+                name = _label(other) if other and other["kind"] == "resource" else e[end]
+                loc = e["evidence"][0] if e["evidence"] else n["location"]
+                loc = {k: loc[k] for k in ("file", "start_line", "end_line")}
+                lines.append(_line(f"{title}: {name} — {e['label']}", loc, 1, edge=e["id"]))
+            if len(edges) > MAX_DRILL_EDGES:
+                lines.append(_line(f"… {len(edges) - MAX_DRILL_EDGES} more", n["location"], 1))
+        if not related:
+            lines.append(_line("No TRIGGER, ACCESS or NETWORK relationships", n["location"], 1))
+        snippet = []
+        if source is not None:
+            snippet = snippet_lines(n["location"], source, context=0)[:MAX_SNIPPET_LINES]
+        out.append(
+            {
+                "node": n["id"],
+                "title": f"{FRIENDLY[n['type']][0]} {_label(n)}",
+                "location": n["location"],
+                "lines": lines,
+                "snippet": snippet,
+            }
+        )
+    return out
+
+
+def _doc_lines(crawled: dict[str, Any]) -> list[dict[str, Any]]:
+    lines = []
+    for d in crawled.get("docs") or []:
+        lines.append(_line(f"{d['path']}: {d['title']}", d["title_location"]))
+        if d["excerpt"] and d["excerpt_location"] != d["title_location"]:
+            lines.append(_line(d["excerpt"], d["excerpt_location"], 1))
+        for h in [h for h in d["headings"][1:] if h["level"] <= 2][:6]:
+            lines.append(_line(f"§ {h['text']}", h["location"], 1))
+    for n in crawled.get("notes") or []:
+        lines.append(_line(f"{n['path']}: {n['reason']}", None, status="skipped"))
+    return lines
+
+
+def _ci_lines(crawled: dict[str, Any]) -> list[dict[str, Any]]:
+    lines = []
+    for c in crawled.get("ci") or []:
+        lines.append(_line(f"{c['system']}: {c['name']} ({c['path']})", c["location"]))
+        for p in c.get("projects") or []:
+            text = f"project {p['name'] or p['dir']}: dir {p['dir']}, workspace {p['workspace']}"
+            lines.append(_line(text, p["location"], 1))
+        for cmd in c["commands"][:10]:
+            lines.append(_line(cmd["text"], cmd["location"], 1))
+        if len(c["commands"]) > 10:
+            lines.append(_line(f"… {len(c['commands']) - 10} more commands", c["location"], 1))
+        if not c["commands"] and not c.get("projects"):
+            lines.append(_line("no terraform / terragrunt command found", c["location"], 1))
+    for lk in crawled.get("locks") or []:
+        lines.append(
+            _line(
+                f"provider lock file {lk['file']}",
+                {"file": lk["file"], "start_line": 1, "end_line": 1},
+            )
+        )
+        for p in lk["providers"]:
+            lines.append(_line(f"{p['source']} = {p['version']}", p["location"], 1))
+    return lines
+
+
+def _history_lines(crawled: dict[str, Any]) -> dict[str, Any]:
+    git = crawled.get("git") or {"status": "skipped", "reason": "not crawled", "commits": []}
+    readable = set(crawled.get("readable") or [])
+    out: dict[str, Any] = {"status": git["status"], "summary": [], "commits": [], "hot_files": []}
+    if git["status"] != "ok":
+        out["summary"].append(
+            _line(f"Git history not read: {git['reason']}", None, status="skipped")
+        )
+        return out
+    commits = git["commits"]
+
+    def first_file(c: dict[str, Any]) -> dict[str, Any] | None:
+        f = next((f for f in c["files"] if f in readable), None)
+        return {"file": f, "start_line": 1, "end_line": 1} if f else None
+
+    authors = ", ".join(f"{a['name']} ({a['commits']})" for a in git.get("authors", []))
+    head = f" (HEAD {git['head'][:8]})" if git.get("head") else ""
+    text = f"{_plural(len(commits), 'commit')} read{head}"
+    if git.get("truncated"):
+        text += f" (the last {len(commits)} only)"
+    if authors:
+        text += f"; authors: {authors}"
+    out["summary"].append(_line(text, first_file(commits[0]) if commits else None))
+    if git.get("reason"):
+        out["summary"].append(_line(git["reason"], None, status="unknown"))
+    for c in commits[:MAX_COMMITS_SHOWN]:
+        line = _line(
+            f"{c['short']} {c['date'][:10]} {c['author']}: {c['subject']} "
+            f"({_plural(len(c['files']), 'file')})",
+            first_file(c),
+        )
+        line["commit"] = c["sha"]
+        out["commits"].append(line)
+    for h in git.get("hot_files", []):
+        loc = {"file": h["path"], "start_line": 1, "end_line": 1} if h["path"] in readable else None
+        text = f"{h['path']}: changed in {_plural(h['commits'], 'commit')}"
+        out["hot_files"].append(_line(text + ("" if h["exists"] else " (no longer present)"), loc))
     return out
 
 
@@ -197,6 +502,45 @@ def _summary(
     return lines
 
 
+def structure_lines(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """The repository structure, one entry per root (Terragrunt units included): its
+    backend, the modules it calls with their source, and why it was not analyzed.
+    Rendered identically in overview.md and report.md (:func:`render_structure_markdown`)."""
+    roots = (model.get("structure") or {}).get("roots", [])
+    lines = []
+    for r in roots:
+        fallback = _first_signal(r)
+        kind = "Terragrunt unit" if r["kind"] == "terragrunt" else f"{r['kind']} root"
+        role = f", {r['role']}" if r.get("role") else ""
+        lines.append(_line(f"{r['dir']}/ — {kind}{role}", fallback))
+        b = r["backend"]
+        settings = ", ".join(f"{s['key']} = {s['value']}" for s in b["settings"])
+        lines.append(
+            _line(
+                f"backend: {b['type']} ({b['origin']})" + (f"; {settings}" if settings else ""),
+                b["location"] or fallback,
+                1,
+            )
+        )
+        for m in r["modules"]:
+            text = f"module {m['address']}: {m['kind']} {m['source'] or '(no literal source)'}"
+            if m["version"]:
+                text += f" @ {m['version']}"
+            if not m["analyzed"]:
+                text += f"; not analyzed: {m['status']}"
+            lines.append(_line(text, m["location"], 1, status="" if m["analyzed"] else "unknown"))
+        if not r["analyzed"]:
+            lines.append(_line(f"not analyzed: {r['status']}", fallback, 1, status="unknown"))
+    if not lines:
+        lines.append(_line("No roots detected", None, status="unknown"))
+    return lines
+
+
+def render_structure_markdown(lines: list[dict[str, Any]], level: int = 1) -> list[str]:
+    """The structure section as Markdown lines (``level`` as in render_overview_markdown)."""
+    return [f"{'#' * level}# Structure", "", *_md_lines(lines), ""]
+
+
 def _root_section(
     model: dict[str, Any], root: dict[str, Any], nodes: dict[str, dict[str, Any]]
 ) -> dict[str, Any]:
@@ -204,7 +548,12 @@ def _root_section(
     sections = [
         {
             "title": "Why this is a root",
-            "lines": [_line(s["signal"], s["location"]) for s in root["signals"]],
+            "lines": [_line(s["signal"], s["location"]) for s in root["signals"]]
+            + (
+                [_line(f"role: {root['role']} — {root['role_reason']}", fallback)]
+                if root.get("role")
+                else []
+            ),
         },
         {"title": "Backend (state)", "lines": _backend_lines(root["backend"], fallback)},
         {"title": "Terraform and providers", "lines": _provider_lines(root, fallback)},
@@ -472,18 +821,42 @@ def _md_lines(lines: list[dict[str, Any]]) -> list[str]:
     return [f"{'  ' * ln['level']}- {ln['text']}{_md_loc(ln['location'])}" for ln in lines]
 
 
-def render_overview_markdown(ov: dict[str, Any], inventory_text: str = "") -> str:
-    out = [f"# Overview: {ov['title']}" if ov["title"] else "# Overview", ""]
+def render_overview_markdown(ov: dict[str, Any], inventory_text: str = "", level: int = 1) -> str:
+    """Markdown of an overview; ``level`` is the heading level of its title (2 when the
+    overview is embedded in handoff.md)."""
+    h = "#" * level
+    out = [f"{h} Overview: {ov['title']}" if ov["title"] else f"{h} Overview", ""]
     if ov["status"] == "failed":
         out += [f"**Analysis failed:** {ov['reason']}", ""]
         if inventory_text:
             out += ["```", inventory_text, "```", ""]
-    out += ["## What this repository deploys", "", *_md_lines(ov["summary"]), ""]
+    if ov.get("purpose"):
+        out += [f"{h}# Purpose (guess)", "", *_md_lines(ov["purpose"]), ""]
+    out += [f"{h}# What this repository deploys", "", *_md_lines(ov["summary"]), ""]
+    if ov.get("structure"):
+        out += render_structure_markdown(ov["structure"], level)
     for r in ov["roots"]:
-        out += [f"## Root {r['title']}", ""]
+        out += [f"{h}# Root {r['title']}", ""]
         for s in r["sections"]:
-            out += [f"### {s['title']}", "", *_md_lines(s["lines"]), ""]
+            out += [f"{h}## {s['title']}", "", *_md_lines(s["lines"]), ""]
+    if ov.get("resources"):
+        out += [f"{h}# Resources", ""]
+        for d in ov["resources"]:
+            out += [f"{h}## {d['title']}{_md_loc(d['location'])}", "", *_md_lines(d["lines"]), ""]
+            if d["snippet"]:
+                out += ["```hcl", format_snippet(d["snippet"]), "```", ""]
     if ov["environments"]:
-        out += ["## Environments", "", *_md_lines(ov["environments"]), ""]
-    out += ["## Discovery", "", *_md_lines(ov["discovery"]), ""]
+        out += [f"{h}# Environments", "", *_md_lines(ov["environments"]), ""]
+    if ov.get("docs"):
+        out += [f"{h}# Documentation", "", *_md_lines(ov["docs"]), ""]
+    if ov.get("ci"):
+        out += [f"{h}# CI / CD and lock files", "", *_md_lines(ov["ci"]), ""]
+    hist = ov.get("history")
+    if hist:
+        out += [f"{h}# History", "", *_md_lines(hist["summary"]), ""]
+        if hist["hot_files"]:
+            out += [f"{h}## Most-changed files", "", *_md_lines(hist["hot_files"]), ""]
+        if hist["commits"]:
+            out += [f"{h}## Recent commits", "", *_md_lines(hist["commits"]), ""]
+    out += [f"{h}# Discovery", "", *_md_lines(ov["discovery"]), ""]
     return "\n".join(out).rstrip() + "\n"

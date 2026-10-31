@@ -1,0 +1,17 @@
+pipeline {
+  agent any
+  stages {
+    stage('Plan') {
+      steps {
+        sh 'terraform init -input=false'
+        sh 'terraform plan -var-file=terraform.tfvars.json -out=tfplan'
+      }
+    }
+    stage('Apply') {
+      when { branch 'main' }
+      steps {
+        sh 'terraform apply tfplan'
+      }
+    }
+  }
+}

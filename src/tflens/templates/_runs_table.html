@@ -17,7 +17,9 @@
       <td class="small counts">{% if s %}<span>{{ s.files or 0 }} files</span><span>{{ r.node_count }} nodes</span><span>{{ r.edge_count }} edges</span>
         <span>{{ s.unknowns or 0 }} unknowns</span>{% if s.parse_errors %}<span class="badge warn">{{ s.parse_errors }} parse errors</span>{% endif %}{% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="actions">
-        {% if r.model_path %}<a class="btn" href="{{ url_for('run_view', run_id=r.id) }}">Open</a>{% endif %}
+        {% if r.model_path %}<a class="btn" href="{{ url_for('run_view', run_id=r.id) }}">Open</a>
+          <a class="btn" href="{{ url_for('run_changes', run_id=r.id) }}">Changes</a>
+          <a class="btn" href="{{ url_for('run_file', run_id=r.id, name='handoff.md') }}">handoff.md</a>{% endif %}
         <form class="inline" method="post" action="{{ url_for('run_delete', run_id=r.id) }}" data-confirm="Delete run {{ r.id }} and its files?">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="next" value="{{ request.full_path.rstrip('?') }}">

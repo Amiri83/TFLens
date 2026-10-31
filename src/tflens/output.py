@@ -10,6 +10,7 @@ from typing import Any
 
 from . import __version__
 from .analyze import analyze
+from .crawl import crawl
 from .detect import detect_structure
 from .engine import Engine, ModuleInstance, in_scope
 from .loader import RepoSource, load_repo
@@ -41,13 +42,17 @@ def run_analysis(
     var_files: list[str] | None = None,
     cli_vars: dict[str, str] | None = None,
     scope: str | None = None,
+    git_root: Path | None = None,
+    git: bool = True,
 ) -> Analysis:
-    """Analyze ``root``. ``scope`` limits the roots to one directory (an environment)."""
+    """Analyze ``root``. ``scope`` limits the roots to one directory (an environment).
+    The git history is read when ``git_root`` (default ``root``) is a git checkout."""
     repo = load_repo(root)
     engine = Engine(repo, var_files, cli_vars, scope)
     engine.run()
     graph = analyze(repo, engine)
-    return Analysis(repo, engine, graph, build_model(repo, engine, graph))
+    crawled = crawl(repo, git_root, git)
+    return Analysis(repo, engine, graph, build_model(repo, engine, graph, crawled))
 
 
 def failure_reason(repo: RepoSource, engine: Engine) -> str:
@@ -198,7 +203,9 @@ def _variables(engine: Engine) -> list[dict[str, Any]]:
     return out
 
 
-def build_model(repo: RepoSource, engine: Engine, graph: Graph) -> dict[str, Any]:
+def build_model(
+    repo: RepoSource, engine: Engine, graph: Graph, crawled: dict[str, Any] | None = None
+) -> dict[str, Any]:
     # first: detection may add the files it reads (env.hcl, *.tfbackend) to repo.files
     structure = detect_structure(repo, engine)
     discovery = _discovery(repo, engine)
@@ -238,6 +245,7 @@ def build_model(repo: RepoSource, engine: Engine, graph: Graph) -> dict[str, Any
         "unknowns": [u.to_dict() for u in graph.unknowns],
         "discovery": discovery,
         "structure": structure,
+        "crawl": crawled if crawled is not None else crawl(repo, git=False),
     }
 
 

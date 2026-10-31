@@ -25,6 +25,8 @@ from .locate import LocBlock, object_keys, scan
 from .values import Location
 
 _SKIP_DIRS = {".terraform", ".git", ".venv", "venv", "node_modules", "__pycache__"}
+# Hidden directories that are walked anyway: CI configuration (read by crawl.py).
+CI_DIRS = frozenset({".github", ".gitlab", ".circleci", ".buildkite"})
 OUTPUT_DIR = "tflens-out"  # written by `tflens serve --dir` inside the repository
 TERRAGRUNT_FILE = "terragrunt.hcl"
 LOCK_FILE = ".terraform.lock.hcl"
@@ -242,7 +244,7 @@ def load_repo(root: Path) -> RepoSource:
                 # TFLens's own output: left out of the model entirely, so a model does not
                 # depend on whether an earlier one was written next to it
                 continue
-            elif d in _SKIP_DIRS or d.startswith("."):
+            elif d in _SKIP_DIRS or (d.startswith(".") and d not in CI_DIRS):
                 repo.skipped.append(SkippedDir(sub, "ignored", "tool, VCS or hidden directory"))
             else:
                 keep.append(d)

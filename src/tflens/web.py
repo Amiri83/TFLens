@@ -59,6 +59,8 @@ from .settings import (
     Settings,
     SettingsStore,
 )
+from .snapshots import diff_runs, previous_run
+from .visuals import DIAGRAMS
 from .webapi import STATIC_DIR, Api, ModelStore
 from .webapi import Response as ApiResponse
 
@@ -344,6 +346,36 @@ def _read():
 def _write():
     """Context manager: a write connection (creates the database on first use)."""
     return writing(_paths().db_path)
+
+
+CHANGE_SECTIONS = (
+    ("resources", "Resources"),
+    ("edges", "Edges"),
+    ("modules", "Modules"),
+    ("envs", "Environments"),
+    ("backends", "Backends"),
+    ("files", "Files"),
+)
+# Files of a run directory that can be downloaded.
+RUN_FILES = frozenset(
+    {"handoff.md", "overview.md", "report.md", "model.json"}
+    | {f"diagrams/{n}.{ext}" for n in DIAGRAMS for ext in ("mmd", "svg", "png")}
+)
+
+
+def describe_change(section: str, item: dict[str, Any]) -> str:
+    if section == "resources":
+        return f"{item['node_id']} ({item['type']})"
+    if section == "edges":
+        return f"{item['kind']}: {item['source']} → {item['target']} — {item['label']}"
+    if section == "modules":
+        text = f"{item['root']}: {item['address']} — {item['kind']} {item['source']}"
+        return text + (f" @ {item['version']}" if item["version"] else "")
+    if section == "envs":
+        return f"{item['env']} ({item['root']})"
+    if section == "backends":
+        return f"{item['root']}: {item['type']}"
+    return f"{item['path']} ({item['kind']})"
 
 
 def _repo_or_404(repo_id: int) -> dict[str, Any]:
@@ -858,6 +890,63 @@ def _register_managed(app: Flask) -> None:
     @app.route("/runs/<int:run_id>/api/<path:sub>", methods=["GET", "HEAD", "POST"])
     def run_api(run_id: int, sub: str):
         return to_flask(_run_api(run_id).handle(request.method, _api_target(sub)))
+
+    @app.get("/runs/<int:run_id>/changes")
+    def run_changes(run_id: int):
+        with _read() as conn:
+            run = tfrepo.get_run(conn, run_id) if conn is not None else None
+            if run is None or not run["model_path"]:
+                abort(404)
+            bases = (
+                [
+                    r
+                    for r in tfrepo.list_runs(conn, run["repo_id"], limit=200)
+                    if r["id"] != run_id and r["model_path"]
+                ]
+                if run["repo_id"] is not None
+                else []
+            )
+            raw = request.args.get("base", "")
+            base = None
+            if raw.isdigit():
+                base = next((b for b in bases if b["id"] == int(raw)), None)
+                if base is None:
+                    abort(404)
+            else:
+                prev = previous_run(conn, run)
+                base = next((b for b in bases if prev and b["id"] == prev["id"]), None)
+        diff, error = None, ""
+        if base is not None:
+            try:
+                with _write() as conn:  # back-fills the snapshot of runs recorded before it
+                    diff = diff_runs(conn, base, run)
+            except ValueError as exc:
+                error = str(exc)
+        return render_template(
+            "changes.html",
+            run=run,
+            base=base,
+            bases=bases,
+            diff=diff,
+            error=error,
+            sections=CHANGE_SECTIONS,
+            describe=describe_change,
+        )
+
+    @app.get("/runs/<int:run_id>/files/<path:name>")
+    def run_file(run_id: int, name: str):
+        if name not in RUN_FILES:
+            abort(404)
+        with _read() as conn:
+            run = tfrepo.get_run(conn, run_id) if conn is not None else None
+        if run is None or not run["model_path"]:
+            abort(404)
+        run_dir = Path(run["model_path"]).parent
+        if not (run_dir / name).is_file():
+            abort(404, f"{name} was not written for run {run_id}")
+        resp = send_from_directory(run_dir, name, max_age=0)
+        resp.headers["Content-Disposition"] = f'attachment; filename="{Path(name).name}"'
+        return resp
 
     @app.post("/runs/<int:run_id>/delete")
     def run_delete(run_id: int):

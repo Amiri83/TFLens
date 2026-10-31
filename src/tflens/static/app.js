@@ -65,7 +65,7 @@
   }
 
   // ------------------------------------------------------------ views
-  const VIEWS = ["overview", "graph", "repo"];
+  const VIEWS = ["overview", "graph", "repo", "diagrams"];
   let graphFitted = false; // the graph is laid out while hidden: fit it when first shown
 
   function setView(view) {
@@ -119,10 +119,23 @@
     return el("ul", { class: "overview-lines" }, ...lines.map(overviewLine));
   }
 
+  function drilldown(d) {
+    const parts = [el("summary", {}, d.title, " ", locLink(d.location), " ",
+      link("details", () => showDetail("node", d.node)))];
+    parts.push(overviewList(d.lines));
+    if (d.snippet && d.snippet.length) parts.push(snippet(d.snippet));
+    return el("details", { class: "drilldown" }, ...parts);
+  }
+
   function renderOverview(ov) {
     const box = document.getElementById("overview");
     const toc = [];
-    const parts = [el("h2", { id: "ov-top" }, "What this repository deploys"), overviewList(ov.summary)];
+    const parts = [];
+    if (ov.purpose && ov.purpose.length) {
+      toc.push(["ov-purpose", "Purpose (guess)"]);
+      parts.push(el("h2", { id: "ov-purpose" }, "Purpose (guess)"), overviewList(ov.purpose));
+    }
+    parts.push(el("h2", { id: "ov-top" }, "What this repository deploys"), overviewList(ov.summary));
     toc.push(["ov-top", "What it deploys"]);
     if (ov.inventory) {
       parts.push(el("h3", {}, "What is in the repository"), inventoryTable(ov.inventory));
@@ -136,9 +149,33 @@
         parts.push(el("h3", {}, s.title), overviewList(s.lines));
       }
     });
+    if (ov.resources && ov.resources.length) {
+      toc.push(["ov-res", "Resources"]);
+      parts.push(el("h2", { id: "ov-res" }, "Resources"),
+        el("p", { class: "muted" }, "What each resource is, what triggers it, what it can access and what accesses it."),
+        ...ov.resources.map(drilldown));
+    }
     if (ov.environments.length) {
       toc.push(["ov-envs", "Environments"]);
       parts.push(el("h2", { id: "ov-envs" }, "Environments"), overviewList(ov.environments));
+    }
+    if (ov.docs && ov.docs.length) {
+      toc.push(["ov-docs", "Documentation"]);
+      parts.push(el("h2", { id: "ov-docs" }, "Documentation"), overviewList(ov.docs));
+    }
+    if (ov.ci && ov.ci.length) {
+      toc.push(["ov-ci", "CI / CD and lock files"]);
+      parts.push(el("h2", { id: "ov-ci" }, "CI / CD and lock files"), overviewList(ov.ci));
+    }
+    if (ov.history) {
+      toc.push(["ov-hist", "History"]);
+      parts.push(el("h2", { id: "ov-hist" }, "History"), overviewList(ov.history.summary));
+      if (ov.history.hot_files.length) {
+        parts.push(el("h3", {}, "Most-changed files"), overviewList(ov.history.hot_files));
+      }
+      if (ov.history.commits.length) {
+        parts.push(el("h3", {}, "Recent commits"), overviewList(ov.history.commits));
+      }
     }
     toc.push(["ov-disc", "Discovery"]);
     parts.push(el("h2", { id: "ov-disc" }, "Discovery"), overviewList(ov.discovery));
@@ -520,7 +557,11 @@
     const d = await api(`api/file?path=${encodeURIComponent(path)}`);
     const parts = [el("h2", {}, d.path)];
     if (d.analyzed === false) {
-      box.replaceChildren(...parts, el("p", { class: "muted" }, d.note));
+      parts.push(el("p", { class: "muted" }, d.note));
+      if (d.readable) {
+        parts.push(el("p", {}, link("Show the source", () => showSource({ file: d.path, start_line: 1, end_line: 1000000 }))));
+      }
+      box.replaceChildren(...parts);
       return;
     }
     parts.push(el("p", {}, link("Show the source", () => showSource({ file: d.path, start_line: 1, end_line: 1000000 }))));
@@ -546,6 +587,29 @@
     box.replaceChildren(...parts);
   }
 
+  // ------------------------------------------------------------ diagrams
+  const DIAGRAMS = [
+    ["architecture", "Architecture (flows)", "Services grouped by root and module; TRIGGER / ACCESS / NETWORK flows only."],
+    ["module-tree", "Module tree", "Each root and the modules it calls, with source and version."],
+    ["env-matrix", "Environment matrix", "Root × environment, with each root's backend."],
+  ];
+
+  function renderDiagrams() {
+    const box = document.getElementById("diagrams");
+    const parts = [el("p", {},
+      el("a", { class: "link", href: "api/handoff?download=1", download: "handoff.md" }, "Download handoff.md"),
+      " — the overview and these diagrams (Mermaid) in one file, for Claude Code.")];
+    for (const [name, title, note] of DIAGRAMS) {
+      parts.push(el("h2", { id: `dg-${name}` }, title),
+        el("p", { class: "muted" }, note, " ",
+          el("a", { class: "link", href: `api/diagram?name=${name}&format=mmd&download=1`, download: `${name}.mmd` }, "Mermaid (.mmd)"),
+          " · ",
+          el("a", { class: "link", href: `api/diagram?name=${name}&format=svg&download=1`, download: `${name}.svg` }, "SVG")),
+        el("div", { class: "diagram" }, el("img", { src: `api/diagram?name=${name}&format=svg`, alt: title })));
+    }
+    box.replaceChildren(...parts);
+  }
+
   // ------------------------------------------------------------ boot
   async function loadAll() {
     const [summary, graph, tree, ov] = await Promise.all(
@@ -556,6 +620,9 @@
     // a recorded run (managed mode) is read-only: no Regenerate, a way back to the runs
     document.getElementById("regenerate").classList.toggle("hidden", Boolean(summary.readonly));
     document.getElementById("home").classList.toggle("hidden", !location.pathname.startsWith("/runs/"));
+    // a recorded run: diff against the previous run (managed mode only)
+    document.getElementById("changes").classList.toggle("hidden", !location.pathname.startsWith("/runs/"));
+    renderDiagrams();
     const s = summary.summary;
     const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
     const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
