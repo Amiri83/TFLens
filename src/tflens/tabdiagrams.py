@@ -7,7 +7,9 @@ the flows (:func:`tflens.flow.flow_svg`: columns by depth, numbered labelled ste
 * **network**: VPC -> subnets -> security groups -> the resources placed in the subnets
   or guarded by the groups (instances, ECS services, load balancers, Lambda functions,
   endpoints, ...). Security group **rules** (NETWORK edges: SG -> SG, CIDR -> SG,
-  SG -> CIDR) are the labelled steps: what can reach what. Containment is drawn quiet;
+  SG -> CIDR) are the labelled steps: what can reach what. The CIDRs, prefix lists and
+  groups outside the model are a column of their own, left of the VPC. Containment is
+  drawn quiet, at right angles, clear of the boxes;
 * **iam**: role / user / group -> its attached and inline policies -> the resources the
   policies grant actions on (ACCESS edges), labelled *can write* / *can read* /
   *can access* (the Flow view's IAM-only style) or *denies*.
@@ -30,6 +32,9 @@ from .flow import (
 from .overview import _line
 from .snippets import location_label
 
+# the Network diagram's columns: what is outside the VPC (CIDRs, prefix lists, groups
+# outside this model) leftmost, so no VPC or containment line cuts across it
+EXTERNAL, VPC, SUBNET, GROUP, PLACED = range(5)
 SG_TYPES = frozenset({"aws_security_group", "aws_default_security_group"})
 # attributes (last path segment) that place a resource in a subnet / attach a group
 PLACEMENT_ATTRS = ("subnet_id", "subnet_ids", "subnet_mapping", "subnets", "vpc_zone_identifier")
@@ -160,7 +165,7 @@ def network_diagram(model: dict[str, Any]) -> dict[str, Any]:
     resources = [n for n in model["nodes"] if n["kind"] == "resource"]
     for n in resources:
         if n["type"] == "aws_vpc":
-            d.node(n["id"], 0, "network")
+            d.node(n["id"], VPC, "network")
     edges = model["edges"]
     config = [e for e in edges if e["kind"] == "CONFIG" and e["source"] in d.nodes]
     # VPC -> subnets / security groups
@@ -169,34 +174,34 @@ def network_diagram(model: dict[str, Any]) -> dict[str, Any]:
         if a == "vpc_id" and d.type_of(e["target"]) == "aws_vpc":
             src = e["source"]
             if d.type_of(src) == "aws_subnet":
-                d.node(src, 1, "network")
+                d.node(src, SUBNET, "network")
             elif d.type_of(src) in SG_TYPES:
-                d.node(src, 2, "guard")
+                d.node(src, GROUP, "guard")
             else:
                 continue
             ev = [{"what": "vpc_id", "location": _ev(e), "edge": e["id"]}]
             d.step(e["target"], src, "contains", "", "contains", ev, quiet=True)
     for n in resources:  # subnets and groups outside a VPC created here
         if n["type"] == "aws_subnet":
-            d.node(n["id"], 1, "network")
+            d.node(n["id"], SUBNET, "network")
         elif n["type"] in SG_TYPES:
-            d.node(n["id"], 2, "guard")
+            d.node(n["id"], GROUP, "guard")
     # subnet -> what is placed in it; security group -> what it guards
     guards: set[tuple[str, str]] = set()
     for e in config:
         a, src, tgt = _last(e["attributes"].get("attribute", "")), e["source"], e["target"]
         if (
             d.type_of(src) == "aws_route_table_association"
-            or d.out.get(src, {}).get("depth", 3) < 3
+            or d.out.get(src, {}).get("depth", PLACED) < PLACED
         ):
             continue  # a VPC / subnet / group referencing another is not placed in it
         if a in PLACEMENT_ATTRS and d.type_of(tgt) == "aws_subnet":
-            d.node(src, 3, "compute" if _is_compute(d, src) else "target")
+            d.node(src, PLACED, "compute" if _is_compute(d, src) else "target")
             ev = [{"what": e["label"], "location": _ev(e), "edge": e["id"]}]
             d.step(tgt, src, "contains", "", "has in it", ev, quiet=True)
         elif a in SG_ATTRS and d.type_of(tgt) in SG_TYPES and (tgt, src) not in guards:
             guards.add((tgt, src))
-            d.node(src, 3, "compute" if _is_compute(d, src) else "target")
+            d.node(src, PLACED, "compute" if _is_compute(d, src) else "target")
             ev = [{"what": e["label"], "location": _ev(e), "edge": e["id"]}]
             d.step(tgt, src, "contains", "", "guards", ev, quiet=True)
     for e in edges:  # attachments the extractors record (Lambda vpc_config, ...)
@@ -204,21 +209,19 @@ def network_diagram(model: dict[str, Any]) -> dict[str, Any]:
             src, tgt = e["source"], e["target"]
             if d.type_of(tgt) in SG_TYPES and (tgt, src) not in guards and src in d.nodes:
                 guards.add((tgt, src))
-                d.node(src, 3, "compute" if _is_compute(d, src) else "target")
+                d.node(src, PLACED, "compute" if _is_compute(d, src) else "target")
                 ev = [{"what": e["label"], "location": _ev(e), "edge": e["id"]}]
                 d.step(tgt, src, "contains", "", "guards", ev, quiet=True)
     # the rules: what can reach what
     rules = [e for e in edges if e["kind"] == "NETWORK" and not e["attributes"].get("attachment")]
-    ingress_peers = {e["source"] for e in rules if e["attributes"].get("direction") != "egress"}
     for e in sorted(rules, key=lambda e: e["id"]):
         loc = _ev(e)
         for nid in (e["source"], e["target"]):
             if nid not in d.out:  # a CIDR, a prefix list, a group outside this model
                 n = d.nodes.get(nid)
-                depth = 1 if nid in ingress_peers else 4
                 d.node(
                     nid,
-                    depth,
+                    EXTERNAL,
                     "entry",
                     loc,
                     kind_label=kind_of(n) if n else "external",

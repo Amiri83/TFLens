@@ -14,7 +14,9 @@ already records with evidence:
   numbered in breadth-first order. Dead-letter queues, alarms and log groups are side
   branches, never chain steps;
 * **every compute gets a flow**: one that no chain from an entry point reaches starts its
-  own chain (marked *no trigger*), so the flows cover all the code, each compute once;
+  own chain (marked *no trigger*), so the flows cover all the code, each compute once:
+  a compute is expanded in one flow only, every other flow that reaches it ends in a
+  *continues in Flow N* link to that one;
 * what a compute runs in and as (ECS cluster, task definition, containers, task /
   execution role, instance profile, launch template) is its **context**: boxes hung
   under it, never chain steps.
@@ -268,45 +270,40 @@ class _Flows:
             reads = [(e, a) for e in access.get(target, []) if (a := _granted(e, READ_ACTIONS))]
             if not ref and target in triggers:
                 continue  # the queue / stream that triggers it: already the step before
-            if ref and writes:
-                kind, status, iam = "send", "verified", writes
-            elif ref and reads:
-                kind, status, iam = "read", "verified", reads
-            elif ref:
-                kind, status, iam = TARGET_TYPES[self.type_of(target)], "unverified", []
-            elif writes:
-                kind, status, iam = "send", "iam_only", writes
-            elif reads:
-                kind, status, iam = "read", "iam_only", reads
-            else:
-                continue  # an ACCESS edge with neither read nor write actions
-            evidence = []
-            for e in ref:
-                ev = e["evidence"][0] if e["evidence"] else None
-                evidence.append(
+            # both granted: a send link and a read link (two parallel edges in the diagram)
+            status = "verified" if ref else "iam_only"
+            grants = [("send", writes), ("read", reads)]
+            kinds = [(kind, status, iam) for kind, iam in grants if iam]
+            if ref and not kinds:
+                kinds = [(TARGET_TYPES[self.type_of(target)], "unverified", [])]
+            for kind, status, iam in kinds:  # none: neither read nor write actions
+                evidence = []
+                for e in ref:
+                    ev = e["evidence"][0] if e["evidence"] else None
+                    evidence.append(
+                        {
+                            "what": e["label"],  # env NAME (or secret NAME: ECS secrets)
+                            "location": _loc(ev),
+                            "edge": e["id"],
+                        }
+                    )
+                for e, actions in iam:
+                    evidence.append(
+                        {
+                            "what": f"IAM {', '.join(actions)}",
+                            "location": _loc(_statement(e)),
+                            "edge": e["id"],
+                        }
+                    )
+                links.append(
                     {
-                        "what": e["label"],  # env NAME (or secret NAME: ECS secrets)
-                        "location": _loc(ev),
-                        "edge": e["id"],
+                        "kind": kind,
+                        "status": status,
+                        "source": compute,
+                        "target": target,
+                        "evidence": evidence,
                     }
                 )
-            for e, actions in iam:
-                evidence.append(
-                    {
-                        "what": f"IAM {', '.join(actions)}",
-                        "location": _loc(_statement(e)),
-                        "edge": e["id"],
-                    }
-                )
-            links.append(
-                {
-                    "kind": kind,
-                    "status": status,
-                    "source": compute,
-                    "target": target,
-                    "evidence": evidence,
-                }
-            )
         links.sort(
             key=lambda lk: (
                 _KIND_ORDER[lk["kind"]],
@@ -345,9 +342,13 @@ class _Flows:
         ]
 
     # ------------------------------------------------------------- chains
-    def chain(self, entry: str) -> dict[str, Any]:
+    def chain(self, entry: str, owned: dict[str, str] | None = None) -> dict[str, Any]:
+        """Breadth-first from ``entry``. A compute in ``owned`` (compute -> the entry of the
+        flow that expands it) is a terminal link here: reached, never expanded."""
+        owned = owned or {}
         steps: list[dict[str, Any]] = []
         depth = {entry: 0}
+        links: dict[str, str] = {}
         queue = deque([entry])
         while queue:
             node = queue.popleft()
@@ -369,13 +370,16 @@ class _Flows:
                 if target in depth:
                     continue
                 depth[target] = depth[node] + 1
-                if kind != "read":  # what it reads is a sink of this chain
+                if owned.get(target, entry) != entry:  # expanded in another flow
+                    links[target] = owned[target]
+                elif kind != "read":  # what it reads is a sink of this chain
                     queue.append(target)
-        main = list(depth)
+        main = [nid for nid in depth if nid not in links]
         return {
             "entry": entry,
             "steps": steps,
             "depth": depth,
+            "links": links,
             "side": self.side(main),
             "context": self.context(main),
         }
@@ -614,8 +618,24 @@ def build_flows(model: dict[str, Any]) -> dict[str, Any]:
             c = f.chain(start)
             reached |= set(c["depth"])
             chains.append(c)
+
+    def order(c: dict[str, Any]) -> tuple[int, str, str]:
+        return -len(c["steps"]), f.name(c["entry"]), c["entry"]
+
+    # each compute is expanded in exactly one flow: its own when it starts one, else the
+    # first (declared triggers before no-trigger, then longest first) to reach it; every
+    # other flow stops there with a "continues in Flow N" link
+    owner = {c["entry"]: c["entry"] for c in chains if f.is_compute(c["entry"])}
+    deduped = []
+    for c in sorted(chains, key=lambda c: (f.is_compute(c["entry"]), *order(c))):
+        c = f.chain(c["entry"], owner)
+        for nid in c["depth"]:
+            if f.is_compute(nid) and nid not in c["links"]:
+                owner.setdefault(nid, c["entry"])
+        deduped.append(c)
     # the longest pipeline first: that is where to start reading
-    chains.sort(key=lambda c: (-len(c["steps"]), f.name(c["entry"]), c["entry"]))
+    chains = sorted(deduped, key=order)
+    n_of = {c["entry"]: i for i, c in enumerate(chains, 1)}
     out_chains = []
     for i, c in enumerate(chains, 1):
         entry = f.nodes[c["entry"]]
@@ -635,6 +655,15 @@ def build_flows(model: dict[str, Any]) -> dict[str, Any]:
             }
             for nid, d in c["depth"].items()
         ]
+        for n in nodes:
+            if n["id"] in c["links"]:  # expanded in its own flow: a link to it here
+                k = n_of[c["links"][n["id"]]]
+                n.update(
+                    label=f"continues in Flow {k}",
+                    kind_label=f"{n['label']} ({n['kind_label']})",
+                    role="link",
+                    continues={"flow": f"flow-{k}", "n": k, "compute": n["label"]},
+                )
         for s in c["side"]:
             n = f.nodes[s["node"]]
             nodes.append(
@@ -691,7 +720,9 @@ def build_flows(model: dict[str, Any]) -> dict[str, Any]:
             }
         )
     steps = [s for c in out_chains for s in c["steps"]]
-    covered = {nid for c in chains for nid in c["depth"] if f.is_compute(nid)}
+    covered = {
+        nid for c in chains for nid in c["depth"] if f.is_compute(nid) and nid not in c["links"]
+    }
     metrics = {
         "flows": len(out_chains),
         "entry_points": len(out_chains),
@@ -837,6 +868,14 @@ def render_flows_markdown(flows: dict[str, Any], level: int = 1) -> str:
         out += [f"{h}# Flow {c['n']}: {c['title']}", ""]
         out += [s["text"] for s in c["steps"]] or ["(no steps)"]
         out.append("")
+        out += [
+            f"- {n['continues']['compute']}: {n['label']}"
+            + (f" (`{location_label(n['code_ref'])}`)" if n["code_ref"] else "")
+            for n in c["nodes"]
+            if n["role"] == "link"
+        ]
+        if any(n["role"] == "link" for n in c["nodes"]):
+            out.append("")
         context = [n for n in c["nodes"] if n["role"] == "context"]
         if context:
             labels = {n["id"]: n["label"] for n in c["nodes"]}
@@ -882,6 +921,7 @@ ROLE_STROKE = {
     "entry": "#bc4c00",
     "no_trigger": "#8250df",
     "compute": "#8250df",
+    "link": "#8250df",
     "target": "#1a7f37",
     "side": "#8c959f",
     "context": "#8250df",
@@ -913,6 +953,16 @@ def _t(
     x: float, y: float, text: str, size: int = 14, fill: str = "#24292f", extra: str = ""
 ) -> str:
     return f'<text x="{x:.0f}" y="{y:.0f}" font-size="{size}" fill="{fill}"{extra}>{escape(text)}</text>'
+
+
+def parallel_lanes(steps: list[dict[str, Any]]) -> dict[int, tuple[int, int]]:
+    """Step number -> (lane, lanes) for steps that share their source and target with
+    another (a compute that reads and writes one table, two rules between two groups),
+    lanes in step order; a step alone on its pair is left out."""
+    pairs: dict[tuple[str, str], list[int]] = {}
+    for s in steps:
+        pairs.setdefault((s["source"], s["target"]), []).append(s["n"])
+    return {n: (k, len(ns)) for ns in pairs.values() if len(ns) > 1 for k, n in enumerate(ns)}
 
 
 def flow_svg(
@@ -1000,55 +1050,89 @@ def flow_svg(
             )
             + "</g>"
         )
-    edges_svg, labels_svg = [], []
+    drawn = [s for s in chain["steps"] if s["source"] in pos and s["target"] in pos]
+    lanes = parallel_lanes([s for s in drawn if not s.get("quiet")])
+    quiet_svg, edges_svg, labels_svg = [], [], []
     placed: list[tuple[float, float, float, float]] = []
-    for s in chain["steps"]:
-        if s["source"] not in pos or s["target"] not in pos:
-            continue
+    routed = 0  # quiet edges sent along the bottom, each in its own lane
+    for s in drawn:
         sx, sy, _, sh = pos[s["source"]]
         tx, ty, _, th = pos[s["target"]]
         colour, dash = STYLE[(s["kind"], s["status"])]
         y1, y2 = sy + sh / 2, ty + th / 2
-        if tx > sx:
+        k, m = lanes.get(s["n"], (0, 1))
+        leftward = tx < sx and s["kind"] == "rule"
+        if s.get("quiet"):
+            # structure (contains / attached): right angles through the gaps between the
+            # columns, along the bottom past the boxes when it skips a column
             x1, x2 = sx + NODE_W, tx
-            d = f"M{x1:.0f},{y1:.0f} C{x1 + 80:.0f},{y1:.0f} {x2 - 80:.0f},{y2:.0f} {x2:.0f},{y2:.0f}"
-        else:  # back to an earlier node (a loop): around the right side
-            x1, x2 = sx + NODE_W, tx + NODE_W
-            d = f"M{x1:.0f},{y1:.0f} C{x1 + 90:.0f},{y1:.0f} {x2 + 90:.0f},{y2:.0f} {x2:.0f},{y2:.0f}"
+            if tx - x1 == COL_GAP:
+                xm = x1 + COL_GAP / 2
+                d = f"M{x1:.0f},{y1:.0f} H{xm:.0f} V{y2:.0f} H{x2:.0f}"
+            else:
+                off = 10 + (routed * 7) % (COL_GAP / 2 - 20)
+                lane = bottom + 4 + 10 * routed
+                d = (
+                    f"M{x1:.0f},{y1:.0f} H{x1 + off:.0f} V{lane:.0f} "
+                    f"H{x2 - min(off, x2 - 4):.0f} V{y2:.0f} H{x2:.0f}"
+                )
+                routed += 1
+        else:
+            # parallel steps (same source and target) each get a lane: ends apart, the
+            # middles further apart, each label on its own edge
+            gap = min(24.0, (min(sh, th) - 16) / (m - 1)) if m > 1 else 0.0
+            o = (k - (m - 1) / 2) * gap
+            y1, y2 = y1 + o, y2 + o
+            if tx > sx:
+                x1, x2, c1, c2 = sx + NODE_W, tx, sx + NODE_W + 80, tx - 80
+            elif leftward:  # egress to the outside, in the leftmost column
+                x1, x2, c1, c2 = sx, tx + NODE_W, sx - 80, tx + NODE_W + 80
+            else:  # back to an earlier node (a loop): around the right side
+                x1, x2, c1, c2 = sx + NODE_W, tx + NODE_W, sx + NODE_W + 90, tx + NODE_W + 90
+            cy1, cy2 = y1 + 2 * o, y2 + 2 * o
+            d = f"M{x1:.0f},{y1:.0f} C{c1:.0f},{cy1:.0f} {c2:.0f},{cy2:.0f} {x2:.0f},{y2:.0f}"
+            mx, my = (x1 + 3 * c1 + 3 * c2 + x2) / 8, (y1 + 3 * cy1 + 3 * cy2 + y2) / 8
         dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
         marker = (
             f' marker-start="url(#fa-{s["n"]})"'
             if s["kind"] == "read"
             else f' marker-end="url(#fa-{s["n"]})"'
         )
-        edges_svg.append(
+        lane_attr = f' data-lane="{k}"' if m > 1 else ""
+        cls = ' class="contains"' if s.get("quiet") else ""
+        (quiet_svg if s.get("quiet") else edges_svg).append(
             f'<marker id="fa-{s["n"]}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" '
             f'markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{colour}"/></marker>'
-            f'<path d="{d}" fill="none" stroke="{colour}" stroke-width="2.2"{dash_attr}{marker}/>'
+            f'<path data-step="{s["n"]}"{lane_attr}{cls} d="{d}" fill="none" stroke="{colour}" '
+            f'stroke-width="{1.5 if s.get("quiet") else 2.2}"{dash_attr}{marker}/>'
         )
-        if s.get("quiet"):  # structure (contains / attached): the boxes say enough
+        if s.get("quiet"):  # the boxes say enough
             continue
-        # the label sits in the gap just before the target: one per incoming step, stacked
+        # the label sits in the gap just before the target: one per incoming step, stacked;
+        # a parallel step's on the middle of its own lane
         line1 = f"{s['n']}. {s['verb'].split(' (')[0]}"
         line2 = {"unverified": "(unverified)", "iam_only": "(IAM only)", "public": "(public)"}.get(
             s["status"], ""
         )
         lw = max(_w(line1, 14), _w(line2, 14)) + 10
         lh = 40 if line2 else 22
-        lx = (x2 - 10 - lw) if tx > sx else x1 + 20
-        ly = y2 - lh - 4
+        if m > 1:
+            lx, ly = mx - lw / 2, my - lh / 2
+        else:
+            lx = x2 - 10 - lw if tx > sx else x2 + 10 if leftward else x1 + 20
+            ly = y2 - lh - 4
         while any(lx < b[1] and b[0] < lx + lw and ly < b[3] and b[2] < ly + lh for b in placed):
             ly -= lh + 4
         placed.append((lx, lx + lw, ly, ly + lh))
         labels_svg.append(
-            f"<g><title>{escape(s['text'])}</title>"
+            f'<g data-step="{s["n"]}"{lane_attr}><title>{escape(s["text"])}</title>'
             f'<rect x="{lx:.0f}" y="{ly:.0f}" width="{lw:.0f}" height="{lh}" rx="4" fill="#ffffff" '
             f'fill-opacity="0.92" stroke="{colour}" stroke-width="1"/>'
             + _t(lx + 5, ly + 16, line1, 14, colour, ' font-weight="700"')
             + (_t(lx + 5, ly + 34, line2, 14, colour) if line2 else "")
             + "</g>"
         )
-    legend_y = bottom + 10
+    legend_y = bottom + 10 + 10 * routed
     lx = PAD
     for text, kind, status in legend:
         colour, dash = STYLE[(kind, status)]
@@ -1073,7 +1157,8 @@ def flow_svg(
         f'font-family="{FONT}" font-size="14">\n'
         f"<title>{escape(title or chain['title'])}</title>\n"
         f'<rect x="0" y="0" width="{w}" height="{h}" fill="#ffffff"/>\n'
-        + "\n".join([head, *body, *edges_svg, *nodes_svg, *labels_svg])
+        # the quiet structure under the boxes, the labelled steps over them
+        + "\n".join([head, *body, *quiet_svg, *nodes_svg, *edges_svg, *labels_svg])
         + "\n</svg>\n"
     )
 
