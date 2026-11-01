@@ -17,6 +17,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+from .docsdiff import doc_sources
 from .loader import RepoSource
 
 MAX_DOCS = 30
@@ -118,16 +119,18 @@ def is_text(path: str) -> bool:
 
 
 def doc_files(all_files: list[str]) -> list[str]:
-    """READMEs down to two directory levels, plus the files at the top of docs/."""
+    """READMEs at any depth, the files of docs/ directories (wherever they are) and every
+    other Markdown file."""
     out = []
     for f in all_files:
         base = posixpath.basename(f)
-        parent = posixpath.dirname(f)
+        parts = posixpath.dirname(f).lower().split("/")
         ext = posixpath.splitext(base)[1].lower()
         if ext not in DOC_EXTENSIONS or base.startswith("."):
             continue
         readme = bool(_README_RE.match(base))
-        if (readme and _depth(f) <= 2) or (parent.lower() in DOC_DIRS and (ext or readme)):
+        in_docs = any(p in DOC_DIRS for p in parts) and bool(ext or readme)
+        if readme or in_docs or ext in (".md", ".markdown"):
             out.append(f)
     # top-level README first, then by depth and path
     out.sort(key=lambda f: (_depth(f), not _README_RE.match(posixpath.basename(f)), f))
@@ -449,6 +452,7 @@ def crawl(repo: RepoSource, git_root: Path | None = None, git: bool = True) -> d
     readable |= {h["path"] for h in history["hot_files"] if h["exists"] and is_text(h["path"])}
     readable |= {f for c in log["commits"] for f in c["files"] if f in all_files and is_text(f)}
     readable |= {lk["file"] for lk in _locks(repo)}
+    readable |= set(doc_sources(repo))  # the docs vs code diff links to their lines
     return {
         "docs": docs,
         "ci": ci,

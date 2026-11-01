@@ -104,6 +104,9 @@ class ModelStore:
         # no environment asked for: apply the default one (dev, else the first) until
         # one, or none, is chosen in the switcher
         self.auto_env = auto_env and not (self.env or self.var_files or self.cli_vars)
+        # the environment chosen per stack (stack id -> environment id, '' for none); the
+        # other stacks keep their default
+        self.stack_envs: dict[str, str] = {}
         self.generated = False  # whether the current model was produced by this process
         self.note = ""
         self._model: dict[str, Any] | None = None
@@ -132,6 +135,7 @@ class ModelStore:
         return (
             self.auto_env
             and not self.readonly
+            and not self.stack_envs
             and model.get("environment") is None
             and bool((model.get("structure") or {}).get("environments"))
         )
@@ -141,7 +145,12 @@ class ModelStore:
             raise ModelUnavailable("a recorded run cannot be regenerated")
         with self._lock:
             model = run_analysis(
-                self.root, self.var_files, self.cli_vars, env=self.env, auto_env=self.auto_env
+                self.root,
+                self.var_files,
+                self.cli_vars,
+                env=self.env,
+                auto_env=self.auto_env,
+                stack_envs=dict(self.stack_envs) if not self.env else None,
             ).model
             try:
                 self.model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,12 +168,27 @@ class ModelStore:
         if self.readonly:
             raise ModelUnavailable("a recorded run cannot switch environments")
         with self._lock:
-            previous = self.env, self.auto_env
-            self.env, self.auto_env = env or None, False
+            previous = self.env, self.auto_env, dict(self.stack_envs)
+            self.env, self.auto_env, self.stack_envs = env or None, False, {}
             try:
                 return self.regenerate()
             except ValueError:
-                self.env, self.auto_env = previous
+                self.env, self.auto_env, self.stack_envs = previous
+                raise
+
+    def select_stack_env(self, stack: str, env: str | None) -> dict[str, Any]:
+        """Re-analyze with ``env`` (an environment id, None / '': none) applied to one
+        stack; every other stack keeps its selection (or its default)."""
+        if self.readonly:
+            raise ModelUnavailable("a recorded run cannot switch environments")
+        with self._lock:
+            previous = self.env, self.auto_env, dict(self.stack_envs)
+            self.env, self.auto_env = None, True
+            self.stack_envs = {**self.stack_envs, stack: env or ""}
+            try:
+                return self.regenerate()
+            except ValueError:
+                self.env, self.auto_env, self.stack_envs = previous
                 raise
 
     def lines(self, file: str) -> list[str] | None:
@@ -669,6 +693,10 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
         "total": None,
         "skipped": analysis.get("skipped", []),
         "current": {**current, "text": env_counts_text(current)},
+        # one environment selector per stack (the stacks with environments)
+        "stacks": model.get("stacks", []),
+        "selected": analysis.get("selected") or ([active["id"]] if active else []),
+        "stack_links": model.get("stack_links", []),
     }
     if rows:
         total = analysis["total"]
@@ -741,7 +769,10 @@ class Api:
                 if self.store.readonly:
                     return json_response({"error": "a recorded run is read-only"}, 405)
                 try:
-                    model = self.store.select_env(query.get("name", ""))
+                    if query.get("stack"):  # the environment selector of one stack
+                        model = self.store.select_stack_env(query["stack"], query.get("name", ""))
+                    else:
+                        model = self.store.select_env(query.get("name", ""))
                 except ValueError as exc:
                     return json_response({"error": "unknown environment", "detail": str(exc)}, 404)
                 return json_response(environments_view(model, self.store))

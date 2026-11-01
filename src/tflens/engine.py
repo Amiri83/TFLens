@@ -30,6 +30,19 @@ ATTR_ALIASES: dict[tuple[str, str], str] = {
 }
 
 _CIRCULAR = object()
+# terraform_remote_state config settings that identify a state (compared with the stacks'
+# backend settings); at least one of the path-like ones must match.
+_STATE_KEYS = (
+    "bucket",
+    "key",
+    "prefix",
+    "path",
+    "storage_account_name",
+    "container_name",
+    "organization",
+    "address",
+)
+_STATE_PATH_KEYS = frozenset({"key", "prefix", "path", "address"})
 
 
 @dataclass
@@ -125,12 +138,12 @@ class ModuleInstance:
         if name == "terraform":
             return Unknown("terraform.workspace is selected at runtime"), []
         if name == "count":
-            only = self.only_instance(scope.self_id)
+            only = self.only_instance(scope.self_id) or self.first_instance(scope.self_id)
             if only is not None and first == "index":
                 return only[0], ops[1:]
             return Unknown("count.index differs per resource instance"), []
         if name == "each":
-            only = self.only_instance(scope.self_id)
+            only = self.only_instance(scope.self_id) or self.first_instance(scope.self_id)
             if only is not None and first in ("key", "value"):
                 return only[0 if first == "key" else 1], ops[1:]
             return Unknown("each.key/each.value differ per resource instance"), []
@@ -263,8 +276,51 @@ class ModuleInstance:
         attr = ops[0][1]
         if dtype == "aws_iam_policy_document" and attr in ("json", "minified_json"):
             return apply_ops(self.policy_document(name), ops[1:])
+        if dtype == "terraform_remote_state" and attr == "outputs":
+            return self.remote_output(name, ops[1:])
         configured, value = self.data_attr(dtype, name, attr)
         return apply_ops(Ref(node_id, attr, value, configured and is_known(value)), ops[1:])
+
+    def remote_state(self, name: str) -> dict[str, Any]:
+        """Where ``data.terraform_remote_state.<name>`` reads from: its backend, config and
+        the stack (root) of this repository whose state that is (:meth:`Engine.match_state`)."""
+        return self.memo(("remote_state", name), lambda: self._remote_state(name))
+
+    def _remote_state(self, name: str) -> dict[str, Any]:
+        block = self.src.data[("terraform_remote_state", name)]
+        node_id = self.node_id("terraform_remote_state", name, data=True)
+        backend = self.eval_attr(block.attrs["backend"]) if "backend" in block.attrs else None
+        config: dict[str, Any] = {}
+        if "config" in block.attrs:
+            value = unwrap(self.eval_attr(block.attrs["config"], node_id))
+            if isinstance(value, dict):
+                config = {str(k): render(v) for k, v in value.items()}
+        btype = render(backend) or "local"
+        return {
+            "backend": btype,
+            "config": {k: config[k] for k in sorted(config)},
+            **self.engine.match_state(self, btype, config),
+        }
+
+    def remote_output(self, name: str, ops: Ops) -> Any:
+        """``data.terraform_remote_state.<name>.outputs.<x>``: the output of the stack it
+        points at when that stack is analyzed here (so references cross stacks), else a
+        reference to the remote state (an external link, never an unknown value)."""
+        node_id = self.node_id("terraform_remote_state", name, data=True)
+        fallback = apply_ops(Ref(node_id, "outputs"), ops)
+        if not ops or ops[0][0] != "attr":
+            return fallback
+        link = self.remote_state(name)
+        target = self.engine.root_instance(link.get("stack"))
+        applied = self.engine.root_envs.get(link.get("stack") or "")
+        if applied and link.get("env") and applied != link["env"]:
+            target = None  # that stack is analyzed here with another environment's tfvars
+        if target is None or ops[0][1] not in target.src.outputs:
+            return fallback
+        value = target.output(ops[0][1])
+        if isinstance(unwrap(value), Unknown):
+            return fallback
+        return apply_ops(value, ops[1:])
 
     def policy_document(self, name: str) -> Any:
         return self.memo(("policydoc", name), lambda: self._policy_document(name))
@@ -354,6 +410,40 @@ class ModuleInstance:
             return unwrap(value[0]), unwrap(value[0])
         return None
 
+    def first_instance(self, self_id: str | None) -> tuple[Any, Any] | None:
+        """``(count.index | each.key, each.value)`` of the first instance of a block whose
+        count / for_each is known (``[0]``, or the first key in terraform's lexical
+        order): a node stands for all its instances and shows the first one's values
+        (:meth:`instance_shown`). None when the instances are not known."""
+        block = self.blocks_by_id().get(self_id) if self_id else None
+        if block is None:
+            return None
+        if "count" in block.attrs:
+            n = self.instances_of(block)[0]
+            return (0, None) if n else None
+        attr = block.attrs.get("for_each")
+        value = unwrap(self.eval_attr(attr)) if attr is not None else None
+        if isinstance(value, dict) and value:
+            key = min(value, key=str)
+            return key, value[key]
+        if isinstance(value, list) and value:
+            keys = [unwrap(v) for v in value]
+            if all(isinstance(k, str) for k in keys):
+                return min(keys), min(keys)
+        return None
+
+    def instance_shown(self, block: Block, self_id: str) -> str | None:
+        """``count.index = 0`` / ``each.key = "a"``: the instance whose values a node with
+        several instances shows (None when it has one, or they are not known)."""
+        if self.only_instance(self_id) is not None:
+            return None
+        first = self.first_instance(self_id)
+        if first is None:
+            return None
+        if "count" in block.attrs:
+            return "count.index = 0"
+        return f"each.key = {display(first[0])!s}"
+
     def all_vars(self) -> list[VarInfo]:
         for name in sorted(self.src.variables):
             self.var(name)
@@ -423,12 +513,23 @@ class Engine:
         var_files: list[str] | None = None,
         cli_vars: dict[str, str] | None = None,
         scope: str | None = None,
+        root_var_files: dict[str, list[str]] | None = None,
+        exclude_roots: set[str] | None = None,
     ) -> None:
         self.repo = repo
         self.var_files = var_files or []
         self.cli_vars = cli_vars or {}
         # only roots at or below this directory (an environment's directory)
         self.scope = None if scope in (None, "", ".") else scope
+        # per stack: the tfvars of the environment selected for that root (applied after
+        # ``var_files``), and the roots of the stacks' other environments (not analyzed)
+        self.root_var_files = root_var_files or {}
+        self.exclude_roots = exclude_roots or set()
+        # the state files of the repository's stacks: [{root, env, type, settings}]
+        # (detect.state_index), matched by terraform_remote_state data sources
+        self.state_index: list[dict[str, Any]] = []
+        # root -> the environment applied to it (its tfvars), for state matching
+        self.root_envs: dict[str, str] = {}
         self.instances: list[ModuleInstance] = []
         self.roots: list[str] = []
         # root directory -> directory of the module instantiated as that root (they
@@ -462,10 +563,63 @@ class Engine:
             self.units[unit.dir] = unit
             if unit.module_dir:
                 self.root_modules[unit.dir] = unit.module_dir
-        roots = sorted(self.root_modules)
-        if self.scope:
-            roots = [r for r in roots if in_scope(r, self.scope)]
-        return roots
+        return [r for r in sorted(self.root_modules) if self.selected(r)]
+
+    def selected(self, root: str) -> bool:
+        """Whether a root is analyzed: in the scope and not another environment's root."""
+        if self.scope and not in_scope(root, self.scope):
+            return False
+        return root not in self.exclude_roots
+
+    def root_instance(self, root: str | None) -> ModuleInstance | None:
+        """The instance of an analyzed root module (None if it is not analyzed here)."""
+        if root is None:
+            return None
+        return next((i for i in self.instances if i.parent is None and i.root_dir == root), None)
+
+    def match_state(
+        self, inst: ModuleInstance, btype: str, config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """The stack whose state a ``terraform_remote_state`` (backend ``btype``, ``config``
+        with rendered values, None where not known) reads: ``{stack, env, status, reason}``.
+        A state is matched when the backend type and every identifying setting both sides
+        know (bucket, key, prefix, path, ...) are equal; ``local`` paths are relative to
+        the root reading them."""
+        if btype == "local":
+            path = config.get("path") or "terraform.tfstate"
+            config = {"path": posixpath.normpath(posixpath.join(inst.root_dir, path))}
+        if any(config.get(k) is None for k in _STATE_KEYS if k in config):
+            missing = [k for k in _STATE_KEYS if k in config and config[k] is None]
+            return {
+                "stack": None,
+                "env": None,
+                "status": "unresolved",
+                "reason": f"config {', '.join(missing)} not known statically",
+            }
+        for entry in self.state_index:
+            if entry["type"] != btype or entry["root"] == inst.root_dir:
+                continue
+            settings = entry["settings"]
+            if btype == "local":
+                path = settings.get("path") or "terraform.tfstate"
+                settings = {"path": posixpath.normpath(posixpath.join(entry["root"], path))}
+            shared = [k for k in _STATE_KEYS if k in config and settings.get(k) is not None]
+            if not any(k in _STATE_PATH_KEYS for k in shared):
+                continue
+            if all(str(config[k]) == str(settings[k]) for k in shared):
+                return {
+                    "stack": entry["root"],
+                    "env": entry.get("env"),
+                    "status": "linked",
+                    "reason": f"{btype} state of {entry['root']}"
+                    + (f" ({entry['env']})" if entry.get("env") else ""),
+                }
+        return {
+            "stack": None,
+            "env": None,
+            "status": "external",
+            "reason": "no stack of this repository writes this state",
+        }
 
     def _remote(self, root_dir: str, address: str) -> tuple[RemoteModule | None, str]:
         """Materialized directory of a remote module call, from the root's modules.json."""
@@ -561,7 +715,8 @@ class Engine:
             and "/" not in f[len(prefix) :]
             and f.endswith((".auto.tfvars", ".auto.tfvars.json"))
         )
-        files = auto + [f for f in self.var_files if f in self.repo.tfvars]
+        chosen = self.var_files + self.root_var_files.get(root_dir, [])
+        files = auto + [f for f in chosen if f in self.repo.tfvars]
         empty = _EmptyScope(self)
         unit = self.units.get(root_dir)
         if unit is not None:

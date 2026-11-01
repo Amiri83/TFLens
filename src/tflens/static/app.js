@@ -185,16 +185,72 @@
     return files.flatMap((f, i) => [i ? ", " : "", locLink({ file: f, start_line: 1, end_line: 1 })]);
   }
 
+  // The environments applied in the model shown: one per stack.
+  function isShown(envs, id) {
+    return (envs.selected || []).includes(id) || id === envs.active;
+  }
+
+  function multiStack(envs) {
+    return (envs.stacks || []).filter((s) => s.environments.length).length > 1;
+  }
+
+  // One row per stack: its root(s), and its own environment selector.
+  function stacksTable(envs) {
+    const head = el("tr", {}, el("th", {}, "Stack"), el("th", {}, "Root(s)"), el("th", {}, "Layout"),
+      el("th", {}, "Environment shown"));
+    const rows = envs.stacks.map((s) => {
+      let pick;
+      if (!s.environments.length) {
+        pick = el("span", { class: "muted" }, "— (no environment detected)");
+      } else if (!envs.switchable) {
+        pick = el("strong", {}, s.selected || "none (variable defaults)");
+      } else {
+        pick = el("select", { "data-stack": s.id, onchange: (ev) => selectStackEnv(s.id, ev.target.value) },
+          el("option", { value: "" }, "none (variable defaults)"),
+          ...s.environments.map((id) => el("option", { value: id },
+            `${id}${s.default && id === s.selected ? " (default)" : ""}`)));
+        pick.value = s.selected || "";
+      }
+      const roots = s.analyzed.length ? s.analyzed : s.roots;
+      return el("tr", { class: "stack-row", "data-stack": s.id },
+        el("td", { class: "mono" }, s.id), el("td", { class: "mono" }, roots.join(", ") || "—"),
+        el("td", {}, s.layout), el("td", {}, pick));
+    });
+    return el("table", { class: "env-stacks" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
+  function stackLinksList(envs) {
+    return el("ul", { class: "overview-lines" }, ...envs.stack_links.map((l) => {
+      const target = l.to_stack ? `stack ${l.to_stack}${l.env ? ` (${l.env})` : ""}` : `${l.backend} state outside this repository`;
+      return el("li", { class: l.status === "unresolved" ? "ov-line st-unknown" : "ov-line" },
+        `${l.from_stack || "?"} reads ${target} via `, link(l.data_source, () => showDetail("node", l.data_source)),
+        " ", locLink(l.location), l.to_stack ? null : el("span", { class: "tag" }, ` ${l.reason}`));
+    }));
+  }
+
+  async function selectStackEnv(stack, name) {
+    for (const s of document.querySelectorAll("select[data-stack]")) s.disabled = true;
+    try {
+      await api(`api/env?stack=${encodeURIComponent(stack)}&name=${encodeURIComponent(name)}`,
+        { method: "POST", headers: { "X-TFLens": "1" } });
+      await loadAll();
+    } catch (err) {
+      document.getElementById("detail").replaceChildren(el("p", {}, `Environment not applied: ${err.message}`));
+      for (const s of document.querySelectorAll("select[data-stack]")) s.disabled = false;
+    }
+  }
+
   function envFilesTable(envs) {
-    const head = el("tr", {}, el("th", {}, "Environment"), el("th", {}, "Wired"),
+    const stacked = multiStack(envs);
+    const head = el("tr", {}, el("th", {}, "Environment"), stacked ? el("th", {}, "Stack") : null, el("th", {}, "Wired"),
       el("th", {}, "tfvars"), el("th", {}, "Backend config"), el("th", {}, "CI / script lines"));
     const rows = envs.environments.map((r) => {
       const ci = r.var_file_cli.map((u) => el("div", {}, `${u.flag}=${u.value} `, locLink(u.location)));
       const wired = r.wired
         ? el("td", { title: r.wiring.join("; ") }, "yes")
         : el("td", { class: "st-unknown", title: r.not_wired_reason || "" }, "not wired");
-      return el("tr", { class: `env-row${r.id === envs.active ? " active" : ""}${r.wired ? "" : " not-wired"}`, "data-env": r.id },
-        el("td", {}, envButton(envs, r.id)), wired,
+      return el("tr", { class: `env-row${isShown(envs, r.id) ? " active" : ""}${r.wired ? "" : " not-wired"}`, "data-env": r.id },
+        el("td", {}, envButton(envs, r.id)), stacked ? el("td", { class: "mono" }, r.stack || "—") : null, wired,
         el("td", {}, ...fileLinks(r.var_files)), el("td", {}, ...fileLinks(r.backend_hcl)),
         el("td", {}, ...(ci.length ? ci : [el("span", { class: "muted" }, "—")])));
     });
@@ -203,8 +259,15 @@
 
   // An environment's name; a button applying it when the analysis can switch.
   function envButton(envs, id) {
-    const label = id === envs.active ? `${id} (shown)` : id;
-    if (!envs.switchable || id === envs.active) return el("strong", {}, label);
+    const shown = isShown(envs, id);
+    const label = shown ? `${id} (shown)` : id;
+    if (!envs.switchable || shown) return el("strong", {}, label);
+    if (multiStack(envs)) {
+      const row = envs.environments.find((r) => r.id === id);
+      if (row && row.stack) {
+        return el("button", { type: "button", class: "env-apply", title: `Show ${row.stack} as ${id}`, onclick: () => selectStackEnv(row.stack, id) }, label);
+      }
+    }
     return el("button", { type: "button", class: "env-apply", title: `Analyze as ${id}`, onclick: () => selectEnv(id) }, label);
   }
 
@@ -218,7 +281,7 @@
     const rows = envs.environments.map((r) => {
       const st = r.state || { type: "?", settings: [] };
       const by = new Map(st.settings.map((s) => [s.key, s]));
-      return el("tr", { class: r.id === envs.active ? "env-row active" : "env-row" },
+      return el("tr", { class: isShown(envs, r.id) ? "env-row active" : "env-row" },
         el("td", {}, r.id), el("td", { title: st.origin || st.note || "" }, st.type),
         ...keys.map((k) => {
           const s = by.get(k);
@@ -309,9 +372,21 @@
     if (!envs.environments.length) {
       parts.push(el("p", { class: "muted" },
         "No environment detected (no env/*.tfvars, backend .hcl per environment, env directories or CI -var-file / -backend-config lines): the inventory below is the code with the variables' defaults."));
+    } else if (multiStack(envs)) {
+      parts.push(el("p", {}, `Shown: ${(envs.selected || []).join(", ") || "no environment (variable defaults)"}. Every stack is analyzed with its own environment: pick one per stack below. The flows, the Root view and the graph follow these selections.`));
     } else {
       const shown = envs.active ? `${envs.active}${envs.default ? " (default)" : ""}` : "no environment (variable defaults)";
       parts.push(el("p", {}, `Shown: ${shown}. The flows, the Root view (Network, IAM) and the graph follow the environment selected here or in the switcher above.`));
+    }
+    if ((envs.stacks || []).length > 1) {
+      section("env-stacks", `Stacks (${envs.stacks.length})`,
+        el("p", { class: "muted" }, "Each root with its own state is a stack; its environments are the tfvars / backend configurations bound to it (the nearest root above them)."),
+        stacksTable(envs));
+    }
+    if ((envs.stack_links || []).length) {
+      section("env-links", "Links between stacks (remote state)", stackLinksList(envs));
+    }
+    if (envs.environments.length) {
       if (envs.not_wired.length) {
         parts.push(el("p", { class: "st-unknown" },
           `Not wired: ${envs.not_wired.join(", ")} — tfvars only (no backend configuration, no CI / script line uses it); still analyzed.`));
@@ -356,7 +431,8 @@
   function renderEnvSwitch(envs) {
     const box = document.getElementById("env-switch");
     const select = document.getElementById("env");
-    box.classList.toggle("hidden", !envs.environments.length);
+    // several stacks: each has its own selector in the Environments view
+    box.classList.toggle("hidden", !envs.environments.length || multiStack(envs));
     select.replaceChildren(el("option", { value: "" }, "no environment (variable defaults)"),
       ...envs.environments.map((r) => el("option", { value: r.id },
         `${r.id}${envs.default && r.id === envs.active ? " (default)" : ""} — ${r.text}`)));
@@ -403,6 +479,12 @@
     if (ov.docs && ov.docs.length) {
       toc.push(["ov-docs", "Documentation"]);
       parts.push(el("h2", { id: "ov-docs" }, "Documentation"), overviewList(ov.docs));
+    }
+    if (ov.docs_diff && ov.docs_diff.length) {
+      toc.push(["ov-docs-diff", "Docs vs code"]);
+      parts.push(el("h2", { id: "ov-docs-diff" }, "Docs vs code"),
+        el("p", { class: "muted" }, "Resources the Markdown files name that the code does not declare, and resources the code declares that no Markdown file mentions (by address or type)."),
+        overviewList(ov.docs_diff));
     }
     if (ov.ci && ov.ci.length) {
       toc.push(["ov-ci", "CI / CD and lock files"]);
@@ -653,6 +735,37 @@
   }
 
   // ------------------------------------------------------------ detail panel
+  // A resource's tags (each with where it comes from: the provider's default_tags or its
+  // own tags), the stack a terraform_remote_state reads, the instance a node shows.
+  function nodeExtras(p) {
+    const out = [];
+    if (p.instance_shown) out.push(el("p", { class: "muted" }, `Several instances: ${p.instance_shown}.`));
+    const tags = Object.entries(p.tags || {});
+    if (tags.length || (p.tags_unknown || []).length) {
+      const src = p.tag_sources || {};
+      const where = p.tag_locations || {};
+      out.push(el("h3", {}, `Tags (${tags.length})`),
+        el("table", { class: "tags" }, el("tbody", {}, ...tags.map(([k, v]) => {
+          const origin = src[k] || "resource";
+          const via = origin === "default_tags" ? `default_tags (provider ${p.tag_provider || "?"})` : "tags";
+          return el("tr", { class: v === "UNKNOWN" ? "st-unknown" : "" },
+            el("td", { class: "mono" }, k), el("td", { class: "mono" }, v),
+            el("td", { class: "muted" }, via, " ", where[origin] ? locLink(where[origin]) : ""));
+        }))),
+        ...(p.tags_unknown || []).filter((u) => u.key === "*").map((u) =>
+          el("p", { class: "st-unknown" }, `${u.source} tags not known statically: ${u.reason}`)));
+    }
+    const rs = p.remote_state;
+    if (rs) {
+      const target = rs.stack ? `stack ${rs.stack}${rs.env ? ` (${rs.env})` : ""}` : `${rs.backend} state outside this repository`;
+      out.push(el("h3", {}, "Remote state"),
+        el("p", { class: rs.status === "unresolved" ? "st-unknown" : "" }, `Reads ${target} — ${rs.reason}`),
+        el("dl", {}, ...Object.entries(rs.config || {}).flatMap(([k, v]) =>
+          [el("dt", {}, k), el("dd", { class: "mono" }, v === null ? "UNKNOWN" : String(v))])));
+    }
+    return out;
+  }
+
   async function showDetail(type, id) {
     const panel = document.getElementById("detail");
     let d;
@@ -677,6 +790,7 @@
         el("dt", {}, "Service"), el("dd", {}, s.service || "—"),
         el("dt", {}, "Module"), el("dd", {}, s.module),
         el("dt", {}, "Edges"), el("dd", {}, `${s.outgoing} out, ${s.incoming} in`)));
+      parts.push(...nodeExtras(d.node.properties || {}));
       parts.push(el("h3", {}, "Defined by"));
       if (d.defined_by) {
         parts.push(evidenceBlock(`${locText(d.defined_by)} (module ${d.defined_by.module})`, d.defined_by.lines));

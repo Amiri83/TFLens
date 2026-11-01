@@ -22,6 +22,7 @@ MAX_DRILLDOWNS = 60
 MAX_DRILL_EDGES = 8
 MAX_SNIPPET_LINES = 15
 MAX_COMMITS_SHOWN = 20
+MAX_TAGGED_RESOURCES = 25
 
 # Resource types people name when saying what a repository deploys: (singular, plural),
 # in the order they are listed. Helper resources (policies, attachments, mappings, bucket
@@ -136,6 +137,7 @@ def build_overview(
         "environments": [],
         "environment_counts": [],
         "docs": _doc_lines(crawled),
+        "docs_diff": docs_diff_lines(model),
         "ci": _ci_lines(crawled),
         "history": _history_lines(crawled),
         "discovery": _discovery_lines(model, discovery),
@@ -580,9 +582,30 @@ def _root_section(
         {"title": "Terraform and providers", "lines": _provider_lines(root, fallback)},
         {"title": "Modules", "lines": _module_lines(root, fallback)},
         {"title": "Resources by service", "lines": _resource_lines(root, nodes, fallback)},
+        {"title": "Tags", "lines": _tag_lines(root, nodes, fallback)},
         {"title": "Key relationships", "lines": _edge_lines(model, root, fallback)},
         {"title": "Unknowns", "lines": _unknown_lines(model, root, fallback)},
     ]
+    remote = _remote_state_lines(model, root, fallback)
+    if remote:
+        sections.insert(-2, {"title": "Remote state (links between stacks)", "lines": remote})
+    stack = next((s for s in model.get("stacks", []) if root["dir"] in s["roots"]), None)
+    if stack is not None and stack["environments"]:
+        shown = stack["selected"] or "none (variable defaults)"
+        sections.insert(
+            1,
+            {
+                "title": "Stack",
+                "lines": [
+                    _line(
+                        f"stack {stack['id']} ({stack['layout']}): environment shown {shown}"
+                        + (" (default)" if stack["default"] else "")
+                        + f"; environments: {', '.join(stack['environments'])}",
+                        fallback,
+                    )
+                ],
+            },
+        )
     if root["environments"]:
         sections.insert(
             2,
@@ -719,6 +742,124 @@ def _resource_lines(
                 status="unknown",
             )
         )
+    return lines
+
+
+def _tag_lines(
+    root: dict[str, Any], nodes: dict[str, dict[str, Any]], fallback: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """How the root tags (default_tags, tagging modules, merge() locals) and the tags of
+    each resource, with where each tag comes from."""
+    tagging = root.get("tagging") or {}
+    lines = []
+    for d in tagging.get("default_tags", []):
+        keys = ", ".join(d["keys"]) or "keys not known statically"
+        lines.append(_line(f"default_tags of provider {d['provider']}: {keys}", d["location"]))
+    for t in tagging.get("tag_modules", []):
+        where = t["dir"] or t["source"] or "?"
+        lines.append(
+            _line(f"tagging module {t['address']} ({where}): output {t['output']}", t["location"])
+        )
+    for m in tagging.get("merge_locals", []):
+        lines.append(_line(f"tags merged in {m['name']} (merge())", m["location"]))
+    tagged = untagged = 0
+    for i in root["resources"]:
+        n = nodes.get(i)
+        if n is None or n["category"] != "resource":
+            continue
+        tags = n["properties"].get("tags")
+        if not tags and not n["properties"].get("tags_unknown"):
+            untagged += 1
+            continue
+        tagged += 1
+        if tagged > MAX_TAGGED_RESOURCES:
+            continue
+        sources = n["properties"].get("tag_sources", {})
+        text = ", ".join(
+            f"{k}={v}" + (" (default)" if sources.get(k) == "default_tags" else "")
+            for k, v in (tags or {}).items()
+        )
+        unknown = any(v == "UNKNOWN" for v in (tags or {}).values()) or bool(
+            n["properties"].get("tags_unknown")
+        )
+        lines.append(
+            _line(
+                f"{_short(n['id'], root['dir'])}: {text or 'tags not known statically'}",
+                n["location"],
+                1,
+                node=n["id"],
+                status="unknown" if unknown else "",
+            )
+        )
+    if tagged > MAX_TAGGED_RESOURCES:
+        lines.append(_line(f"… {tagged - MAX_TAGGED_RESOURCES} more tagged resources", fallback, 1))
+    if untagged:
+        lines.append(_line(f"{_plural(untagged, 'resource')} without tags", fallback))
+    if not lines:
+        lines.append(_line("No tags (no default_tags, no tags arguments)", fallback))
+    return lines
+
+
+def _remote_state_lines(
+    model: dict[str, Any], root: dict[str, Any], fallback: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """The stacks this root reads (terraform_remote_state) and the stacks reading it."""
+    lines = []
+    for link in model.get("stack_links", []):
+        if link["from_stack"] == root["dir"]:
+            if link["to_stack"]:
+                env = f" ({link['env']})" if link["env"] else ""
+                text = f"reads stack {link['to_stack']}{env} via {_short(link['data_source'], root['dir'])}"
+            else:
+                text = (
+                    f"{_short(link['data_source'], root['dir'])}: {link['backend']} state outside "
+                    f"this repository — {link['reason']}"
+                )
+            lines.append(_line(text, link["location"], node=link["data_source"]))
+        elif link["to_stack"] == root["dir"]:
+            lines.append(
+                _line(
+                    f"read by stack {link['from_stack'] or '?'} via {link['data_source']}",
+                    link["location"],
+                    node=link["data_source"],
+                )
+            )
+    return lines
+
+
+def docs_diff_lines(model: dict[str, Any]) -> list[dict[str, Any]]:
+    """The docs vs code diff: resources the docs name and the code does not declare, and
+    the resources the code declares that no doc mentions."""
+    dd = model.get("docs_diff")
+    if not dd:
+        return []
+    if dd["status"] != "ok":
+        return [_line(dd["note"], None)]
+    c = dd["counts"]
+    lines = [
+        _line(
+            f"{_plural(len(dd['files']), 'Markdown file')} read: {c['documented']} documented "
+            f"item(s) found in the code, {c['documented_missing']} documented but missing, "
+            f"{c['undocumented']} of {_plural(c['resources'], 'resource')} not documented",
+            None,
+        )
+    ]
+    if dd["documented_missing"]:
+        lines.append(_line("Documented but missing from the code:", None))
+        for m in dd["documented_missing"]:
+            where = ", ".join(f"{loc['file']}:{loc['start_line']}" for loc in m["locations"][1:])
+            lines.append(
+                _line(
+                    f"{m['ref']}" + (f" (also {where})" if where else ""),
+                    m["locations"][0],
+                    1,
+                    status="unknown",
+                )
+            )
+    if dd["undocumented"]:
+        lines.append(_line("In the code but not documented:", None))
+        for u in dd["undocumented"]:
+            lines.append(_line(u["ref"], u["location"], 1))
     return lines
 
 
@@ -872,6 +1013,8 @@ def render_overview_markdown(ov: dict[str, Any], inventory_text: str = "", level
         out += [f"{h}# Counts per environment", "", *_md_lines(ov["environment_counts"]), ""]
     if ov.get("docs"):
         out += [f"{h}# Documentation", "", *_md_lines(ov["docs"]), ""]
+    if ov.get("docs_diff"):
+        out += [f"{h}# Docs vs code", "", *_md_lines(ov["docs_diff"]), ""]
     if ov.get("ci"):
         out += [f"{h}# CI / CD and lock files", "", *_md_lines(ov["ci"]), ""]
     hist = ov.get("history")

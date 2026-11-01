@@ -344,8 +344,12 @@ def test_single_instance_count_index_and_each_are_known(tmp_path):
     nodes = {n["id"]: n for n in m["nodes"]}
     assert nodes["aws_sqs_queue.q"]["attributes"]["name"] == "example-0"
     assert nodes["aws_sns_topic.t"]["attributes"]["name"] == "example-a"
-    assert nodes["aws_sqs_queue.many"]["properties"]["created"] == 2
-    assert [u["subject"] for u in m["unknowns"]] == ["aws_sqs_queue.many"]
+    many = nodes["aws_sqs_queue.many"]
+    assert many["properties"]["created"] == 2
+    # several instances: the node shows the first one's values, and says so
+    assert many["attributes"]["name"] == "example-0"
+    assert many["properties"]["instance_shown"] == "values shown for count.index = 0"
+    assert m["unknowns"] == []
 
 
 def test_unknown_module_count_is_reported(tmp_path):

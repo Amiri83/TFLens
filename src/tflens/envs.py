@@ -16,10 +16,12 @@ repository-relative paths): per environment the counts of the resource types peo
 
 from __future__ import annotations
 
+import posixpath
 from typing import Any
 
 from .analyze import analyze
-from .engine import Engine
+from .detect import env_segment
+from .engine import Engine, in_scope
 from .loader import RepoSource
 from .model import Graph
 from .overview import FRIENDLY, _line, _plural
@@ -82,6 +84,117 @@ def default_env(environments: list[dict[str, Any]]) -> dict[str, Any] | None:
     return next((e for e in environments if e["name"].lower() == "dev"), None) or next(
         iter(environments), None
     )
+
+
+def _layout_env(env: dict[str, Any]) -> bool:
+    """An environment that is its own directory (envs/dev, live/prod/...), not tfvars
+    applied to a root."""
+    seg = env_segment(env["root"])
+    return (
+        bool({"dir", "terragrunt"} & set(env["kinds"]))
+        and seg is not None
+        and (seg[1] == env["root"])
+    )
+
+
+def env_roots(env: dict[str, Any], roots: list[str]) -> list[str]:
+    """The roots an environment applies to: its own, else every root under its directory."""
+    if env["roots"]:
+        return list(env["roots"])
+    return [r for r in roots if env["root"] == "." or in_scope(r, env["root"])]
+
+
+def stacks(environments: list[dict[str, Any]], roots: list[str]) -> list[dict[str, Any]]:
+    """The repository's stacks, each with its root(s) and its environments (ids).
+
+    A stack is a root deployed on its own: every root is one, wherever it is. Its
+    environments are the tfvars / backend configurations bound to it (the nearest root
+    above them). Environments that are directories of their own (``envs/dev``,
+    ``envs/prod``) are one stack, ``envs/*``, with one root per environment."""
+    out: dict[str, dict[str, Any]] = {}
+    claimed: dict[str, str] = {}
+    for e in environments:
+        layout = _layout_env(e)
+        if layout:
+            parent = posixpath.dirname(e["root"])
+            sid = f"{parent}/*" if parent else "*"
+        else:
+            sid = e["root"]
+        stack = out.setdefault(
+            sid,
+            {
+                "id": sid,
+                "layout": "environment directories" if layout else "tfvars per environment",
+                "roots": [],
+                "environments": [],
+                "env_roots": {},
+            },
+        )
+        eid = env_id(e, environments)
+        mine = [r for r in env_roots(e, roots) if claimed.setdefault(r, sid) == sid]
+        stack["environments"].append(eid)
+        stack["env_roots"][eid] = mine
+        stack["roots"] = sorted(set(stack["roots"]) | set(mine))
+    for r in roots:
+        if r not in claimed:
+            out[r] = {
+                "id": r,
+                "layout": "no environment",
+                "roots": [r],
+                "environments": [],
+                "env_roots": {},
+            }
+    return [out[k] for k in sorted(out, key=lambda s: (s == ".", s))]
+
+
+def select_stacks(
+    stack_list: list[dict[str, Any]],
+    environments: list[dict[str, Any]],
+    choices: dict[str, str],
+) -> dict[str, Any]:
+    """Apply one environment per stack: ``choices`` (stack id -> environment id, '' for
+    none), else the stack's default (dev, else its first). Returns the stacks with their
+    ``selected`` environment and the engine settings: each selected environment's tfvars
+    for its roots, and the roots of the stacks' other environments (not analyzed)."""
+    by_id = {env_id(e, environments): e for e in environments}
+    root_var_files: dict[str, list[str]] = {}
+    root_envs: dict[str, str] = {}
+    exclude: set[str] = set()
+    out = []
+    for s in stack_list:
+        envs = [by_id[i] for i in s["environments"] if i in by_id]
+        if s["id"] in choices:
+            chosen = by_id.get(choices[s["id"]]) if choices[s["id"]] else None
+            if choices[s["id"]] and (chosen is None or chosen not in envs):
+                known = ", ".join(s["environments"]) or "none"
+                raise ValueError(
+                    f"unknown environment {choices[s['id']]!r} for stack {s['id']} "
+                    f"(detected: {known})"
+                )
+            default = False
+        else:
+            chosen = default_env(envs)
+            default = True
+        sel = env_id(chosen, environments) if chosen is not None else None
+        for eid, rs in s["env_roots"].items():
+            for r in rs:
+                if eid == sel:
+                    root_var_files[r] = list(chosen["var_files"]) if chosen else []
+                    root_envs[r] = chosen["name"] if chosen else ""
+                elif (
+                    sel is not None
+                    and s["layout"] == "environment directories"
+                    and r not in s["env_roots"].get(sel, [])
+                ):
+                    exclude.add(r)
+        out.append({**s, "selected": sel, "default": default and sel is not None})
+    exclude -= set(root_var_files)
+    return {
+        "stacks": out,
+        "root_var_files": root_var_files,
+        "root_envs": root_envs,
+        "exclude_roots": exclude,
+    }
 
 
 def counts(nodes: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int]]:
@@ -322,17 +435,24 @@ def analyze_environment(repo: RepoSource, env: dict[str, Any]) -> tuple[Engine, 
 
 
 def analyze_environments(
-    repo: RepoSource, environments: list[dict[str, Any]], active: str | None = None
+    repo: RepoSource,
+    environments: list[dict[str, Any]],
+    active: str | None = None,
+    stack_list: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """The ``environment_analysis`` section (None when no environment was detected)."""
+    """The ``environment_analysis`` section (None when no environment was detected). With
+    the stacks, each row names its stack and ``selected`` lists the environment applied
+    to each stack in the model shown."""
     if not environments:
         return None
+    stack_of = {e: s["id"] for s in stack_list or [] for e in s["environments"]}
     rows = []
     for env in environments[:MAX_ENVIRONMENTS]:
         _, graph = analyze_environment(repo, env)
         nodes, unknowns = _graph_dicts(graph)
         row = summarize(env, nodes, unknowns)
         row["id"] = env_id(env, environments)
+        row["stack"] = stack_of.get(row["id"])
         row["not_created"] = len(graph.not_created)
         rows.append(row)
     total_counts: dict[str, int] = {}
@@ -344,8 +464,10 @@ def analyze_environments(
             total_uncertain[t] = total_uncertain.get(t, 0) + n
     order = list(FRIENDLY)
     types = sorted(total_counts, key=order.index)
+    selected = [s["selected"] for s in stack_list or [] if s.get("selected")]
     return {
         "active": active,
+        "selected": selected or ([active] if active else []),
         "types": [{"type": t, "label": FRIENDLY[t][1]} for t in types],
         "environments": rows,
         "inventory": inventory_rows([(r["id"], r["inventory"]) for r in rows]),

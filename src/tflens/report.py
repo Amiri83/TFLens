@@ -137,6 +137,58 @@ def _evidence_section(
     return lines
 
 
+_TAG_PROPS = frozenset({"tags", "tag_sources", "tag_locations", "tags_unknown", "tag_provider"})
+
+
+def _tag_lines(node: dict[str, Any]) -> list[str]:
+    """``**Tags:**`` of a resource: each tag, and whether it comes from default_tags."""
+    props = node["properties"]
+    tags = props.get("tags") or {}
+    if not tags and not props.get("tags_unknown"):
+        return []
+    sources = props.get("tag_sources", {})
+    out = ["", "**Tags:**", ""]
+    for k, v in tags.items():
+        origin = sources.get(k, "resource")
+        where = (props.get("tag_locations") or {}).get(origin)
+        via = (
+            f"provider {props['tag_provider']} default_tags" if origin == "default_tags" else "tags"
+        )
+        out.append(
+            f"- {_code(k)} = {_md_escape(str(v))} ({via}"
+            + (f", {_code(_loc(where))}" if where else "")
+            + ")"
+        )
+    for u in props.get("tags_unknown", []):
+        if u["key"] == "*":
+            out.append(
+                f"- (all {u['source']} tags): not known statically — {_md_escape(u['reason'])}"
+            )
+    return out
+
+
+def _docs_diff_section(dd: dict[str, Any] | None) -> list[str]:
+    """``## Docs vs code``: documented but missing, and in the code but not documented."""
+    if not dd:
+        return []
+    out = ["## Docs vs code", ""]
+    if dd["status"] != "ok":
+        return [*out, dd["note"], ""]
+    out.append(f"Markdown files read: {', '.join(_code(f) for f in dd['files'])}.")
+    out.append("")
+    out += ["### Documented but missing from the code", ""]
+    out += [
+        f"- {_code(m['ref'])} ({', '.join(_code(_loc(loc)) for loc in m['locations'])})"
+        for m in dd["documented_missing"]
+    ] or ["- none"]
+    out += ["", "### In the code but not documented", ""]
+    out += [f"- {_code(u['ref'])} ({_code(_loc(u['location']))})" for u in dd["undocumented"]] or [
+        "- none"
+    ]
+    out.append("")
+    return out
+
+
 def render_report(
     model: dict[str, Any],
     title: str = "Terraform repository",
@@ -232,11 +284,12 @@ def render_report(
         nid = n["id"]
         lines += [f"### {_code(nid)}", ""]
         lines.append(f"**What it is:** {describe_node(n)}.")
-        props = {k: v for k, v in n["properties"].items()}
+        props = {k: v for k, v in n["properties"].items() if k not in _TAG_PROPS}
         if props:
             lines.append("")
             for k in sorted(props):
                 lines.append(f"- {k}: {_md_escape(_value(props[k]))}")
+        lines += _tag_lines(n)
         lines += [
             "",
             f"**Where defined:** {_code(_loc(n['location']))} (module {_code(n['module'] or '(root)')})",
@@ -307,6 +360,21 @@ def render_report(
         for n in supporting:
             lines.append(f"| {_code(n['id'])} | {n['type']} | {_code(_loc(n['location']))} |")
         lines.append("")
+
+    if model.get("stack_links"):
+        lines += ["## Links between stacks (terraform_remote_state)", ""]
+        for link in model["stack_links"]:
+            if link["to_stack"]:
+                env = f" ({link['env']})" if link["env"] else ""
+                target = f"stack {_code(link['to_stack'])}{env}"
+            else:
+                target = f"{link['backend']} state outside this repository ({link['reason']})"
+            lines.append(
+                f"- {_code(link['from_stack'] or '?')} reads {target} via "
+                f"{_code(link['data_source'])} ({_code(_loc(link['location']))})"
+            )
+        lines.append("")
+    lines += _docs_diff_section(model.get("docs_diff"))
 
     if model["unknowns"]:
         lines += [

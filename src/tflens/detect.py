@@ -29,8 +29,19 @@ from typing import Any
 from .engine import Engine, ModuleInstance, in_scope
 from .evaluate import evaluate
 from .expr import raw_to_expr
-from .loader import Attr, Block, ModuleSource, RepoSource, map_keys, read_attrs, read_blocks
+from .loader import (
+    ENV_CONTAINERS,
+    ENV_WORDS,
+    Attr,
+    Block,
+    ModuleSource,
+    RepoSource,
+    map_keys,
+    read_attrs,
+    read_blocks,
+)
 from .sources import classify_source
+from .tags import tagging
 from .terragrunt import Unit, substitute_raw, unit_context
 from .values import Location, Unknown, display, is_known, to_plain
 
@@ -38,42 +49,6 @@ UNKNOWN = "UNKNOWN"
 MAX_VALUE = 160
 MAX_WORKSPACE_REFS = 5
 
-ENV_WORDS = frozenset(
-    {
-        "dev",
-        "develop",
-        "development",
-        "test",
-        "testing",
-        "qa",
-        "uat",
-        "sit",
-        "int",
-        "intg",
-        "integ",
-        "integration",
-        "e2e",
-        "stage",
-        "staging",
-        "stg",
-        "preprod",
-        "pre-prod",
-        "prod",
-        "production",
-        "prd",
-        "sandbox",
-        "sbx",
-        "nonprod",
-        "non-prod",
-        "perf",
-        "demo",
-        "dr",
-    }
-)
-# Directories whose sub-directories are environments (envs/<env>, live/<env>, ...).
-ENV_CONTAINERS = frozenset(
-    {"envs", "env", "environments", "environment", "live", "deployments", "accounts", "stages"}
-)
 # Directories holding per-environment tfvars files.
 VAR_DIRS = frozenset({"vars", "tfvars", "varfiles", "var-files", "config", "configs"})
 NOT_ENVS = frozenset(
@@ -197,7 +172,7 @@ def detect_structure(repo: RepoSource, engine: Engine) -> dict[str, Any]:
     referenced = engine.referenced_dirs()
     all_roots = sorted(set(engine.root_modules) | set(engine.units))
     environments = detect_environments(repo, engine)
-    shown = [r for r in all_roots if engine.scope is None or in_scope(r, engine.scope)]
+    shown = [r for r in all_roots if engine.selected(r)]
     roots = [_root(repo, engine, r, referenced, environments) for r in shown]
     return {
         "roots": roots,
@@ -404,6 +379,7 @@ def _root(
         "resources": sorted(resources),
         "data_sources": sorted(data),
         "environments": env_names,
+        "tagging": tagging(insts),
     }
 
 
@@ -996,6 +972,46 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
     return out
 
 
+def _known_settings(settings: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        s["key"]: s["value"]
+        for s in settings
+        if s.get("known") and "per_environment" not in s and s.get("value") != "(redacted)"
+    }
+
+
+def state_index(
+    repo: RepoSource, engine: Engine, environments: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """The state each stack writes, per environment: ``[{root, env, type, settings}]``
+    (the known backend settings: the backend block merged with the environment's partial
+    configuration). ``terraform_remote_state`` data sources are matched against it."""
+    out: list[dict[str, Any]] = []
+    covered: set[str] = set()
+    for e in environments:
+        state = e.get("state") or {}
+        settings = _known_settings(state.get("settings", []))
+        for r in e["roots"] or [e["root"]]:
+            out.append(
+                {"root": r, "env": e["name"], "type": state.get("type"), "settings": settings}
+            )
+            covered.add(r)
+    for r in sorted(set(engine.root_modules) | set(engine.units)):
+        if r in covered:
+            continue
+        mod = repo.modules.get(engine.root_modules.get(r, r))
+        b = _backend(repo, r, engine.units.get(r), mod)
+        out.append(
+            {
+                "root": r,
+                "env": None,
+                "type": b["type"],
+                "settings": _known_settings(b["settings"]),
+            }
+        )
+    return out
+
+
 def _wiring(env: dict[str, Any]) -> dict[str, Any]:
     """Is the environment deployed from this repository? It is *wired* when a backend
     configuration or a CI / script line is used for it, or when it is its own root
@@ -1084,22 +1100,18 @@ def _env_state(repo: RepoSource, engine: Engine, env: dict[str, Any]) -> dict[st
 
 def backend_files(repo: RepoSource) -> list[str]:
     """The repository's partial backend configurations (``terraform init
-    -backend-config=FILE``): files named so (:data:`_BACKEND_FILE_RE`), and ``*.hcl``
-    files named after an environment (``env/dev.hcl`` next to ``env/dev.tfvars``) whose
-    top-level settings are backend settings (``bucket``, ``key``, ``region``, ...)."""
-    stems = {
-        posixpath.basename(f).removesuffix(".json").removesuffix(".tfvars").lower()
-        for f in repo.tfvars
-    }
+    -backend-config=FILE``): files named so (:data:`_BACKEND_FILE_RE`), and any other
+    ``*.hcl`` file, wherever it is, whose content is backend settings only (``bucket``,
+    ``key``, ``region``, ...): classified by content, not by name or location."""
     configs = {u.file for u in repo.units} | {p.file for u in repo.units for p in u.parents}
+    configs |= set(repo.terragrunt)
     out = []
     for f in repo.all_files:
         if _BACKEND_FILE_RE.search(f):
             out.append(f)
             continue
         base = posixpath.basename(f)
-        stem = base.removesuffix(".hcl").lower()
-        if not base.endswith(".hcl") or f in configs or stem not in ENV_WORDS | stems:
+        if not base.endswith(".hcl") or base.startswith(".") or f in configs:
             continue
         keys = set(read_attrs(repo, f) or {})
         if keys and keys <= _BACKEND_SETTINGS and keys & {"bucket", "key", "prefix", "path"}:

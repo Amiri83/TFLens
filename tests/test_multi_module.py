@@ -68,8 +68,10 @@ def test_unknown_with_reason(load):
     # no edge is invented for the unknown endpoint
     assert m.edges("TRIGGER", "aws_sns_topic.alerts") == []
 
-    (each,) = m.unknowns("aws_sqs_queue.per_tenant")
-    assert "each.key" in each["reason"]
+    # for_each over a known set: no unknown, the node shows the first key's values
+    assert m.unknowns("aws_sqs_queue.per_tenant") == []
+    per_tenant = m.nodes["aws_sqs_queue.per_tenant"]
+    assert per_tenant["properties"]["instance_shown"] == "values shown for each.key = a"
 
     (remote,) = m.unknowns("module.network")
     assert "non-local source 'terraform-aws-modules/vpc/aws'" in remote["reason"]
