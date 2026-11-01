@@ -4,12 +4,13 @@ Built from model.json alone (deterministic, offline, no LLM), with the same rend
 the flows (:func:`tflens.flow.flow_svg`: columns by depth, numbered labelled steps, a
 ``file:line`` code reference on every box):
 
-* **network**: VPC -> subnets -> security groups -> the resources placed in the subnets
-  or guarded by the groups (instances, ECS services, load balancers, Lambda functions,
-  endpoints, ...). Security group **rules** (NETWORK edges: SG -> SG, CIDR -> SG,
-  SG -> CIDR) are the labelled steps: what can reach what. The CIDRs, prefix lists and
-  groups outside the model are a column of their own, left of the VPC. Containment is
-  drawn quiet, at right angles, clear of the boxes;
+* **network**: three columns, what is outside (CIDRs, prefix lists, groups outside the
+  model) | security groups | the resources placed in the subnets or guarded by the groups
+  (instances, ECS services, load balancers, Lambda functions, endpoints, ...). Security
+  group **rules** (NETWORK edges: SG -> SG, CIDR -> SG, SG -> CIDR) are the labelled
+  steps, and the only lines: what can reach what. Containment is not a line: each VPC is
+  a frame around its groups and subnets, each subnet a frame around what is placed in it,
+  and each resource's box lists its subnets and groups (``subnet-a / sg-a, sg-b``);
 * **iam**: role / user / group -> its attached and inline policies -> the resources the
   policies grant actions on (ACCESS edges), labelled *can write* / *can read* /
   *can access* (the Flow view's IAM-only style) or *denies*.
@@ -33,17 +34,19 @@ from .overview import _line
 from .snippets import location_label
 
 # the Network diagram's columns: what is outside the VPC (CIDRs, prefix lists, groups
-# outside this model) leftmost, so no VPC or containment line cuts across it
-EXTERNAL, VPC, SUBNET, GROUP, PLACED = range(5)
+# outside this model), the security groups, the resources. Rules join neighbouring
+# columns (or two groups, around the groups' right side), so no line crosses a box
+EXTERNAL, GROUP, PLACED = range(3)
 SG_TYPES = frozenset({"aws_security_group", "aws_default_security_group"})
 # attributes (last path segment) that place a resource in a subnet / attach a group
 PLACEMENT_ATTRS = ("subnet_id", "subnet_ids", "subnet_mapping", "subnets", "vpc_zone_identifier")
 SG_ATTRS = ("security_group_ids", "security_groups", "vpc_security_group_ids")
+# what refers to a subnet or group without being placed in it / guarded by it
+NOT_HELD = frozenset({"aws_vpc", "aws_subnet", "aws_route_table_association", *SG_TYPES})
 PRINCIPAL_TYPES = ("aws_iam_role", "aws_iam_user", "aws_iam_group")
 NETWORK_LEGEND = (
     ("security group rule", "rule", ""),
     ("public rule", "rule", "public"),
-    ("contains / placed in / guarded by", "contains", ""),
 )
 IAM_LEGEND = (
     ("attached / inline policy", "contains", ""),
@@ -143,9 +146,10 @@ class _Diagram:
         }
         (self.quiet if quiet else self.rules).append(s)
 
-    def result(self, title: str) -> dict[str, Any]:
+    def result(self, title: str, frames: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Labelled steps first (numbered 1..), then the quiet structure; nodes by depth,
-        then name: the same model always gives the same diagram."""
+        then name; ``frames`` (outer before inner) as given: the same model always gives
+        the same diagram."""
         key = lambda s: (self.name(s["target"]), self.name(s["source"]), s["verb"], s["target"])  # noqa: E731
         steps = sorted(self.rules, key=key) + sorted(self.quiet, key=key)
         for i, s in enumerate(steps, 1):
@@ -153,67 +157,35 @@ class _Diagram:
             s["text"] = f"{i}. {s['summary']}" + (f" ({s['detail']})" if s["detail"] else "")
             del s["detail"]
         nodes = sorted(self.out.values(), key=lambda n: (n["depth"], n["label"], n["id"]))
-        return {"title": title, "nodes": nodes, "steps": steps}
+        out = {"title": title, "nodes": nodes, "steps": steps}
+        if frames is not None:
+            out["frames"] = frames
+        return out
 
 
 # ------------------------------------------------------------------ network
 
 
 def network_diagram(model: dict[str, Any]) -> dict[str, Any]:
-    """VPC -> subnets -> security groups -> resources, and the security group rules."""
+    """Outside | security groups | resources, the security group rules between them (the
+    only lines), the VPCs and subnets as frames around what is in them."""
     d = _Diagram(model)
     resources = [n for n in model["nodes"] if n["kind"] == "resource"]
-    for n in resources:
-        if n["type"] == "aws_vpc":
-            d.node(n["id"], VPC, "network")
     edges = model["edges"]
     config = [e for e in edges if e["kind"] == "CONFIG" and e["source"] in d.nodes]
-    # VPC -> subnets / security groups
+    by_name = lambda nid: (d.name(nid), nid)  # noqa: E731
+    vpcs = sorted((n["id"] for n in resources if n["type"] == "aws_vpc"), key=by_name)
+    subnets = sorted((n["id"] for n in resources if n["type"] == "aws_subnet"), key=by_name)
+    vpc_of: dict[str, str] = {}  # a subnet / security group -> the VPC it is created in
     for e in config:
-        a = e["attributes"].get("attribute", "")
-        if a == "vpc_id" and d.type_of(e["target"]) == "aws_vpc":
-            src = e["source"]
-            if d.type_of(src) == "aws_subnet":
-                d.node(src, SUBNET, "network")
-            elif d.type_of(src) in SG_TYPES:
-                d.node(src, GROUP, "guard")
-            else:
-                continue
-            ev = [{"what": "vpc_id", "location": _ev(e), "edge": e["id"]}]
-            d.step(e["target"], src, "contains", "", "contains", ev, quiet=True)
-    for n in resources:  # subnets and groups outside a VPC created here
-        if n["type"] == "aws_subnet":
-            d.node(n["id"], SUBNET, "network")
-        elif n["type"] in SG_TYPES:
+        if e["attributes"].get("attribute", "") == "vpc_id" and e["target"] in vpcs:
+            vpc_of.setdefault(e["source"], e["target"])
+    for n in resources:
+        if n["type"] in SG_TYPES:
             d.node(n["id"], GROUP, "guard")
-    # subnet -> what is placed in it; security group -> what it guards
-    guards: set[tuple[str, str]] = set()
-    for e in config:
-        a, src, tgt = _last(e["attributes"].get("attribute", "")), e["source"], e["target"]
-        if (
-            d.type_of(src) == "aws_route_table_association"
-            or d.out.get(src, {}).get("depth", PLACED) < PLACED
-        ):
-            continue  # a VPC / subnet / group referencing another is not placed in it
-        if a in PLACEMENT_ATTRS and d.type_of(tgt) == "aws_subnet":
-            d.node(src, PLACED, "compute" if _is_compute(d, src) else "target")
-            ev = [{"what": e["label"], "location": _ev(e), "edge": e["id"]}]
-            d.step(tgt, src, "contains", "", "has in it", ev, quiet=True)
-        elif a in SG_ATTRS and d.type_of(tgt) in SG_TYPES and (tgt, src) not in guards:
-            guards.add((tgt, src))
-            d.node(src, PLACED, "compute" if _is_compute(d, src) else "target")
-            ev = [{"what": e["label"], "location": _ev(e), "edge": e["id"]}]
-            d.step(tgt, src, "contains", "", "guards", ev, quiet=True)
-    for e in edges:  # attachments the extractors record (Lambda vpc_config, ...)
-        if e["kind"] == "NETWORK" and e["attributes"].get("attachment"):
-            src, tgt = e["source"], e["target"]
-            if d.type_of(tgt) in SG_TYPES and (tgt, src) not in guards and src in d.nodes:
-                guards.add((tgt, src))
-                d.node(src, PLACED, "compute" if _is_compute(d, src) else "target")
-                ev = [{"what": e["label"], "location": _ev(e), "edge": e["id"]}]
-                d.step(tgt, src, "contains", "", "guards", ev, quiet=True)
+            d.out[n["id"]]["frame"] = vpc_of.get(n["id"])
     # the rules: what can reach what
-    rules = [e for e in edges if e["kind"] == "NETWORK" and not e["attributes"].get("attachment")]
+    rules = [e for e in edges if e["kind"] == "NETWORK" and "direction" in e["attributes"]]
     for e in sorted(rules, key=lambda e: e["id"]):
         loc = _ev(e)
         for nid in (e["source"], e["target"]):
@@ -238,7 +210,62 @@ def network_diagram(model: dict[str, Any]) -> dict[str, Any]:
             ev,
             what=e["attributes"].get("description") or "",
         )
-    return d.result("Network: VPC → subnets → security groups → resources")
+
+    def held(src: str) -> bool:  # not a VPC / subnet / group, nor drawn outside
+        return d.type_of(src) not in NOT_HELD and src not in d.out
+
+    # what is placed in a subnet or guarded by a group: a box that lists them
+    subnets_of: dict[str, set[str]] = {}
+    groups_of: dict[str, set[str]] = {}
+    for e in config:
+        a, src, tgt = _last(e["attributes"].get("attribute", "")), e["source"], e["target"]
+        if not held(src):
+            continue
+        if a in PLACEMENT_ATTRS and d.type_of(tgt) == "aws_subnet":
+            subnets_of.setdefault(src, set()).add(tgt)
+        elif a in SG_ATTRS and d.type_of(tgt) in SG_TYPES:
+            groups_of.setdefault(src, set()).add(tgt)
+    for e in edges:  # attachments the extractors record (Lambda vpc_config, ...)
+        src, tgt = e["source"], e["target"]
+        if (
+            e["kind"] == "NETWORK"
+            and e["attributes"].get("attachment")
+            and src in d.nodes
+            and held(src)
+            and d.type_of(tgt) in SG_TYPES
+        ):
+            groups_of.setdefault(src, set()).add(tgt)
+    for src in sorted(subnets_of.keys() | groups_of.keys()):
+        nets = sorted(subnets_of.get(src, ()), key=by_name)
+        sgs = sorted(groups_of.get(src, ()), key=by_name)
+        d.node(src, PLACED, "compute" if _is_compute(d, src) else "target")
+        parts = (", ".join(map(d.name, nets)), ", ".join(map(d.name, sgs)))
+        d.out[src]["meta"] = " / ".join(p for p in parts if p)
+        # its frame: its first subnet created here, else the VPC of its groups
+        d.out[src]["frame"] = next((s for s in nets if s in subnets), None) or next(
+            (vpc_of[g] for g in sgs if g in vpc_of), None
+        )
+    for n in d.out.values():
+        n.setdefault("frame", None)
+        n.setdefault("meta", "")
+
+    def frame(nid: str, parent: str | None, columns: list[int]) -> dict[str, Any]:
+        n = d.nodes[nid]
+        return {
+            "id": nid,
+            "label": d.label_of(n),
+            "kind_label": kind_of(n),
+            "code_ref": n["location"],
+            "parent": parent,
+            "columns": columns,
+        }
+
+    frames = []
+    for v in vpcs:  # a VPC spans the groups and the resources; its subnets, the resources
+        frames.append(frame(v, None, [GROUP, PLACED]))
+        frames += [frame(s, v, [PLACED, PLACED]) for s in subnets if vpc_of.get(s) == v]
+    frames += [frame(s, None, [PLACED, PLACED]) for s in subnets if s not in vpc_of]
+    return d.result("Network: outside → security groups → resources, by VPC and subnet", frames)
 
 
 def _is_compute(d: _Diagram, nid: str) -> bool:
@@ -326,7 +353,7 @@ def tab_svg(model: dict[str, Any], name: str, title: str = "") -> str | None:
         return None
     build, legend = DIAGRAMS[name]
     dg = build(model)
-    if not dg["nodes"]:
+    if not dg["nodes"] and not dg.get("frames"):
         return None
     return flow_svg(dg, f"{dg['title']} — {title}" if title else dg["title"], legend)
 

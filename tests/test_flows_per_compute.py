@@ -225,27 +225,37 @@ def test_deterministic():
 # -- 4. the Network diagram ------------------------------------------------------------------
 
 
-def test_network_diagram_vpc_subnets_groups_resources():
+def test_network_diagram_outside_groups_resources_in_frames():
     dg = network_diagram(_model(FIXTURE))
     depth = {n["label"]: n["depth"] for n in dg["nodes"]}
-    # the CIDRs (ingress and egress peers) in a column of their own, left of the VPC
+    # the CIDRs (ingress and egress peers) | the groups | the resources
     assert depth["0.0.0.0/0 (internet)"] == depth["10.9.0.0/16"] == 0
-    assert depth["vpc-a"] == 1
-    assert depth["subnet-a"] == depth["subnet-b"] == 2
-    assert depth["sg-app"] == depth["sg-lb"] == 3
+    assert depth["sg-app"] == depth["sg-lb"] == 1
     for r in ("instance-a", "lambda-classifier", "ecs-service-a", "lb-a", "asg-a"):
-        assert depth[r] == 4, r
-    quiet = {(s["source"], s["verb"], s["target"]) for s in dg["steps"] if s["quiet"]}
-    assert {
-        ("aws_vpc.vpc-a", "contains", "aws_subnet.subnet-a"),
-        ("aws_vpc.vpc-a", "contains", "aws_security_group.sg-app"),
-        ("aws_subnet.subnet-b", "has in it", "aws_ecs_service.ecs-service-a"),
-        ("aws_security_group.sg-app", "guards", "aws_instance.instance-a"),
-        ("aws_security_group.sg-app", "guards", "aws_lambda_function.lambda-classifier"),
-        ("aws_security_group.sg-lb", "guards", "aws_lb.lb-a"),
-    } <= quiet
+        assert depth[r] == 2, r
+    # the VPC and its subnets are frames, not boxes
+    assert "vpc-a" not in depth and "subnet-a" not in depth
+    assert [(f["label"], f["parent"], f["columns"]) for f in dg["frames"]] == [
+        ("vpc-a", None, [1, 2]),
+        ("subnet-a", "aws_vpc.vpc-a", [2, 2]),
+        ("subnet-b", "aws_vpc.vpc-a", [2, 2]),
+    ]
+    frame = {n["label"]: n["frame"] for n in dg["nodes"]}
+    assert frame["sg-app"] == frame["sg-lb"] == "aws_vpc.vpc-a"
+    assert frame["0.0.0.0/0 (internet)"] is None
+    assert frame["instance-a"] == frame["lb-a"] == "aws_subnet.subnet-a"
+    assert frame["ecs-service-a"] == "aws_subnet.subnet-b"
+    # placement and guards are a line of text in the box, not a line
+    meta = {n["label"]: n["meta"] for n in dg["nodes"]}
+    assert meta["instance-a"] == meta["lambda-classifier"] == "subnet-a / sg-app"
+    assert meta["ecs-service-a"] == "subnet-b / sg-app"
+    assert meta["lb-a"] == "subnet-a, subnet-b / sg-lb"
+    assert meta["sg-app"] == meta["10.9.0.0/16"] == ""
+    assert not [s for s in dg["steps"] if s["quiet"] or s["kind"] != "rule"]
     for n in dg["nodes"]:
         assert n["code_ref"], n
+    for f in dg["frames"]:
+        assert f["code_ref"], f
 
 
 def test_network_diagram_security_group_rules_are_the_steps():
@@ -262,10 +272,19 @@ def test_network_diagram_security_group_rules_are_the_steps():
     ]
     assert [s["status"] for s in rules] == ["public", "", "", "public"]
     svg = tab_svg(_model(FIXTURE), "network", "repo-a")
-    assert "Network: VPC → subnets → security groups → resources — repo-a" in svg
-    # a numbered rule label, the public mark, the legend, a box's code reference (sg-app)
-    for text in (">3. ingress tcp 8080<", ">(public)<", ">security group rule<", ">main.tf:35-53<"):
+    assert "Network: outside → security groups → resources, by VPC and subnet — repo-a" in svg
+    # a numbered rule label, the public mark, the legend, a box's code reference (sg-app),
+    # a box's subnet / group line, a frame's name
+    for text in (
+        ">3. ingress tcp 8080<",
+        ">(public)<",
+        ">security group rule<",
+        ">main.tf:35-53<",
+        ' class="meta">subnet-a / sg-app<',
+        'data-frame="aws_subnet.subnet-b"',
+    ):
         assert text in svg, text
+    assert "contains" not in svg  # no containment line, nor its legend
     sizes = [int(s) for s in re.findall(r'font-size="(\d+)"', svg)]
     assert min(sizes) >= 14
 

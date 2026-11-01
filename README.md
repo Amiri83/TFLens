@@ -75,9 +75,11 @@ Nothing has to be configured before a first analysis:
   its state, `aws_ssm_parameter` data sources) and its environments;
   *network* (VPC, subnets, security groups, endpoints, transit gateways) → **Network**:
   VPC → subnets → what is placed in them, security groups, endpoints, and what can
-  reach what, with a diagram (VPC → subnets → security groups → the instances, ECS
-  services, load balancers, Lambda functions in them; the security group rules are the
-  numbered, labelled edges, public ones in red); *module library* (no backend, no
+  reach what, with a diagram (three columns: CIDRs / external peers → security groups →
+  the instances, ECS services, load balancers, Lambda functions they guard; VPCs and
+  subnets are frames around what is in them, each box lists its subnets and groups; the
+  security group rules are the only lines, numbered and labelled, public ones in red);
+  *module library* (no backend, no
   provider, nothing calls it) → **Module catalog**: inputs, outputs, resources, an
   example `module` block and who calls it. Every root also has an **IAM** view: each
   role / user / group → its attached and inline policies → what they grant (*can
