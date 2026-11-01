@@ -106,6 +106,8 @@ details.drilldown { border: 1px solid #d0d7de; border-radius: 6px; padding: 4px 
 #flow .st-unverified { color: #9a6700; }
 #flow .st-iam_only { color: #57606a; }
 #flow ul.flow-side { margin: 2px 0 8px; padding-left: 28px; color: #57606a; }
+#flow ul.flow-context { margin: 2px 0 8px; padding-left: 28px; color: #57606a; }
+#flow h2.flow-group { margin-top: 28px; padding: 4px 8px; background: #f6f8fa; border-left: 4px solid #8250df; font-size: 17px; }
 #flow details.all-resources { margin-top: 24px; border: 1px solid #d0d7de; border-radius: 6px; padding: 4px 10px; background: #fff; }
 #flow details.all-resources > summary { cursor: pointer; font-weight: 600; font-size: 14px; }
 #flow .diagram-panel { margin-bottom: 10px; }
@@ -139,6 +141,8 @@ details.drilldown > summary { cursor: pointer; font-weight: 600; }
 #roots .st-unverified { color: #9a6700; }
 #roots .st-iam_only { color: #57606a; }
 #roots ul.flow-side { margin: 2px 0 8px; padding-left: 28px; color: #57606a; }
+#roots ul.flow-context { margin: 2px 0 8px; padding-left: 28px; color: #57606a; }
+#roots h2.flow-group { margin-top: 28px; padding: 4px 8px; background: #f6f8fa; border-left: 4px solid #8250df; font-size: 17px; }
 #roots .diagram-panel { margin-bottom: 10px; }
 #roots .diagram-toolbar { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
 #roots .diagram-toolbar button { min-width: 28px; padding: 1px 8px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; color: #1f2328; }

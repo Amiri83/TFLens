@@ -75,16 +75,31 @@ Nothing has to be configured before a first analysis:
   its state, `aws_ssm_parameter` data sources) and its environments;
   *network* (VPC, subnets, security groups, endpoints, transit gateways) → **Network**:
   VPC → subnets → what is placed in them, security groups, endpoints, and what can
-  reach what; *module library* (no backend, no provider, nothing calls it) →
-  **Module catalog**: inputs, outputs, resources, an example `module` block and who
-  calls it. A mixed repository lists its roots grouped by shape, each with a one-line
-  description; a root switcher and a view switcher pick any root and any view.
-  `/api/shapes`, `/api/root-view?root=<dir>&view=<flow|provides|network|catalog>`.
+  reach what, with a diagram (VPC → subnets → security groups → the instances, ECS
+  services, load balancers, Lambda functions in them; the security group rules are the
+  numbered, labelled edges, public ones in red); *module library* (no backend, no
+  provider, nothing calls it) → **Module catalog**: inputs, outputs, resources, an
+  example `module` block and who calls it. Every root also has an **IAM** view: each
+  role / user / group → its attached and inline policies → what they grant (*can
+  write* / *can read* / *can access* / *denies*), as a list and a diagram. Every box of
+  these diagrams shows its `file:line`. A mixed repository lists its roots grouped by
+  shape, each with a one-line description; a root switcher and a view switcher pick
+  any root and any view.
+  `/api/shapes`, `/api/root-view?root=<dir>&view=<flow|provides|network|iam|catalog>`.
 - **Flow** (the analyzer's second tab, the `## Flows` section of `handoff.md`): how
   data moves, entry point to sink. Entry points are the declared triggers nothing in
   the repository writes to (Kafka / MSK / SQS / Kinesis / DynamoDB event source
   mappings, SNS subscriptions, S3 notifications, EventBridge rules, API Gateway
-  integrations, load balancer listeners → target groups → ECS services). A compute
+  integrations, load balancer listeners → target groups → ECS services, EC2 instances,
+  Auto Scaling groups), plus **every compute** (Lambda, ECS service, EC2 instance, Auto
+  Scaling group, ...) that no chain from an entry point reaches: it starts its own
+  flow, marked *(no trigger)*, so every compute is in exactly one flow as a start or a
+  later step, never twice as a start. The flows are grouped under **Lambda / ECS /
+  EC2 / Network** (by the first compute a chain reaches; *Network* = routing with no
+  compute behind it), and the header shows *covered / total compute*. Under each
+  compute hangs what it runs in and as: ECS cluster → task definition → containers →
+  task / execution role; instance profile → role; ASG → launch template → instance
+  profile → role. A compute
   **sends to** / **reads from** a queue, topic, table, bucket, stream or secret when it
   has both a reference to it (environment variable, ECS container `environment` /
   `secrets`) and an IAM write / read action on it; a reference alone is *unverified*,
@@ -252,7 +267,8 @@ no external requests; the graph library is vendored (copy `cytoscape.min.js` int
 JSON API (all GET; under `/runs/<id>/` for a run): `api/summary`, `api/graph`,
 `api/nodes`, `api/edges`, `api/node?id=`, `api/edge?id=`, `api/tree`,
 `api/file?path=`, `api/overview`, `api/source?file=&start=&end=`, `api/model`,
-`api/diagram?name=architecture|module-tree|env-matrix&format=svg|mmd`, `api/handoff`
+`api/diagram?name=architecture|module-tree|env-matrix&format=svg|mmd`,
+`api/diagram?name=flow-<n>|network|iam&format=svg[&root=<dir>]`, `api/handoff`
 (add `download=1` for an attachment); `POST api/regenerate` (standalone only, needs the
 header `X-TFLens: 1`).
 

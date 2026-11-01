@@ -219,26 +219,52 @@
         el("span", {}, `${m.flows} flows found`),
         el("span", {}, `${m.steps} steps`),
         el("span", { class: m.unverified ? "warn" : "" }, `${m.unverified} unverified links`),
-        el("span", {}, `${m.iam_only} IAM-only (can write / can read)`)),
+        el("span", {}, `${m.iam_only} IAM-only (can write / can read)`),
+        el("span", { class: m.compute_covered < m.compute_total ? "warn" : "" },
+          `${m.compute_covered}/${m.compute_total} compute covered`)),
     ];
     if (!fl.chains.length) {
       parts.push(el("p", { class: "muted" },
         "No flows found: no trigger, subscription, notification, rule, API or load balancer is declared for the code here."));
     }
-    for (const c of fl.chains) {
-      const id = `${pre}-${c.id}`;
-      toc.push([id, `Flow ${c.n}: ${c.entry_label}`]);
-      parts.push(el("h2", { id, class: "flow-title" }, `Flow ${c.n}: ${c.title}`),
-        el("p", { class: "muted" }, `Entry point: ${c.entry_label} (${c.entry_kind}). `,
-          el("a", { class: "link", href: `api/diagram?name=${c.id}&format=svg${diagramQuery}&download=1`, download: `${c.id}.svg` }, "SVG")),
-        diagramPanel(c.id, `Flow ${c.n}`, diagramQuery),
-        el("ol", { class: "flow-steps" }, ...c.steps.map(flowStep)));
-      if (c.side.length) {
-        parts.push(el("h3", {}, "Side branches (dead-letter queues, alarms, logs)"),
-          el("ul", { class: "flow-side" }, ...c.side.map((s) => el("li", {}, s.text, " ", locLink(s.location)))));
-      }
+    // one heading per group (Lambda / ECS / EC2 / Network / Other), in the server's order
+    const byId = new Map(fl.chains.map((c) => [c.id, c]));
+    for (const g of fl.groups) {
+      const gid = `${pre}-group-${g.group.toLowerCase()}`;
+      toc.push([gid, `${g.group} (${g.flows.length})`]);
+      parts.push(el("h2", { id: gid, class: "flow-group" }, `${g.group} (${g.flows.length})`));
+      for (const c of g.flows.map((i) => byId.get(i))) parts.push(...flowChain(c, pre, diagramQuery, toc));
     }
     return { parts, toc };
+  }
+
+  // What a compute runs in / as (cluster, task definition, containers, roles, ...).
+  function flowContext(c) {
+    const ctx = c.nodes.filter((n) => n.role === "context");
+    if (!ctx.length) return [];
+    const label = new Map(c.nodes.map((n) => [n.id, n.label]));
+    return [el("h3", {}, "Runs in / as"),
+      el("ul", { class: "flow-context" }, ...ctx.map((n) =>
+        el("li", {}, `${label.get(n.parent) || n.parent} ${n.relation}: ${n.label} `, locLink(n.code_ref))))];
+  }
+
+  function flowChain(c, pre, diagramQuery, toc) {
+    const id = `${pre}-${c.id}`;
+    toc.push([id, `Flow ${c.n}: ${c.entry_label}`]);
+    const entry = c.no_trigger
+      ? el("p", { class: "muted" }, `No trigger: ${c.entry_label} (${c.entry_kind}). `)
+      : el("p", { class: "muted" }, `Entry point: ${c.entry_label} (${c.entry_kind}). `);
+    entry.append(el("a", { class: "link", href: `api/diagram?name=${c.id}&format=svg${diagramQuery}&download=1`, download: `${c.id}.svg` }, "SVG"));
+    const parts = [el("h2", { id, class: "flow-title" }, `Flow ${c.n}: ${c.title}`), entry,
+      diagramPanel(c.id, `Flow ${c.n}`, diagramQuery),
+      c.steps.length ? el("ol", { class: "flow-steps" }, ...c.steps.map(flowStep))
+        : el("p", { class: "muted" }, "No step: nothing it sends to or reads from is declared."),
+      ...flowContext(c)];
+    if (c.side.length) {
+      parts.push(el("h3", {}, "Side branches (dead-letter queues, alarms, logs)"),
+        el("ul", { class: "flow-side" }, ...c.side.map((s) => el("li", {}, s.text, " ", locLink(s.location)))));
+    }
+    return parts;
   }
 
   function tocLinks(toc) {
@@ -324,6 +350,15 @@
         if (sec.code) {
           parts.push(el("h3", {}, sec.code_title || "Code"), el("pre", { class: "code" }, sec.code));
         }
+      }
+      // the Network / IAM views: one diagram of the root, drawn like the flows
+      if (d.diagram) {
+        const q = `&root=${encodeURIComponent(root)}`;
+        const id = `rv-diagram-${d.diagram}`;
+        toc.push([id, `${d.view_label} diagram`]);
+        parts.push(el("h2", { id, class: "rv-section" }, `${d.view_label} diagram `,
+          el("a", { class: "link", href: `api/diagram?name=${d.diagram}&format=svg${q}&download=1`, download: `${d.diagram}.svg` }, "SVG")),
+          diagramPanel(d.diagram, `${d.view_label} diagram`, q));
       }
     }
     box.replaceChildren(...parts);

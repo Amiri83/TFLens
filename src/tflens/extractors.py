@@ -78,6 +78,42 @@ def ec2_instance(a: Analyzer, it: Item) -> None:
             _attach_sgs(a, it, a.get(it, name), a.attr_loc(it, name))
 
 
+@extractor("aws_launch_template")
+def launch_template(a: Analyzer, it: Item) -> None:
+    _props(a, it, "name", "instance_type", "image_id")
+    for blk, prof in a.nested(it, "iam_instance_profile"):
+        value = prof.get("name", prof.get("arn"))
+        for p in a.resolve(
+            it,
+            value,
+            "iam_instance_profile",
+            blk.loc,
+            {"aws_iam_instance_profile"},
+            "instance_profile",
+        ):
+            a.runs_as.setdefault(it.id, []).append((p, [a.ev(blk.loc, "instance profile")], []))
+    if "vpc_security_group_ids" in it.block.attrs:
+        name = "vpc_security_group_ids"
+        _attach_sgs(a, it, a.get(it, name), a.attr_loc(it, name))
+
+
+@extractor("aws_autoscaling_group")
+def autoscaling_group(a: Analyzer, it: Item) -> None:
+    _props(a, it, "name", "min_size", "max_size", "desired_capacity")
+    for blk, lt in a.nested(it, "launch_template"):
+        value = lt.get("id", lt.get("name"))
+        for t in a.resolve(
+            it, value, "launch_template", blk.loc, {"aws_launch_template"}, "launch_template"
+        ):
+            a.runs_as.setdefault(it.id, []).append((t, [a.ev(blk.loc, "launch template")], []))
+    if "target_group_arns" in it.block.attrs:
+        loc = a.attr_loc(it, "target_group_arns")
+        for tg in a.resolve(
+            it, a.get(it, "target_group_arns"), "target_group_arns", loc, TARGET_GROUP
+        ):
+            a.edge("TRIGGER", tg, it.id, "load balancer target", [a.ev(loc)], {})
+
+
 # --------------------------------------------------------------------- Lambda
 
 
