@@ -17,6 +17,7 @@ output.
 ```sh
 pip install -e ".[dev]"
 tflens --dir path/to/terraform --out model.json --report report.md
+tflens                           # no arguments: the web UI, same as `tflens serve`
 ```
 
 | Option | Meaning |
@@ -196,6 +197,7 @@ it when it is missing or unusable; the **Regenerate** button re-analyzes on dema
 
 ```sh
 tflens serve                     # data directory $TFLENS_HOME or ~/.tflens
+tflens                           # the same (also `python -m tflens`)
 tflens serve --home /srv/tflens --port 9000 --no-browser
 ```
 

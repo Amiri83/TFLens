@@ -5,6 +5,7 @@ analyzes a repository (exit status 1 when there is nothing to analyze);
 ``tflens serve --dir PATH`` serves the web UI over that repository's model (no data
 directory, no database); ``tflens serve`` alone runs the full local app (Settings,
 Accounts, Repos, Runs, Logs) over the data directory ``$TFLENS_HOME`` / ``~/.tflens``.
+``tflens`` with no arguments is the same as ``tflens serve``.
 """
 
 from __future__ import annotations
@@ -53,7 +54,9 @@ def _add_var_options(parser: argparse.ArgumentParser) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
-    if argv and argv[0] == "serve":
+    if not argv:  # bare ``tflens`` / ``python -m tflens``: same as ``tflens serve``
+        return serve_main([])
+    if argv[0] == "serve":
         return serve_main(argv[1:])
     parser = argparse.ArgumentParser(
         prog="tflens",
