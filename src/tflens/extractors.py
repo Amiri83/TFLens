@@ -23,6 +23,9 @@ ROLE = {"aws_iam_role"}
 USER = {"aws_iam_user"}
 GROUP = {"aws_iam_group"}
 LAMBDA = {"aws_lambda_function"}
+# what a function_name may name: a function or an alias of it (the analyzer turns an
+# alias into its function)
+LAMBDA_TARGETS = {"aws_lambda_function", "aws_lambda_alias"}
 
 
 def extractor(*types: str, data: bool = False) -> Callable[[Extractor], Extractor]:
@@ -149,10 +152,13 @@ def lambda_event_source_mapping(a: Analyzer, it: Item) -> None:
     topics = [t for t in (render(v) for v in as_list(a.get(it, "topics"))) if t]
     kafka = "self_managed_event_source" in it.block.blocks
     if kafka:
-        # self-managed Kafka: no ARN, the topics are the event source
+        # self-managed Kafka: no ARN, the topics are the event source; topics that are
+        # not known are named after their variable, else the cluster stands for them
         sources = [a.external("kafka_topic", t) for t in topics]
         if not topics:
             a.unknown(it.id, "topics", "Kafka topics are not known statically", it.loc)
+            named = a.named_external(it, "topics", "kafka_topic")
+            sources = [named or a.external("kafka", "self-managed Kafka")]
     else:
         sources = a.resolve(
             it,
@@ -161,13 +167,14 @@ def lambda_event_source_mapping(a: Analyzer, it: Item) -> None:
             a.attr_loc(it, "event_source_arn"),
             None,
             "event_source",
+            from_var=True,
         )
     functions = a.resolve(
         it,
         a.get(it, "function_name"),
         "function_name",
         a.attr_loc(it, "function_name"),
-        LAMBDA,
+        LAMBDA_TARGETS,
         "lambda_function",
     )
     attrs = {
@@ -182,7 +189,14 @@ def lambda_event_source_mapping(a: Analyzer, it: Item) -> None:
     }
     if topics:
         attrs["topics"] = topics
-    label = "event source mapping (self-managed Kafka)" if kafka else "event source mapping"
+    msk = any(a.type_of(s) == "aws_msk_cluster" or ":kafka:" in s for s in sources)
+    label = (
+        "event source mapping (self-managed Kafka)"
+        if kafka
+        else "event source mapping (MSK)"
+        if msk
+        else "event source mapping"
+    )
     for s in sources:
         for f in functions:
             a.edge("TRIGGER", s, f, label, [a.ev(it.loc)], attrs, [it.id])
@@ -195,7 +209,7 @@ def lambda_permission(a: Analyzer, it: Item) -> None:
         a.get(it, "function_name"),
         "function_name",
         a.attr_loc(it, "function_name"),
-        LAMBDA,
+        LAMBDA_TARGETS,
         "lambda_function",
     )
     action = render(a.get(it, "action")) or "lambda:InvokeFunction"
@@ -295,6 +309,7 @@ def sns_subscription(a: Analyzer, it: Item) -> None:
         a.attr_loc(it, "topic_arn"),
         {"aws_sns_topic"},
         "sns_topic",
+        from_var=True,
     )
     protocol = render(a.get(it, "protocol"))
     loc = a.attr_loc(it, "endpoint")

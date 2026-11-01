@@ -28,6 +28,8 @@ a ``code_ref`` (its own block, else the first evidence that names it).
 from __future__ import annotations
 
 import fnmatch
+import os
+import re
 from collections import deque
 from typing import Any
 from xml.sax.saxutils import escape
@@ -121,6 +123,11 @@ KIND_LABELS = {
     "aws_iam_group_policy": "inline group policy",
     # external nodes (by external kind)
     "kafka_topic": "Kafka topic",
+    "kafka": "Kafka cluster",
+    "sns_topic": "SNS topic",
+    "event_source": "event source",
+    "lambda_function": "Lambda function",
+    "aws_lambda_alias": "Lambda alias",
     "aws_service": "AWS service",
     "aws_managed_policy": "AWS managed policy",
 }
@@ -174,7 +181,7 @@ def label_of(n: dict[str, Any]) -> str:
     if n["kind"] == "external":
         return n["name"]
     for src in (n["properties"], n["attributes"]):
-        for key in ("function_name", "bucket", "name", "alarm_name", "family"):
+        for key in ("function_name", "bucket", "name", "alarm_name", "family", "cluster_name"):
             if isinstance(src.get(key), str) and src[key]:
                 return src[key]
     return n["name"]
@@ -934,6 +941,8 @@ FONT = "Helvetica, Arial, sans-serif"
 NODE_W, NODE_H, SIDE_H = 240, 80, 72
 COL_GAP, ROW_GAP, PAD = 210, 26, 24
 META_H = 22  # a box's summary line (the Network diagram's "subnet-a / sg-a, sg-b")
+NAME2_H, SIDE_NAME2_H = 20, 18  # the second line of a long name (a box's, a hung box's)
+NAME_SEPS = "-_/.: "  # where a name may be wrapped, and where a shared prefix may end
 FRAME_HEAD, FRAME_PAD = 48, 12  # a frame's name and code reference; its margin
 FRAME_FILL = ("#f6f8fa", "#ffffff")  # by nesting level: VPC, subnet
 # where a step's label may sit along its own edge, best first
@@ -967,6 +976,10 @@ ROLE_STROKE = {
     "principal": "#8250df",
     "policy": "#9a6700",
 }
+HUNG = ("side", "context")  # boxes hung under the node they belong to
+SIDE_STROKE = "#8c959f"  # the line from a node down to its hung boxes
+REF_COLOUR, MUTED = "#0969da", "#57606a"
+STATUS_NOTE = {"unverified": "(unverified)", "iam_only": "(IAM only)", "public": "(public)"}
 FLOW_LEGEND = (
     ("triggers / routes to", "trigger", ""),
     ("sends to", "send", "verified"),
@@ -1007,8 +1020,41 @@ def _free(p: tuple[float, float], w: float, h: float, taken: list[tuple[float, .
     return not any(x < b[1] and b[0] < x + w and y < b[3] and b[2] < y + h for b in taken)
 
 
+def common_prefix(labels: list[str]) -> str:
+    """The start every name shares, up to a separator (``dev-app-``), shown once in the
+    title instead of in every box ('' when there is none worth taking off)."""
+    labels = [x for x in labels if x]
+    if len(labels) < 2:
+        return ""
+    shared = os.path.commonprefix(labels)
+    shared = shared[: max(shared.rfind(c) for c in NAME_SEPS) + 1]
+    return shared if len(shared) >= 3 and all(len(x) > len(shared) for x in labels) else ""
+
+
+def wrap_name(text: str, width: float, size: int) -> list[str]:
+    """A name on one line, else on two (split after a separator when there is one); only
+    a name too long for two lines is shortened (the box's tooltip has it in full)."""
+    n = max(int(width / (0.6 * size)), 1)
+    if len(text) <= n:
+        return [text]
+    cut = max(text.rfind(c, 0, n) for c in NAME_SEPS)
+    split = cut + 1 if cut > 0 else n
+    return [text[:split].rstrip(), _cut(text[split:].lstrip(), width, size)]
+
+
+def _name2(n: dict[str, Any]) -> float:
+    """Extra height of a box whose name takes two lines."""
+    if len(n.get("name_lines", ())) < 2:
+        return 0
+    return SIDE_NAME2_H if n["role"] in HUNG else NAME2_H
+
+
 def _node_h(n: dict[str, Any]) -> float:
-    return NODE_H + META_H if n.get("meta") else NODE_H
+    return NODE_H + (META_H if n.get("meta") else 0) + _name2(n)
+
+
+def _side_h(n: dict[str, Any]) -> float:
+    return SIDE_H + _name2(n)
 
 
 def _col_x(depth: int) -> float:
@@ -1109,29 +1155,46 @@ def parallel_lanes(steps: list[dict[str, Any]]) -> dict[int, tuple[int, int]]:
     return {n: (k, len(ns)) for ns in pairs.values() if len(ns) > 1 for k, n in enumerate(ns)}
 
 
-def flow_svg(
+def flow_layout(
     chain: dict[str, Any],
     title: str = "",
     legend: tuple[tuple[str, str, str], ...] = FLOW_LEGEND,
-) -> str:
-    """One chain, left to right by step depth, at natural size (every font >= 14px).
-    Side branches and context (what a compute runs in / as) hang below the node they
-    belong to. Every box shows its code reference (``file:line``). Also draws the
-    Network and IAM tab diagrams (same shape: nodes with a depth, numbered steps); a
-    diagram with ``frames`` (the Network one) has its boxes laid out in them
-    (:func:`framed_layout`), and a node's ``meta`` is a summary line in its box."""
-    hung = ("side", "context")
-    main = [n for n in chain["nodes"] if n["role"] not in hung]
-    side: dict[str, list[dict[str, Any]]] = {}
+) -> dict[str, Any]:
+    """Where everything of a diagram goes: what :func:`flow_svg` draws and
+    :mod:`tflens.drawio` exports (the same boxes, lines, colours and legend).
+
+    The prefix every name shares is taken off the boxes and shown once in the title; a
+    name too long for its box takes two lines. Nodes get ``name_lines`` (what the box
+    shows) and ``name_size``; their ``label`` stays the full name."""
+    prefix = common_prefix(
+        [n["label"] for n in chain["nodes"] if n["role"] != "link"]
+        + [f["label"] for f in chain.get("frames") or []]
+    )
+
+    def short(label: str) -> str:
+        return label[len(prefix) :] if prefix and label.startswith(prefix) else label
+
+    nodes = []
     for n in chain["nodes"]:
-        if n["role"] in hung:
+        hung = n["role"] in HUNG
+        size = 14 if hung else 16
+        shown = n["label"] if n["role"] == "link" else short(n["label"])
+        lines = wrap_name(shown, NODE_W - (48 if hung else 24), size)
+        nodes.append({**n, "name_lines": lines, "name_size": size})
+    chain = {**chain, "nodes": nodes}
+    if chain.get("frames") is not None:
+        chain["frames"] = [{**f, "short_label": short(f["label"])} for f in chain["frames"]]
+    main = [n for n in nodes if n["role"] not in HUNG]
+    side: dict[str, list[dict[str, Any]]] = {}
+    for n in nodes:
+        if n["role"] in HUNG:
             side.setdefault(n["parent"], []).append(n)
     cols: dict[int, list[dict[str, Any]]] = {}
     for n in main:
         cols.setdefault(n["depth"], []).append(n)
     top = PAD + 40
     pos: dict[str, tuple[float, float, float, float]] = {}  # id -> x, y, width, height
-    body: list[str] = []
+    connectors: list[tuple[str, str, str]] = []  # (parent, hung box, path)
     bottom = float(top)
 
     def place_side(parent: str, x: float, y: float) -> float:
@@ -1141,13 +1204,12 @@ def flow_svg(
             if s["id"] in pos:
                 continue
             sx = px + 24
-            mid = y + SIDE_H / 2
-            body.append(
-                f'<path d="M{sx - 12:.0f},{y - ROW_GAP:.0f} V{mid:.0f} H{sx:.0f}" fill="none" '
-                f'stroke="#8c959f" stroke-width="1.5" stroke-dasharray="4 3"/>'
+            h = _side_h(s)
+            connectors.append(
+                (parent, s["id"], f"M{sx - 12:.0f},{y - ROW_GAP:.0f} V{y + h / 2:.0f} H{sx:.0f}")
             )
-            pos[s["id"]] = (sx, y, NODE_W - (sx - x), SIDE_H)
-            y = place_side(s["id"], x, y + SIDE_H + ROW_GAP)
+            pos[s["id"]] = (sx, y, NODE_W - (sx - x), h)
+            y = place_side(s["id"], x, y + h + ROW_GAP)
         return y
 
     frames: list[tuple[Any, ...]] = []
@@ -1163,75 +1225,11 @@ def flow_svg(
                 y = place_side(n["id"], x, y + h + ROW_GAP)
             bottom = max(bottom, y)
     width = PAD * 2 + (max(cols) + 1 if cols else 1) * (NODE_W + COL_GAP) - COL_GAP
-    for f, level, x, y, w, h in frames:
+    for _f, _level, x, _y, w, _h in frames:
         width = max(width, x + w + PAD)
-        ref = f.get("code_ref")
-        ref_text = location_label(ref) if ref else "no code reference"
-        dash = ' stroke-dasharray="6 4"' if level else ""
-        body.append(
-            f'<g class="frame" data-frame="{escape(f["id"])}">'
-            f"<title>{escape(f['id'])} ({escape(ref_text)})</title>"
-            f'<rect x="{x:.0f}" y="{y:.0f}" width="{w:.0f}" height="{h:.0f}" rx="10" '
-            f'fill="{FRAME_FILL[min(level, 1)]}" stroke="{ROLE_STROKE["network"]}" '
-            f'stroke-width="1.5"{dash}/>'
-            + _t(x + 10, y + 20, _cut(f["label"], w - 20, 14), 14, extra=' font-weight="700"')
-            + _t(
-                x + 10,
-                y + 38,
-                _cut(f"{f['kind_label']} · {ref_text}", w - 20, 14),
-                14,
-                "#57606a",
-            )
-            + "</g>"
-        )
-    nodes_svg = []
-    for n in chain["nodes"]:
-        if n["id"] not in pos:
-            continue
-        x, y, w, h = pos[n["id"]]
-        stroke = ROLE_STROKE[n["role"]]
-        dash = ' stroke-dasharray="5 3"' if n["role"] in hung else ""
-        name_size = 14 if n["role"] in hung else 16
-        ref = n.get("code_ref", n.get("location"))
-        ref_text = location_label(ref) if ref else "no code reference"
-        meta = n.get("meta") or ""
-        meta_svg = (
-            _t(x + 12, y + 70, _cut(meta, w - 24, 14), 14, extra=' class="meta"') if meta else ""
-        )
-        nodes_svg.append(
-            f"<g><title>{escape(n['id'])} ({escape(ref_text)})"
-            + (f" — {escape(meta)}" if meta else "")
-            + "</title>"
-            f'<rect x="{x:.0f}" y="{y:.0f}" width="{w:.0f}" '
-            f'height="{h:.0f}" rx="8" fill="#ffffff" stroke="{stroke}" stroke-width="2"{dash}/>'
-            + _t(
-                x + 12,
-                y + (22 if h == SIDE_H else 26),
-                _cut(n["label"], w - 24, name_size),
-                name_size,
-                extra=' font-weight="700"',
-            )
-            + _t(
-                x + 12,
-                y + (42 if h == SIDE_H else 48),
-                _cut(n["kind_label"], w - 24, 14),
-                14,
-                "#57606a",
-            )
-            + meta_svg
-            + _t(
-                x + 12,
-                y + (62 if h == SIDE_H else 92 if meta else 70),
-                _cut(ref_text, w - 24, 14),
-                14,
-                "#0969da",
-                ' class="code-ref"',
-            )
-            + "</g>"
-        )
     drawn = [s for s in chain["steps"] if s["source"] in pos and s["target"] in pos]
     lanes = parallel_lanes([s for s in drawn if not s.get("quiet")])
-    quiet_svg, edges_svg, labels_svg = [], [], []
+    edges: list[dict[str, Any]] = []
     placed: list[tuple[float, ...]] = []
     boxes = [(bx, bx + bw, by, by + bh) for bx, by, bw, bh in pos.values()]
     routed = 0  # quiet edges sent along the bottom, each in its own lane
@@ -1242,6 +1240,8 @@ def flow_svg(
         y1, y2 = sy + sh / 2, ty + th / 2
         k, m = lanes.get(s["n"], (0, 1))
         leftward = tx < sx and s["kind"] == "rule"
+        edge: dict[str, Any] = {"step": s, "colour": colour, "dash": dash, "lane": (k, m)}
+        edges.append(edge)
         if s.get("quiet"):
             # structure (contains / attached): right angles through the gaps between the
             # columns, along the bottom past the boxes when it skips a column
@@ -1257,44 +1257,27 @@ def flow_svg(
                     f"H{x2 - min(off, x2 - 4):.0f} V{y2:.0f} H{x2:.0f}"
                 )
                 routed += 1
-        else:
-            # parallel steps (same source and target) each get a lane: ends apart, the
-            # middles further apart, each label on its own edge
-            gap = min(24.0, (min(sh, th) - 16) / (m - 1)) if m > 1 else 0.0
-            o = (k - (m - 1) / 2) * gap
-            y1, y2 = y1 + o, y2 + o
-            if tx > sx:
-                x1, x2, c1, c2 = sx + NODE_W, tx, sx + NODE_W + 80, tx - 80
-            elif leftward:  # egress to the outside, in the leftmost column
-                x1, x2, c1, c2 = sx, tx + NODE_W, sx - 80, tx + NODE_W + 80
-            else:  # back to an earlier node (a loop): around the right side
-                x1, x2, c1, c2 = sx + NODE_W, tx + NODE_W, sx + NODE_W + 90, tx + NODE_W + 90
-            cy1, cy2 = y1 + 2 * o, y2 + 2 * o
-            d = f"M{x1:.0f},{y1:.0f} C{c1:.0f},{cy1:.0f} {c2:.0f},{cy2:.0f} {x2:.0f},{y2:.0f}"
-            curve = (x1, y1, c1, cy1, c2, cy2, x2, y2)
-        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
-        marker = (
-            f' marker-start="url(#fa-{s["n"]})"'
-            if s["kind"] == "read"
-            else f' marker-end="url(#fa-{s["n"]})"'
-        )
-        lane_attr = f' data-lane="{k}"' if m > 1 else ""
-        cls = ' class="contains"' if s.get("quiet") else ""
-        (quiet_svg if s.get("quiet") else edges_svg).append(
-            f'<marker id="fa-{s["n"]}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" '
-            f'markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{colour}"/></marker>'
-            f'<path data-step="{s["n"]}"{lane_attr}{cls} d="{d}" fill="none" stroke="{colour}" '
-            f'stroke-width="{1.5 if s.get("quiet") else 2.2}"{dash_attr}{marker}/>'
-        )
-        if s.get("quiet"):  # the boxes say enough
-            continue
+            edge.update(d=d, ends=(x1, y1, x2, y2), label=None)
+            continue  # the boxes say enough
+        # parallel steps (same source and target) each get a lane: ends apart, the
+        # middles further apart, each label on its own edge
+        gap = min(24.0, (min(sh, th) - 16) / (m - 1)) if m > 1 else 0.0
+        o = (k - (m - 1) / 2) * gap
+        y1, y2 = y1 + o, y2 + o
+        if tx > sx:
+            x1, x2, c1, c2 = sx + NODE_W, tx, sx + NODE_W + 80, tx - 80
+        elif leftward:  # egress to the outside, in the leftmost column
+            x1, x2, c1, c2 = sx, tx + NODE_W, sx - 80, tx + NODE_W + 80
+        else:  # back to an earlier node (a loop): around the right side
+            x1, x2, c1, c2 = sx + NODE_W, tx + NODE_W, sx + NODE_W + 90, tx + NODE_W + 90
+        cy1, cy2 = y1 + 2 * o, y2 + 2 * o
+        d = f"M{x1:.0f},{y1:.0f} C{c1:.0f},{cy1:.0f} {c2:.0f},{cy2:.0f} {x2:.0f},{y2:.0f}"
+        curve = (x1, y1, c1, cy1, c2, cy2, x2, y2)
         # the label sits on its own edge (its own lane, for a parallel step): at the middle,
         # or slid along the edge clear of the boxes and of the labels already placed; a
         # loop's label may also lean right of the column it loops around
         line1 = f"{s['n']}. {s['verb'].split(' (')[0]}"
-        line2 = {"unverified": "(unverified)", "iam_only": "(IAM only)", "public": "(public)"}.get(
-            s["status"], ""
-        )
+        line2 = STATUS_NOTE.get(s["status"], "")
         lw = max(_w(line1, 14), _w(line2, 14)) + 10
         lh = 40 if line2 else 22
         loop = tx <= sx and not leftward
@@ -1309,6 +1292,144 @@ def flow_svg(
             next((p for p in spots if _free(p, lw, lh, placed)), spots[0]),
         )
         placed.append((lx, lx + lw, ly, ly + lh))
+        edge.update(d=d, ends=(x1, y1, x2, y2), label=(lx, ly, lw, lh), lines=(line1, line2))
+    legend_y = bottom + 10 + 10 * routed
+    items = []
+    lx = PAD
+    for text, kind, status in legend:
+        items.append((lx, text, *STYLE[(kind, status)]))
+        lx += 40 + _w(text, 14) + 28
+    width = max(width, lx + PAD)
+    full = title or f"Flow {chain['n']}: {chain['title']}"
+    head = full
+    if prefix:  # the shared prefix: once, here, instead of in every box
+        head = re.sub(rf"(?<![\w.-]){re.escape(prefix)}", "", full) + f" · names: {prefix}…"
+    return {
+        "nodes": [n for n in nodes if n["id"] in pos],
+        "frames": frames,
+        "pos": pos,
+        "connectors": connectors,
+        "edges": edges,
+        "legend": items,
+        "legend_y": legend_y,
+        "width": round(width),
+        "height": round(legend_y + 24),
+        "title": full,
+        "head": head,
+        "doc_title": title or chain["title"],
+        "prefix": prefix,
+    }
+
+
+def node_tooltip(n: dict[str, Any]) -> str:
+    """A box's hover text: its id and code reference (file:lines), its full name, what
+    it is, and its summary line."""
+    ref = n.get("code_ref", n.get("location"))
+    ref_text = location_label(ref) if ref else "no code reference"
+    text = f"{n['id']} ({ref_text})\n{n['label']}\n{n['kind_label']}"
+    return text + (f"\n{n['meta']}" if n.get("meta") else "")
+
+
+def flow_svg(
+    chain: dict[str, Any],
+    title: str = "",
+    legend: tuple[tuple[str, str, str], ...] = FLOW_LEGEND,
+) -> str:
+    """One chain, left to right by step depth, at natural size (every font >= 14px).
+    Side branches and context (what a compute runs in / as) hang below the node they
+    belong to. Every box shows its code reference (``file:line``). Also draws the
+    Network and IAM tab diagrams (same shape: nodes with a depth, numbered steps); a
+    diagram with ``frames`` (the Network one) has its boxes laid out in them
+    (:func:`framed_layout`), and a node's ``meta`` is a summary line in its box.
+    The positions are :func:`flow_layout`'s."""
+    lay = flow_layout(chain, title, legend)
+    pos = lay["pos"]
+    body: list[str] = [
+        f'<path d="{d}" fill="none" stroke="{SIDE_STROKE}" stroke-width="1.5" '
+        f'stroke-dasharray="4 3"/>'
+        for _parent, _child, d in lay["connectors"]
+    ]
+    for f, level, x, y, w, h in lay["frames"]:
+        ref = f.get("code_ref")
+        ref_text = location_label(ref) if ref else "no code reference"
+        dash = ' stroke-dasharray="6 4"' if level else ""
+        body.append(
+            f'<g class="frame" data-frame="{escape(f["id"])}">'
+            f"<title>{escape(f['id'])} ({escape(ref_text)})\n{escape(f['label'])}</title>"
+            f'<rect x="{x:.0f}" y="{y:.0f}" width="{w:.0f}" height="{h:.0f}" rx="10" '
+            f'fill="{FRAME_FILL[min(level, 1)]}" stroke="{ROLE_STROKE["network"]}" '
+            f'stroke-width="1.5"{dash}/>'
+            + _t(x + 10, y + 20, _cut(f["short_label"], w - 20, 14), 14, extra=' font-weight="700"')
+            + _t(x + 10, y + 38, _cut(f"{f['kind_label']} · {ref_text}", w - 20, 14), 14, MUTED)
+            + "</g>"
+        )
+    nodes_svg = []
+    for n in lay["nodes"]:
+        x, y, w, h = pos[n["id"]]
+        hung = n["role"] in HUNG
+        dash = ' stroke-dasharray="5 3"' if hung else ""
+        size = n["name_size"]
+        ref = n.get("code_ref", n.get("location"))
+        ref_text = location_label(ref) if ref else "no code reference"
+        meta = n.get("meta") or ""
+        extra = _name2(n)
+        line_h = SIDE_NAME2_H if hung else NAME2_H
+        names = "".join(
+            _t(x + 12, y + (22 if hung else 26) + i * line_h, _cut(line, w - 24, size), size,
+               extra=' font-weight="700"')
+            for i, line in enumerate(n["name_lines"])
+        )  # fmt: skip
+        meta_svg = (
+            _t(x + 12, y + 70 + extra, _cut(meta, w - 24, 14), 14, extra=' class="meta"')
+            if meta
+            else ""
+        )
+        nodes_svg.append(
+            f"<g><title>{escape(node_tooltip(n))}</title>"
+            f'<rect x="{x:.0f}" y="{y:.0f}" width="{w:.0f}" '
+            f'height="{h:.0f}" rx="8" fill="#ffffff" stroke="{ROLE_STROKE[n["role"]]}" '
+            f'stroke-width="2"{dash}/>'
+            + names
+            + _t(
+                x + 12,
+                y + (42 if hung else 48) + extra,
+                _cut(n["kind_label"], w - 24, 14),
+                14,
+                MUTED,
+            )
+            + meta_svg
+            + _t(
+                x + 12,
+                y + (62 if hung else 92 if meta else 70) + extra,
+                _cut(ref_text, w - 24, 14),
+                14,
+                REF_COLOUR,
+                ' class="code-ref"',
+            )
+            + "</g>"
+        )
+    quiet_svg, edges_svg, labels_svg = [], [], []
+    for e in lay["edges"]:
+        s, colour, dash = e["step"], e["colour"], e["dash"]
+        k, m = e["lane"]
+        dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
+        marker = (
+            f' marker-start="url(#fa-{s["n"]})"'
+            if s["kind"] == "read"
+            else f' marker-end="url(#fa-{s["n"]})"'
+        )
+        lane_attr = f' data-lane="{k}"' if m > 1 else ""
+        cls = ' class="contains"' if s.get("quiet") else ""
+        (quiet_svg if s.get("quiet") else edges_svg).append(
+            f'<marker id="fa-{s["n"]}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" '
+            f'markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{colour}"/></marker>'
+            f'<path data-step="{s["n"]}"{lane_attr}{cls} d="{e["d"]}" fill="none" stroke="{colour}" '
+            f'stroke-width="{1.5 if s.get("quiet") else 2.2}"{dash_attr}{marker}/>'
+        )
+        if e["label"] is None:
+            continue
+        lx, ly, lw, lh = e["label"]
+        line1, line2 = e["lines"]
         labels_svg.append(
             f'<g data-step="{s["n"]}"{lane_attr}><title>{escape(s["text"])}</title>'
             f'<rect x="{lx:.0f}" y="{ly:.0f}" width="{lw:.0f}" height="{lh}" rx="4" fill="#ffffff" '
@@ -1317,30 +1438,19 @@ def flow_svg(
             + (_t(lx + 5, ly + 34, line2, 14, colour) if line2 else "")
             + "</g>"
         )
-    legend_y = bottom + 10 + 10 * routed
-    lx = PAD
-    for text, kind, status in legend:
-        colour, dash = STYLE[(kind, status)]
+    legend_y = lay["legend_y"]
+    for lx, text, colour, dash in lay["legend"]:
         dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
         body.append(
             f'<line x1="{lx}" y1="{legend_y:.0f}" x2="{lx + 34}" y2="{legend_y:.0f}" stroke="{colour}" stroke-width="2.2"{dash_attr}/>'
         )
         body.append(_t(lx + 40, legend_y + 5, text, 14, colour))
-        lx += 40 + _w(text, 14) + 28
-    width = max(width, lx + PAD)
-    height = legend_y + 24
-    head = _t(
-        PAD,
-        PAD + 18,
-        title or f"Flow {chain['n']}: {chain['title']}",
-        18,
-        extra=' font-weight="700"',
-    )
-    w, h = round(width), round(height)
+    head = _t(PAD, PAD + 18, lay["head"], 18, extra=' font-weight="700"')
+    w, h = lay["width"], lay["height"]
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}" '
         f'font-family="{FONT}" font-size="14">\n'
-        f"<title>{escape(title or chain['title'])}</title>\n"
+        f"<title>{escape(lay['doc_title'])}</title>\n"
         f'<rect x="0" y="0" width="{w}" height="{h}" fill="#ffffff"/>\n'
         # the quiet structure under the boxes, the labelled steps over them
         + "\n".join([head, *body, *quiet_svg, *nodes_svg, *edges_svg, *labels_svg])
@@ -1348,11 +1458,17 @@ def flow_svg(
     )
 
 
+def find_chain(model: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """The chain ``flow-<n>`` of the Flow view (None when there is no such chain)."""
+    return next((c for c in build_flows(model)["chains"] if c["id"] == name), None)
+
+
+def chain_title(chain: dict[str, Any], title: str = "") -> str:
+    head = f"Flow {chain['n']}: {chain['title']}"
+    return f"{head} — {title}" if title else head
+
+
 def chain_svg(model: dict[str, Any], name: str, title: str = "") -> str | None:
     """The SVG of ``flow-<n>`` (None when there is no such chain)."""
-    flows = build_flows(model)
-    chain = next((c for c in flows["chains"] if c["id"] == name), None)
-    if chain is None:
-        return None
-    head = f"Flow {chain['n']}: {chain['title']}"
-    return flow_svg(chain, f"{head} — {title}" if title else head)
+    chain = find_chain(model, name)
+    return None if chain is None else flow_svg(chain, chain_title(chain, title))
