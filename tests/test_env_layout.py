@@ -282,9 +282,10 @@ def test_differences_between_environments_are_flagged(model):
     assert by["s3"]["differs"] and by["s3"]["only"] == {"aws_s3_bucket.archive": ["prod"]}
     assert by["sns"]["differs"] and by["sns"]["only"] == {}
     assert not by["lambda"]["differs"] and not by["ecs_service"]["differs"]
+    # columns in promotion order (dev | intg | uat | prod), never summed
     assert view["differences"] == [
-        "SNS topics: dev 1, intg 0 (+1 uncertain), prod 1, uat 1",
-        "S3 buckets: dev 0, intg 0, prod 1, uat 0",
+        "SNS topics: dev 1, intg 0 (+1 uncertain), uat 1, prod 1",
+        "S3 buckets: dev 0, intg 0, uat 0, prod 1",
         "  aws_s3_bucket.archive only in prod",
     ]
 

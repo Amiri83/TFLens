@@ -171,14 +171,56 @@ def detect_structure(repo: RepoSource, engine: Engine) -> dict[str, Any]:
     """The ``structure`` section of model.json."""
     referenced = engine.referenced_dirs()
     all_roots = sorted(set(engine.root_modules) | set(engine.units))
-    environments = detect_environments(repo, engine)
+    trace: list[dict[str, Any]] = []
+    environments = detect_environments(repo, engine, trace)
     shown = [r for r in all_roots if engine.selected(r)]
     roots = [_root(repo, engine, r, referenced, environments) for r in shown]
     return {
         "roots": roots,
         "environments": environments,
+        "env_files": sorted(trace, key=lambda t: (t["stack"], t["file"], t["kind"])),
         "module_dirs": classify_module_dirs(repo, engine),
     }
+
+
+def stack_env_debug(
+    stack: dict[str, Any], trace: list[dict[str, Any]], skipped: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Per stack: the environment files found for it (accepted or not, with why) and,
+    when none was accepted, why no environment was detected: no candidates, candidates
+    ignored by an exclusion, unreadable, or rejected (each reason listed)."""
+    roots = set(stack["roots"]) | {stack["id"]}
+    files = [t for t in trace if t["stack"] in roots]
+    out: dict[str, Any] = {"env_files": files}
+    if stack["environments"]:
+        return out
+    below = [
+        s
+        for s in skipped
+        if any(r == "." or in_scope(s["path"], r) for r in roots if not r.endswith("*"))
+    ]
+    excluded = [s["path"] for s in below if s["kind"] in ("excluded", "ignored", "symlink")]
+    unreadable = [s["path"] for s in below if s["kind"] == "unreadable"]
+    unreadable += [t["file"] for t in files if t["reason"].startswith("unreadable")]
+    rejected = [t for t in files if not t["accepted"] and not t["reason"].startswith("unreadable")]
+    where = ", ".join(sorted(roots - {stack["id"]}) or [stack["id"]])
+    if unreadable:
+        why = "unreadable: " + ", ".join(sorted(set(unreadable)))
+    elif rejected:
+        why = "candidates rejected: " + "; ".join(f"{t['file']}: {t['reason']}" for t in rejected)
+    elif excluded:
+        why = (
+            f"no candidates at or below {where}; ignored by an exclusion (not searched): "
+            + ", ".join(excluded)
+        )
+    else:
+        why = (
+            f"no candidates: no *.tfvars (other than terraform.tfvars / *.auto.tfvars), "
+            f"backend-<env>.hcl / <env>.tfbackend, environment directory or CI -var-file / "
+            f"-backend-config line at or below {where}"
+        )
+    out["no_env_reason"] = why
+    return out
 
 
 def _role(
@@ -796,7 +838,9 @@ def _owner(path_dir: str, roots: list[str]) -> str:
     return best
 
 
-def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]]:
+def detect_environments(
+    repo: RepoSource, engine: Engine, trace: list[dict[str, Any]] | None = None
+) -> list[dict[str, Any]]:
     """Environments of the repository, sorted by (directory, name).
 
     Each is ``{name, root, kinds, var_files, backend_hcl, var_file_cli, evidence, roots}``:
@@ -804,11 +848,31 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
     ``<env>.tfbackend``, ``backend/<env>.hcl``) and the ``-var-file`` / ``-backend-config``
     options naming them in CI files and docs. Backend files and CLI usages are attached to
     the environment found from the layout or tfvars; they only add a kind (``backend`` /
-    ``ci``) when they are what reveals the environment."""
+    ``ci``) when they are what reveals the environment.
+
+    Detection is per stack: a tfvars file or a partial backend configuration at any depth
+    below a root belongs to that root (the deepest one) and its stem names the
+    environment. ``trace`` (when given) receives one entry per candidate file:
+    ``{file, stack, env, kind, accepted, reason}``, the rejected ones with why."""
     if not engine.root_modules and not engine.units:
         engine.discover_roots()
     roots = sorted(set(engine.root_modules) | set(engine.units))
     envs: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def note(
+        file: str, owner: str, name: str | None, kind: str, accepted: bool, reason: str
+    ) -> None:
+        if trace is not None:
+            trace.append(
+                {
+                    "file": file,
+                    "stack": owner,
+                    "env": env_name(name) if name else None,
+                    "kind": kind,
+                    "accepted": accepted,
+                    "reason": reason,
+                }
+            )
 
     def add(scope: str, name: str, kind: str, loc: Location | None, root: str | None) -> None:
         key = (scope, env_name(name))
@@ -844,6 +908,14 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
         else:
             loc = Location(mod.files[0], 1, 1) if mod and mod.files else None
         add(seg[1], seg[0], "terragrunt" if unit else "dir", loc, r)
+        note(
+            loc.file if loc else r,
+            r,
+            seg[0],
+            "terragrunt" if unit else "dir",
+            True,
+            f"root inside the environment directory {seg[1]}/",
+        )
     # Terragrunt env.hcl: locals { environment = "dev" } names the environment
     for r in sorted(engine.units):
         found = _env_hcl(repo, r)
@@ -859,24 +931,53 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
     commons: dict[str, list[str]] = {}
     candidates: list[tuple[str, str, str, Location]] = []  # owner, name, file, loc
     siblings: dict[str, int] = {}
+    for err in repo.errors:
+        if err.file.endswith((".tfvars", ".tfvars.json")):
+            d = posixpath.dirname(err.file) or "."
+            note(err.file, _owner(d, roots), None, "tfvars", False, f"unreadable: {err.message}")
     for f in sorted(repo.tfvars):
         base = posixpath.basename(f)
         stem = base.removesuffix(".json").removesuffix(".tfvars")
         d = posixpath.dirname(f) or "."
         owner = _owner(d, roots)
         if ".auto." in base or (stem == "terraform" and d == owner):
-            continue  # loaded automatically by terraform: not an environment
+            note(
+                f,
+                owner,
+                None,
+                "tfvars",
+                False,
+                "loaded automatically by terraform on every run (terraform.tfvars / "
+                "*.auto.tfvars): not an environment",
+            )
+            continue
         if _BACKEND_FILE_RE.search(f):
-            continue  # a partial backend configuration (-backend-config), not variables
+            continue  # a partial backend configuration (-backend-config): listed below
         attrs = repo.tfvars[f]
         first = min((a.loc for a in attrs.values()), key=lambda x: x.start_line, default=None)
         loc = first or Location(f, 1, 1)
         if stem.lower() in COMMON_STEMS:
             commons.setdefault(owner, []).append(f)
+            note(
+                f,
+                owner,
+                None,
+                "tfvars",
+                True,
+                f"shared values ({stem}): applied to every environment of {owner}",
+            )
             continue
         if stem.lower() in GENERIC_STEMS:
             seg = env_segment(d)
             if seg is None:
+                note(
+                    f,
+                    owner,
+                    None,
+                    "tfvars",
+                    False,
+                    f"generic name ({stem}) outside an environment directory: no environment name",
+                )
                 continue
             stem = seg[0]
         candidates.append((owner, stem, f, loc))
@@ -884,14 +985,29 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
     for owner, stem, f, loc in candidates:
         d = posixpath.dirname(f) or "."
         parent = posixpath.basename(d)
-        plausible = (
-            stem.lower() in ENV_WORDS
-            or parent.lower() in ENV_CONTAINERS | VAR_DIRS
-            or env_segment(d) is not None
-            or siblings[d] >= 2
-        )
-        if not plausible:
+        seg = env_segment(d)
+        if stem.lower() in ENV_WORDS:
+            why = f"named after an environment ({stem})"
+        elif seg is not None:
+            why = f"inside the environment directory {seg[1]}/"
+        elif parent.lower() in ENV_CONTAINERS | VAR_DIRS:
+            why = f"in a {parent}/ directory"
+        elif siblings[d] >= 2:
+            why = f"one of {siblings[d]} tfvars files in {d}/"
+        elif owner in roots:
+            why = "tfvars file next to or below the root"
+        else:
+            note(
+                f,
+                owner,
+                stem,
+                "tfvars",
+                False,
+                "not below any root and not named like an environment",
+            )
             continue
+        where = "next to" if d == owner else "below"
+        note(f, owner, stem, "tfvars", True, f"{why}; {where} the root {owner}: env = file stem")
         add(owner, stem, "tfvars", loc, owner if owner in roots else None)
         e = envs[(owner, env_name(stem))]
         for c in commons.get(owner, []):
@@ -920,16 +1036,41 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
     for f in configs:
         d = posixpath.dirname(f) or "."
         name = backend_env(f)
-        if name is None:
-            continue
-        known = any(k[1] == env_name(name) for k in envs)
-        if not (
-            name.lower() in ENV_WORDS or known or per_dir[d] >= 2 or env_segment(d) is not None
-        ):
-            continue
         owner = _owner(d, roots)
         if d != owner:
             owner = _owner(_backend_owner_dir(d), roots)
+        if name is None:
+            note(
+                f,
+                owner,
+                None,
+                "backend",
+                False,
+                "partial backend configuration with no environment in its name or directory",
+            )
+            continue
+        known = any(k[1] == env_name(name) for k in envs)
+        if name.lower() in ENV_WORDS:
+            why = f"named after an environment ({name})"
+        elif known:
+            why = f"matches the environment {name} found from tfvars / directories"
+        elif per_dir[d] >= 2:
+            why = f"one of {per_dir[d]} backend configurations in {d}/"
+        elif env_segment(d) is not None:
+            why = "inside an environment directory"
+        elif owner in roots:
+            why = "backend configuration next to or below the root"
+        else:
+            note(
+                f,
+                owner,
+                name,
+                "backend",
+                False,
+                "not below any root and not named like an environment",
+            )
+            continue
+        note(f, owner, name, "backend", True, f"partial backend configuration: {why}")
         e = attach(owner, name, "backend", Location(f, 1, 1))
         if f not in e["backend_hcl"]:
             e["backend_hcl"].append(f)
@@ -950,6 +1091,15 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
             e = attach(use["owner"], use["env"], "ci", use["loc"])
         if e is None:
             continue
+        src = use["loc"]
+        note(
+            use["file"],
+            e["roots"][0] if e["roots"] else e["root"],
+            e["name"],
+            "ci",
+            True,
+            f"{use['flag']} {use['value']} in {src.file}:{src.start_line}",
+        )
         files = e["var_files"] if use["flag"] == "-var-file" else e["backend_hcl"]
         if use["file"] not in files:
             files.append(use["file"])

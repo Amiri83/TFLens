@@ -74,6 +74,7 @@ TERRAGRUNT_FILE = "terragrunt.hcl"
 LOCK_FILE = ".terraform.lock.hcl"
 # Files listed in the repository tree (the full inventory); beyond this it is truncated.
 MAX_LISTED_FILES = 20000
+ENV_FILE_SUFFIXES = (".tfvars", ".tfvars.json", ".hcl", ".tfbackend")
 _LABEL_COUNT = {
     "resource": 2,
     "data": 2,
@@ -320,7 +321,9 @@ def load_repo(root: Path) -> RepoSource:
         for fname in filenames:
             rel = f"{rel_dir}/{fname}" if rel_dir != "." else fname
             counts[extension(fname)] += 1
-            if len(repo.all_files) < MAX_LISTED_FILES:
+            if len(repo.all_files) < MAX_LISTED_FILES or fname.endswith(ENV_FILE_SUFFIXES):
+                # environment files (tfvars, partial backend configurations) are always
+                # listed: environment detection reads them from this list
                 repo.all_files.append(rel)
             else:
                 repo.truncated = True

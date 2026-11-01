@@ -18,10 +18,10 @@ from urllib.parse import parse_qs, urlsplit
 
 from .drawio import MIME as DRAWIO_MIME
 from .drawio import chain_drawio, tab_drawio
-from .envs import difference_lines, env_counts_text, inventory_rows, summarize
+from .envs import difference_lines, env_counts_text, inventory_rows, node_root, summarize
 from .flow import build_flows, chain_svg
 from .model import EDGE_KINDS, SCHEMA_VERSION
-from .output import dumps, run_analysis
+from .output import dumps, library_roots, run_analysis
 from .overview import build_overview
 from .report import describe_node
 from .shapes import build_root_view, build_shapes, root_entries, root_model
@@ -673,12 +673,30 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
     analysis = model.get("environment_analysis") or {}
     active = model.get("environment")
     rows = [{**r, "text": env_counts_text(r)} for r in analysis.get("environments", [])]
-    current = summarize(None, model["nodes"], model["unknowns"])
+    # reusable modules nothing calls are not deployed from here: never counted
+    library = set(analysis.get("library_roots") or library_roots(model))
+    roots = list(model.get("roots") or [])
+    shown_nodes = [n for n in model["nodes"] if node_root(n["id"], roots) not in library]
+    stack_of = {r: s["id"] for s in model.get("stacks", []) for r in s["roots"]}
+    current = summarize(
+        None,
+        shown_nodes,
+        model["unknowns"],
+        roots=roots,
+        stack_of=stack_of,
+        env_name=active["name"] if active else None,
+    )
     per_env = bool(rows) and all("inventory" in r for r in rows)  # older model.json: no
+    # one column per environment name (every stack with its own tfvars); older models:
+    # one per environment row
+    columns = [
+        {**c, "text": env_counts_text(c)}
+        for c in analysis.get("columns") or (rows if per_env else [])
+    ]
     inventory = analysis.get("inventory") if per_env else None
     if inventory is None:
-        columns = [(r["id"], r["inventory"]) for r in rows] if per_env else []
-        inventory = inventory_rows(columns or [("", current["inventory"])])
+        cols = [(c["id"], c["inventory"]) for c in columns]
+        inventory = inventory_rows(cols or [("", current["inventory"])])
     out: dict[str, Any] = {
         "active": active["id"] if active else None,
         "active_name": active["name"] if active else None,
@@ -686,7 +704,9 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
         "switchable": store is not None and not store.readonly,
         "types": analysis.get("types", []),
         "environments": rows,
+        "columns": columns,
         "inventory": inventory,
+        "library_roots": sorted(library),
         "differences": difference_lines({**analysis, "inventory": inventory}) if per_env else [],
         "inventory_columns": "environments" if per_env else "current",
         "not_wired": [r["id"] for r in rows if not r.get("wired", True)],

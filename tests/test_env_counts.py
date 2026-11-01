@@ -209,7 +209,9 @@ def test_overview_lists_counts_per_environment(model):
     texts = [ln["text"] for ln in ov["environment_counts"]]
     assert texts[0].startswith("dev: 4 Lambda functions · 1 ECS cluster · 1 ECS service")
     assert texts[0].endswith("0 unknowns — backend.dev.hcl, environments/dev.tfvars")
-    assert texts[-1].startswith("total: 12 Lambda functions · 3 ECS clusters · 3 ECS services")
+    # one line per environment, never a sum across environments
+    assert not any(t.startswith("total") for t in texts)
+    assert not any("12 Lambda functions" in t for t in texts)
     md = render_overview_markdown(ov)
     assert "## Counts per environment" in md
 
