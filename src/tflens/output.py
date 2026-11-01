@@ -11,7 +11,7 @@ from typing import Any
 from . import __version__
 from .analyze import analyze
 from .crawl import crawl
-from .detect import detect_environments, detect_structure, state_index
+from .detect import detect_environments, detect_structure, stack_env_debug, state_index
 from .docsdiff import docs_diff
 from .engine import Engine, ModuleInstance, in_scope
 from .envs import (
@@ -133,6 +133,12 @@ def run_analysis(
     model["stacks"] = _stacks_section(
         per_stack["stacks"] if per_stack else stack_list, engine, selected, environments
     )
+    trace = model["structure"].get("env_files", [])
+    library = library_roots(model)
+    for s in model["stacks"]:
+        s.update(stack_env_debug(s, trace, model["discovery"]["skipped"]))
+        # a reusable module nothing calls: not deployed from here, never counted
+        s["library"] = bool(s["roots"]) and set(s["roots"]) <= library
     model["environment_analysis"] = (
         None
         if explicit
@@ -141,9 +147,20 @@ def run_analysis(
             environments,
             model["environment"]["id"] if model["environment"] else None,
             model["stacks"],
+            library_roots(model),
         )
     )
     return Analysis(repo, engine, graph, model)
+
+
+def library_roots(model: dict[str, Any]) -> set[str]:
+    """Roots that are reusable modules nothing in the repository calls: not deployed from
+    here, so their resources are never counted (they are counted where they are called).
+    Only when another root is deployed: a repository that is only such modules is what
+    it is (its roots are counted)."""
+    roots = (model.get("structure") or {}).get("roots", [])
+    library = {r["dir"] for r in roots if r["role"] == "library"}
+    return library if len(library) < len(roots) else set()
 
 
 def _stack_of(stack_list: list[dict[str, Any]], eid: str) -> str:

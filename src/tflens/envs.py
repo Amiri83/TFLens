@@ -283,18 +283,52 @@ def display_name(node: dict[str, Any]) -> str:
     return node["name"]
 
 
-def inventory(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def node_root(node_id: str, roots: list[str]) -> str | None:
+    """The root a node (or unknown subject) of an analysis belongs to: its ``<root>::``
+    prefix, else the only root analyzed (None: not known)."""
+    if "::" in node_id:
+        return node_id.split("::", 1)[0]
+    return roots[0] if len(roots) == 1 else None
+
+
+def _module_calls(node: dict[str, Any], by_id: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    """The module calls a resource is created through, outermost first, with their
+    file:line: part of the resource's item, not items of their own."""
+    out = []
+    parent = by_id.get(node.get("parent") or "")
+    while parent is not None and parent["kind"] == "module" and len(out) < 32:
+        out.append({"id": parent["id"], "location": parent["location"]})
+        parent = by_id.get(parent.get("parent") or "")
+    return out[::-1]
+
+
+def inventory(
+    nodes: list[dict[str, Any]],
+    env_name: str | None = None,
+    roots: list[str] | None = None,
+    stack_of: dict[str, str] | None = None,
+    qualify: bool = False,
+) -> dict[str, dict[str, Any]]:
     """Per inventory row: ``{count, uncertain, items}``: the instances known to be
     created, the blocks whose count is not known, and each block with its name,
-    file:line and why it is counted so (count expression, value, source)."""
+    file:line and why it is counted so (count expression, value, source).
+
+    Only resource blocks are counted: a module call is not an item of its own, so a
+    module call and the resources inside it are one item. With ``roots`` (the roots
+    analyzed) each item names its root, its stack (``stack_of``: root -> stack id) and
+    ``env_name``; ``qualify`` prefixes ids with ``<root>::`` when the analysis did not (one
+    root analyzed in a repository with several), so ids compare across analyses."""
     out = {
         key: {"count": 0, "uncertain": 0, "items": []}
         for key, _, _ in INVENTORY + OPTIONAL_INVENTORY
     }
+    by_id = {n["id"]: n for n in nodes}
+    seen: set[str] = set()
     for n in nodes:
         key = inventory_key(n)
-        if key is None:
+        if key is None or n["id"] in seen:
             continue
+        seen.add(n["id"])
         cell = out[key]
         c = created(n)
         if c is None:
@@ -308,6 +342,16 @@ def inventory(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
             "created": c,
             "location": n["location"],
         }
+        if roots is not None:
+            root = node_root(n["id"], roots)
+            if qualify and root is not None and "::" not in n["id"]:
+                item["id"] = f"{root}::{n['id']}"
+            item["root"] = root
+            item["stack"] = (stack_of or {}).get(root or "", root)
+            item["env"] = env_name
+        via = _module_calls(n, by_id)
+        if via:
+            item["via"] = via
         why = why_counted(n)
         if why is not None:
             item["why"] = why
@@ -346,10 +390,11 @@ def inventory_rows(columns: list[tuple[str, dict[str, dict[str, Any]]]]) -> list
 
 
 def difference_lines(analysis: dict[str, Any]) -> list[str]:
-    """``S3 buckets: dev 0, intg 0, prod 1, uat 0`` / ``aws_s3_bucket.archive only in
-    prod`` for each inventory row that differs between environments."""
+    """``S3 buckets: dev 0, intg 0, uat 0, prod 1`` / ``aws_s3_bucket.archive only in
+    prod`` for each inventory row that differs between environments (the columns: one
+    per environment name; older models: one per environment row)."""
     out = []
-    envs = analysis["environments"]
+    envs = analysis.get("columns") or analysis["environments"]
     for row in analysis.get("inventory", []):
         if not row["differs"]:
             continue
@@ -385,9 +430,13 @@ def unknown_entries(unknowns: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def summarize(
-    env: dict[str, Any] | None, nodes: list[dict[str, Any]], unknowns: list[dict[str, Any]]
+    env: dict[str, Any] | None,
+    nodes: list[dict[str, Any]],
+    unknowns: list[dict[str, Any]],
+    **where: Any,
 ) -> dict[str, Any]:
-    """Counts, functions, services and unknowns of one analysis (model dicts)."""
+    """Counts, functions, services and unknowns of one analysis (model dicts); ``where``
+    is passed to :func:`inventory` (env_name, roots, stack_of, qualify)."""
     instances, uncertain = counts(nodes)
     entries = unknown_entries(unknowns)
     by_category: dict[str, int] = {}
@@ -402,7 +451,7 @@ def summarize(
         "unknown_categories": {k: by_category[k] for k in sorted(by_category)},
         "unknowns": entries[:MAX_UNKNOWNS_LISTED],
         "uncertain_items": uncertain_items(nodes),
-        "inventory": inventory(nodes),
+        "inventory": inventory(nodes, **where),
     }
     if env is not None:
         out = {
@@ -434,84 +483,218 @@ def analyze_environment(repo: RepoSource, env: dict[str, Any]) -> tuple[Engine, 
     return engine, analyze(repo, engine)
 
 
+def analyze_roots(
+    repo: RepoSource, root_var_files: dict[str, list[str]], env: str = ""
+) -> tuple[Engine, Graph]:
+    """These roots only (every other root left out), each with its own tfvars: one
+    environment applied to every stack that has it."""
+    probe = Engine(repo)
+    probe.discover_roots()
+    every = set(probe.root_modules) | set(probe.units)
+    engine = Engine(repo, root_var_files=root_var_files, exclude_roots=every - set(root_var_files))
+    engine.root_envs = {r: env for r in root_var_files} if env else {}
+    engine.run()
+    return engine, analyze(repo, engine)
+
+
+# Columns ordered the way environments are promoted (dev before uat before prod); names
+# not listed here follow, alphabetically.
+_PROMOTION = (
+    "sandbox", "sbx", "dev", "develop", "development", "test", "testing", "qa", "int",
+    "intg", "integ", "integration", "sit", "e2e", "uat", "perf", "nonprod", "non-prod",
+    "demo", "stage", "staging", "stg", "preprod", "pre-prod", "prod", "production", "prd",
+    "dr",
+)  # fmt: skip
+NO_ENV_COLUMN = "(no environment)"
+
+
+def column_order(name: str) -> tuple[int, str]:
+    low = name.lower()
+    return (_PROMOTION.index(low) if low in _PROMOTION else len(_PROMOTION), low)
+
+
+def env_columns(
+    environments: list[dict[str, Any]], stack_list: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """One column per environment name (``dev | intg | uat | prod``): the stacks that
+    have an environment of that name, each root with that environment's tfvars, and the
+    stacks that have environments but none of that name (``missing``)."""
+    by_id = {env_id(e, environments): e for e in environments}
+    cols: dict[str, dict[str, Any]] = {}
+    for s in stack_list:
+        for eid in s["environments"]:
+            e = by_id.get(eid)
+            if e is None:
+                continue
+            col = cols.setdefault(
+                e["name"],
+                {"id": e["name"], "envs": [], "stacks": [], "root_var_files": {}},
+            )
+            col["envs"].append(eid)
+            if s["id"] not in col["stacks"]:
+                col["stacks"].append(s["id"])
+            for r in s["env_roots"].get(eid, []):
+                col["root_var_files"][r] = list(e["var_files"])
+    with_envs = [s["id"] for s in stack_list if s["environments"]]
+    out = []
+    for name in sorted(cols, key=column_order):
+        col = cols[name]
+        col["missing"] = [s for s in with_envs if s not in col["stacks"]]
+        out.append(col)
+    return out
+
+
+def _rows_of(items: list[dict[str, Any]], key: str, roots: list[str], mine: set[str]):
+    return [x for x in items if node_root(x[key], roots) in mine]
+
+
 def analyze_environments(
     repo: RepoSource,
     environments: list[dict[str, Any]],
     active: str | None = None,
     stack_list: list[dict[str, Any]] | None = None,
+    library_roots: set[str] | frozenset[str] = frozenset(),
 ) -> dict[str, Any] | None:
-    """The ``environment_analysis`` section (None when no environment was detected). With
-    the stacks, each row names its stack and ``selected`` lists the environment applied
-    to each stack in the model shown."""
+    """The ``environment_analysis`` section (None when no environment was detected).
+
+    ``columns``: one per environment name, every stack that has it analyzed together with
+    its own tfvars (``dev`` = the dev of every stack). Each real resource is counted once:
+    a stack's roots belong to one column per environment, a module call and the
+    resources inside it are one item, and reusable modules nothing calls
+    (``library_roots``) are not deployed from here. Stacks with no environment have
+    their own column (variable defaults). ``environments``: one row per stack's
+    environment, its part of the column. ``total`` sums the columns and is never shown
+    by default."""
     if not environments:
         return None
-    stack_of = {e: s["id"] for s in stack_list or [] for e in s["environments"]}
-    rows = []
-    for env in environments[:MAX_ENVIRONMENTS]:
-        _, graph = analyze_environment(repo, env)
+    probe = Engine(repo)
+    probe.discover_roots()
+    all_roots = sorted(set(probe.root_modules) | set(probe.units))
+    if stack_list is None:
+        stack_list = stacks(environments, all_roots)
+    stack_of_env = {e: s["id"] for s in stack_list for e in s["environments"]}
+    stack_of_root = {r: s["id"] for s in stack_list for r in s["roots"]}
+    qualify = len(all_roots) > 1
+    columns_all = env_columns(environments, stack_list)
+    columns_run = columns_all[:MAX_ENVIRONMENTS]
+    unbound = sorted(
+        r for s in stack_list if not s["environments"] for r in s["roots"] if r not in library_roots
+    )
+    if unbound:
+        columns_run.append(
+            {
+                "id": NO_ENV_COLUMN,
+                "envs": [],
+                "stacks": sorted({stack_of_root.get(r, r) for r in unbound}),
+                "root_var_files": {r: [] for r in unbound},
+                "missing": [],
+                "no_environment": True,
+            }
+        )
+    by_id = {env_id(e, environments): e for e in environments}
+    row_by_id: dict[str, dict[str, Any]] = {}
+    columns = []
+    for col in columns_run:
+        engine, graph = analyze_roots(
+            repo, col["root_var_files"], "" if col.get("no_environment") else col["id"]
+        )
+        roots = list(engine.roots)
         nodes, unknowns = _graph_dicts(graph)
-        row = summarize(env, nodes, unknowns)
-        row["id"] = env_id(env, environments)
-        row["stack"] = stack_of.get(row["id"])
-        row["not_created"] = len(graph.not_created)
-        rows.append(row)
+        where = {"roots": roots, "stack_of": stack_of_root, "qualify": qualify}
+        env_name = None if col.get("no_environment") else col["id"]
+        summary = summarize(None, nodes, unknowns, env_name=env_name, **where)
+        for eid in col["envs"]:
+            env = by_id[eid]
+            stack = stack_of_env.get(eid)
+            mine = {r for s in stack_list if s["id"] == stack for r in s["env_roots"].get(eid, [])}
+            row = summarize(
+                env,
+                _rows_of(nodes, "id", roots, mine),
+                _rows_of(unknowns, "subject", roots, mine),
+                env_name=env["name"],
+                **where,
+            )
+            row["id"] = eid
+            row["stack"] = stack
+            row["column"] = col["id"]
+            row["roots"] = sorted(mine)
+            row["not_created"] = len(_rows_of(graph.not_created, "subject", roots, mine))
+            row_by_id[eid] = row
+        rows_here = [row_by_id[e] for e in col["envs"]]
+        columns.append(
+            {
+                "id": col["id"],
+                "environments": list(col["envs"]),
+                "stacks": list(col["stacks"]),
+                "missing": list(col["missing"]),
+                "roots": roots,
+                "no_environment": bool(col.get("no_environment")),
+                "wired": any(r["wired"] for r in rows_here) if rows_here else True,
+                "not_created": len(graph.not_created),
+                **summary,
+            }
+        )
+    rows = [row_by_id[i] for i in (env_id(e, environments) for e in environments) if i in row_by_id]
     total_counts: dict[str, int] = {}
     total_uncertain: dict[str, int] = {}
-    for r in rows:
-        for t, n in r["counts"].items():
+    for c in columns:
+        for t, n in c["counts"].items():
             total_counts[t] = total_counts.get(t, 0) + n
-        for t, n in r["uncertain"].items():
+        for t, n in c["uncertain"].items():
             total_uncertain[t] = total_uncertain.get(t, 0) + n
     order = list(FRIENDLY)
     types = sorted(total_counts, key=order.index)
-    selected = [s["selected"] for s in stack_list or [] if s.get("selected")]
+    selected = [s["selected"] for s in stack_list if s.get("selected")]
     return {
         "active": active,
         "selected": selected or ([active] if active else []),
         "types": [{"type": t, "label": FRIENDLY[t][1]} for t in types],
+        "columns": columns,
         "environments": rows,
-        "inventory": inventory_rows([(r["id"], r["inventory"]) for r in rows]),
+        "inventory": inventory_rows([(c["id"], c["inventory"]) for c in columns]),
+        "library_roots": sorted(library_roots),
+        # optional: the sum over the columns (never part of the default views)
         "total": {
             "counts": {t: total_counts[t] for t in types},
             "uncertain": {t: total_uncertain[t] for t in types if t in total_uncertain},
-            "unknown_count": sum(r["unknown_count"] for r in rows),
-            "lambda_functions": sum(r["counts"].get("aws_lambda_function", 0) for r in rows),
-            "ecs_services": sum(r["counts"].get("aws_ecs_service", 0) for r in rows),
+            "unknown_count": sum(c["unknown_count"] for c in columns),
+            "lambda_functions": sum(c["counts"].get("aws_lambda_function", 0) for c in columns),
+            "ecs_services": sum(c["counts"].get("aws_ecs_service", 0) for c in columns),
         },
         "not_wired": [r["id"] for r in rows if not r["wired"]],
-        "skipped": [e["name"] for e in environments[MAX_ENVIRONMENTS:]],
+        "skipped": [c["id"] for c in columns_all[MAX_ENVIRONMENTS:]],
     }
 
 
 def env_count_lines(model: dict[str, Any]) -> list[dict[str, Any]]:
-    """Overview lines: the counts per environment (its tfvars applied), the total, and
-    each environment's remaining unknowns with the reason."""
+    """Overview lines: the counts per environment (one line per environment name, every
+    stack with its own tfvars; never a sum across environments), per stack when there
+    are several, and each environment's remaining unknowns with the reason."""
     analysis = model.get("environment_analysis")
     if not analysis or not analysis["environments"]:
         return []
     active = (model.get("environment") or {}).get("id")
+    selected = set(analysis.get("selected") or [])
+    rows = {r["id"]: r for r in analysis["environments"]}
+    columns = analysis.get("columns") or [
+        {"id": r["id"], "environments": [r["id"]], "stacks": [r.get("stack")], **r}
+        for r in analysis["environments"]
+    ]
     lines = []
-    for r in analysis["environments"]:
-        files = ", ".join(r["backend_hcl"] + r["var_files"]) or "no files"
-        mark = " (shown)" if r["id"] == active else ""
-        if not r.get("wired", True):
-            mark += " (not wired)"
-        lines.append(_line(f"{r['id']}{mark}: {env_counts_text(r)} — {files}", r["evidence"]))
-        lines += uncertain_lines(r)
-        for u in r["unknowns"]:
-            lines.append(
-                _line(
-                    f"unknown {u['subject']}.{u['attribute']} ({u['category']}): {u['reason']}",
-                    u["location"],
-                    1,
-                    node=u["subject"],
-                    status="unknown",
-                )
-            )
-        if r["unknown_count"] > len(r["unknowns"]):
-            more = r["unknown_count"] - len(r["unknowns"])
-            lines.append(_line(f"… {more} more unknowns", r["evidence"], 1, status="unknown"))
-    lines.append(_line(f"total: {env_counts_text(analysis['total'])}", None))
+    for c in columns:
+        mine = [rows[e] for e in c["environments"] if e in rows]
+        if len(mine) == 1 and not c.get("no_environment"):
+            lines += _row_lines(mine[0], active, selected, 0)
+            continue
+        stacks_text = ", ".join(c["stacks"]) or "no stack"
+        evidence = mine[0]["evidence"] if mine else None
+        lines.append(_line(f"{c['id']} ({stacks_text}): {env_counts_text(c)}", evidence))
+        if c.get("missing"):
+            lines.append(_line(f"no {c['id']} environment in: {', '.join(c['missing'])}", None, 1))
+        for r in mine:
+            lines += _row_lines(r, active, selected, 1)
+        if c.get("no_environment"):
+            lines += uncertain_lines(c)
     diffs = difference_lines(analysis)
     if diffs:
         lines.append(_line("differences between environments:", None))
@@ -525,6 +708,33 @@ def env_count_lines(model: dict[str, Any]) -> list[dict[str, Any]]:
                 status="skipped",
             )
         )
+    return lines
+
+
+def _row_lines(
+    r: dict[str, Any], active: str | None, selected: set[str], level: int
+) -> list[dict[str, Any]]:
+    """One environment of one stack: its counts and files, then its unknowns."""
+    files = ", ".join(r["backend_hcl"] + r["var_files"]) or "no files"
+    mark = " (shown)" if r["id"] == active or r["id"] in selected else ""
+    if not r.get("wired", True):
+        mark += " (not wired)"
+    label = r["id"] if not level else (r.get("stack") or r["id"])
+    lines = [_line(f"{label}{mark}: {env_counts_text(r)} — {files}", r["evidence"], level)]
+    lines += uncertain_lines(r, level + 1)
+    for u in r["unknowns"]:
+        lines.append(
+            _line(
+                f"unknown {u['subject']}.{u['attribute']} ({u['category']}): {u['reason']}",
+                u["location"],
+                level + 1,
+                node=u["subject"],
+                status="unknown",
+            )
+        )
+    if r["unknown_count"] > len(r["unknowns"]):
+        more = r["unknown_count"] - len(r["unknowns"])
+        lines.append(_line(f"… {more} more unknowns", r["evidence"], level + 1, status="unknown"))
     return lines
 
 

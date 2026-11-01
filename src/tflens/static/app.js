@@ -131,29 +131,34 @@
   }
 
   // ------------------------------------------------------------ environments
-  // One row per detected environment (its tfvars applied) and a total row; the shown
-  // environment is highlighted, its remaining unknowns listed with the reason.
+  // One row per environment name (dev | intg | uat | prod: every stack with its own
+  // tfvars), never a total across environments; the files of each stack's environment.
   function envCountsTable(envs) {
     const types = envs.types || [];
     const head = el("tr", {}, el("th", {}, "Environment"),
       ...types.map((t) => el("th", {}, t.label)), el("th", {}, "Unknowns"), el("th", {}, "Files"));
-    const rows = envs.environments.map((r) => {
-      const files = [...r.backend_hcl, ...r.var_files];
-      return el("tr", { class: r.id === envs.active ? "env-row active" : "env-row", "data-env": r.id },
-        el("td", {}, r.id),
-        ...types.map((t) => el("td", { class: r.uncertain[t.type] ? "num st-unknown" : "num",
-          title: r.uncertain[t.type] ? "blocks whose count is not known statically are not counted" : "" },
-          countText(r.counts[t.type] || 0, r.uncertain[t.type] || 0))),
-        el("td", { class: r.unknown_count ? "num st-unknown" : "num" }, String(r.unknown_count)),
+    const byId = new Map(envs.environments.map((r) => [r.id, r]));
+    const rows = envColumns(envs).map((c) => {
+      const files = (c.environments || [c.id]).flatMap((id) => {
+        const r = byId.get(id);
+        return r ? [...r.backend_hcl, ...r.var_files] : [];
+      });
+      const active = (c.environments || []).some((id) => isShown(envs, id));
+      return el("tr", { class: active ? "env-row active" : "env-row", "data-env": c.id },
+        el("td", {}, c.id),
+        ...types.map((t) => el("td", { class: c.uncertain[t.type] ? "num st-unknown" : "num",
+          title: c.uncertain[t.type] ? "blocks whose count is not known statically are not counted" : "" },
+          countText(c.counts[t.type] || 0, c.uncertain[t.type] || 0))),
+        el("td", { class: c.unknown_count ? "num st-unknown" : "num" }, String(c.unknown_count)),
         el("td", {}, ...files.flatMap((f, i) => [i ? ", " : "",
           locLink({ file: f, start_line: 1, end_line: 1 })])));
     });
-    const t = envs.total;
-    const total = el("tr", { class: "env-total" }, el("td", {}, el("strong", {}, "Total")),
-      ...types.map((x) => el("td", { class: "num" },
-        el("strong", {}, countText(t.counts[x.type] || 0, (t.uncertain || {})[x.type] || 0)))),
-      el("td", { class: "num" }, el("strong", {}, String(t.unknown_count))), el("td", {}, ""));
-    return el("table", { class: "env-counts" }, el("thead", {}, head), el("tbody", {}, ...rows, total));
+    return el("table", { class: "env-counts" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
+  // The inventory's columns: one per environment name (older models: one per row).
+  function envColumns(envs) {
+    return envs.columns && envs.columns.length ? envs.columns : envs.environments;
   }
 
   function envUnknowns(envs) {
@@ -200,8 +205,10 @@
       el("th", {}, "Environment shown"));
     const rows = envs.stacks.map((s) => {
       let pick;
-      if (!s.environments.length) {
-        pick = el("span", { class: "muted" }, "— (no environment detected)");
+      if (s.library) {
+        pick = el("span", { class: "muted" }, "— reusable module nothing calls: not deployed from here, not counted");
+      } else if (!s.environments.length) {
+        pick = el("span", { class: "st-unknown" }, `— ${s.no_env_reason || "no environment files found"}`);
       } else if (!envs.switchable) {
         pick = el("strong", {}, s.selected || "none (variable defaults)");
       } else {
@@ -217,6 +224,24 @@
         el("td", {}, s.layout), el("td", {}, pick));
     });
     return el("table", { class: "env-stacks" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
+  // Debug: per stack, every environment file found for it (tfvars, backend-<env>.hcl,
+  // environment directories, CI lines), accepted or not, and why; when none was
+  // accepted, why no environment was detected.
+  function envFilesDebug(envs) {
+    return el("div", { class: "env-debug" }, ...(envs.stacks || []).map((s) => {
+      const files = s.env_files || [];
+      const items = files.map((t) => el("li", { class: t.accepted ? "ov-line" : "ov-line st-unknown" },
+        el("span", { class: "tag" }, t.accepted ? "accepted " : "rejected "),
+        locLink({ file: t.file, start_line: 1, end_line: 1 }),
+        ` — ${t.kind}${t.env ? ` → ${t.env}` : ""}: ${t.reason}`));
+      if (s.no_env_reason) items.push(el("li", { class: "ov-line st-unknown" }, `No environment: ${s.no_env_reason}`));
+      if (!items.length) items.push(el("li", { class: "ov-line muted" }, "no environment files"));
+      const title = `${s.id}${s.library ? " (reusable module, not deployed from here)" : ""} — ${s.environments.length} environment(s), ${files.filter((t) => t.accepted).length} file(s) accepted`;
+      return el("details", { class: "drilldown", "data-stack": s.id, open: s.environments.length ? null : "" },
+        el("summary", { class: "mono" }, title), el("ul", { class: "overview-lines" }, ...items));
+    }));
   }
 
   function stackLinksList(envs) {
@@ -324,6 +349,8 @@
       const only = row.only[it.id];
       parts.push(el("div", { class: `inv-item${it.created === null ? " uncertain" : ""}` },
         el("strong", {}, it.name), " ", link(it.id, () => showDetail("node", it.id)), " ", locLink(it.location),
+        it.stack || it.env ? el("div", { class: "tag" }, `stack ${it.stack || "—"} · env ${it.env || "none (variable defaults)"}`) : null,
+        it.via && it.via.length ? el("div", { class: "tag" }, "via ", ...it.via.flatMap((m, i) => [i ? " → " : "", m.id, " ", locLink(m.location)])) : null,
         el("div", { class: "tag" }, it.created === null ? "count not known" : `${it.created} instance${it.created === 1 ? "" : "s"}`,
           only ? ` · only in ${only.join(", ")}` : ""),
         it.why ? el("div", {}, el("div", { class: "tag" }, "Why counted:"), whySteps(it.why)) : null));
@@ -334,7 +361,8 @@
 
   function inventoryGrid(envs) {
     const perEnv = envs.inventory_columns === "environments";
-    const cols = perEnv ? envs.environments.map((r) => [r.id, r.inventory, r.wired]) : [["", envs.current.inventory, true]];
+    // one column per environment name (dev | intg | uat | prod), never a total column
+    const cols = perEnv ? envColumns(envs).map((c) => [c.id, c.inventory, c.wired !== false]) : [["", envs.current.inventory, true]];
     const head = el("tr", {}, el("th", {}, "Service"),
       ...cols.map(([id, , wired]) => el("th", { class: wired ? "num" : "num st-unknown", title: wired ? "" : "not wired" },
         id || (envs.active ? envs.active : "shown (variable defaults)"))));
@@ -370,8 +398,10 @@
       parts.push(el("h2", { id, class: "rv-section" }, title), ...content);
     };
     if (!envs.environments.length) {
-      parts.push(el("p", { class: "muted" },
-        "No environment detected (no env/*.tfvars, backend .hcl per environment, env directories or CI -var-file / -backend-config lines): the inventory below is the code with the variables' defaults."));
+      const why = (envs.stacks || []).filter((s) => s.no_env_reason).map((s) => `${s.id}: ${s.no_env_reason}`);
+      parts.push(el("p", { class: "st-unknown" },
+        "No environment found for any stack — the inventory below is the code with the variables' defaults. Why, per stack:"),
+        el("ul", { class: "overview-lines" }, ...(why.length ? why : ["no stack (no root module) found"]).map((w) => el("li", { class: "ov-line" }, w))));
     } else if (multiStack(envs)) {
       parts.push(el("p", {}, `Shown: ${(envs.selected || []).join(", ") || "no environment (variable defaults)"}. Every stack is analyzed with its own environment: pick one per stack below. The flows, the Root view and the graph follow these selections.`));
     } else {
@@ -382,6 +412,11 @@
       section("env-stacks", `Stacks (${envs.stacks.length})`,
         el("p", { class: "muted" }, "Each root with its own state is a stack; its environments are the tfvars / backend configurations bound to it (the nearest root above them)."),
         stacksTable(envs));
+    }
+    if ((envs.stacks || []).length) {
+      section("env-debug", "Environment files per stack (debug)",
+        el("p", { class: "muted" }, "Every tfvars / backend-<env>.hcl / environment directory / CI line found at any depth below each stack, accepted or rejected, and why. The environment name is the file stem."),
+        envFilesDebug(envs));
     }
     if ((envs.stack_links || []).length) {
       section("env-links", "Links between stacks (remote state)", stackLinksList(envs));
