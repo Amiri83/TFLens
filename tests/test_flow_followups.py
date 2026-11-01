@@ -4,9 +4,11 @@ table-a; a VPC, subnet and group with two rules from one CIDR).
 
 * a compute is expanded in exactly one flow; every other flow that reaches it ends in a
   "continues in Flow N" link;
-* steps between the same two nodes are drawn in lanes of their own, each labelled;
-* the Network diagram puts what is outside the VPC in the leftmost column, and its
-  containment lines never cross a box.
+* steps between the same two nodes are drawn in lanes of their own, each labelled, and
+  every step's label sits on its own edge;
+* the Network diagram is three columns (outside | security groups | resources), its only
+  lines the security group rules, none crossing a box; VPCs and subnets are frames, and
+  each resource's box lists its subnets and groups.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from tflens.flow import (
     parallel_lanes,
     render_flows_markdown,
 )
-from tflens.tabdiagrams import EXTERNAL, VPC, network_diagram, tab_svg
+from tflens.tabdiagrams import EXTERNAL, GROUP, PLACED, SG_TYPES, network_diagram, tab_svg
 
 FIXTURE = "flow_followups"
 LAMBDA_A, LAMBDA_B = "aws_lambda_function.lambda-a", "aws_lambda_function.lambda-b"
@@ -187,7 +189,101 @@ def test_two_rules_from_one_cidr_get_their_own_lanes():
     assert ">1. ingress tcp 443</text>" in svg and ">2. ingress tcp 80</text>" in svg
 
 
-# -- 3. the Network diagram's layout ---------------------------------------------------------
+# -- 3. every label on its own edge ----------------------------------------------------------
+
+
+def _label_rect(svg, n):
+    m = re.search(
+        rf'<g data-step="{n}"[^>]*><title>[^<]*</title><rect x="(-?\d+)" y="(-?\d+)" '
+        rf'width="(\d+)" height="(\d+)"',
+        svg,
+    )
+    assert m, n
+    return tuple(int(v) for v in m.groups())
+
+
+def _curve_points(p, k=200):
+    """Points along a cubic ``M x1,y1 C c1 c2 x2,y2``."""
+    x1, y1, ax, ay, bx, by, x2, y2 = p
+    out = []
+    for i in range(k + 1):
+        t = i / k
+        u = 1 - t
+        out.append(
+            (
+                u**3 * x1 + 3 * u * u * t * ax + 3 * u * t * t * bx + t**3 * x2,
+                u**3 * y1 + 3 * u * u * t * ay + 3 * u * t * t * by + t**3 * y2,
+            )
+        )
+    return out
+
+
+def _touches(rect, points, slack=2):
+    x, y, w, h = rect
+    return any(
+        x - slack <= px <= x + w + slack and y - slack <= py <= y + h + slack for px, py in points
+    )
+
+
+def _check_labels_on_their_edges(svg):
+    steps = sorted({int(n) for n in re.findall(r'<g data-step="(\d+)"', svg)})
+    for n in steps:
+        _, p = _path(svg, n)
+        assert len(p) == 8, (n, p)  # a cubic
+        assert _touches(_label_rect(svg, n), _curve_points(p)), n
+    return steps
+
+
+def test_parallel_labels_touch_their_own_lane_only():
+    c = _chain("aws_sqs_queue.queue-a")
+    svg = chain_svg(_model(FIXTURE), c["id"])
+    (_, p2), (_, p3) = _path(svg, 2), _path(svg, 3)
+    r2, r3 = _label_rect(svg, 2), _label_rect(svg, 3)
+    # "3. reads from" on the reads-from lane, "2. sends to" on the sends-to lane
+    assert _touches(r3, _curve_points(p3)) and not _touches(r3, _curve_points(p2), slack=0)
+    assert _touches(r2, _curve_points(p2)) and not _touches(r2, _curve_points(p3), slack=0)
+    # and within the span of the edge, between the two boxes
+    for r, p in ((r2, p2), (r3, p3)):
+        assert p[0] <= r[0] and r[0] + r[2] <= p[6]
+
+
+def test_every_flow_label_touches_its_edge():
+    for fixture in (FIXTURE, "flows_per_compute", "kafka_flow", "app_flows", "app_pipeline"):
+        for c in _flows(fixture)["chains"]:
+            svg = chain_svg(_model(fixture), c["id"])
+            _check_labels_on_their_edges(svg)
+    for fixture in (FIXTURE, "flows_per_compute"):
+        for name in ("network", "iam"):
+            _check_labels_on_their_edges(tab_svg(_model(fixture), name))
+
+
+def test_more_than_two_parallel_labels_touch_their_own_edges():
+    chain = {
+        "n": 1,
+        "title": "t",
+        "nodes": [
+            {"id": "a", "label": "a", "kind_label": "k", "depth": 0, "role": "entry"},
+            {"id": "b", "label": "b", "kind_label": "k", "depth": 1, "role": "target"},
+        ],
+        "steps": [
+            {
+                "n": i,
+                "source": "a",
+                "target": "b",
+                "kind": "read" if i % 2 else "send",
+                "status": "verified",
+                "verb": "reads from" if i % 2 else "sends to",
+                "text": f"{i}. a b",
+            }
+            for i in (1, 2, 3, 4)
+        ],
+    }
+    svg = flow_svg(chain)
+    assert _check_labels_on_their_edges(svg) == [1, 2, 3, 4]
+    assert flow_svg(chain) == svg
+
+
+# -- 4. the Network diagram's layout ---------------------------------------------------------
 
 
 def _boxes(svg):
@@ -232,45 +328,116 @@ def _check_containment_clear_of_boxes(svg):
     return paths
 
 
-def test_external_cidr_is_the_leftmost_column():
+def _boxes_by_id(svg):
+    return {
+        nid: tuple(int(v) for v in rect)
+        for nid, *rect in re.findall(
+            r'<g><title>([^ <]+) [^<]*</title><rect x="(\d+)" y="(\d+)" width="(\d+)" '
+            r'height="(\d+)"',
+            svg,
+        )
+    }
+
+
+def _frames(svg):
+    return {
+        fid: tuple(int(v) for v in rect)
+        for fid, *rect in re.findall(
+            r'<g class="frame" data-frame="([^"]+)"><title>[^<]*</title><rect x="(\d+)" '
+            r'y="(\d+)" width="(\d+)" height="(\d+)"',
+            svg,
+        )
+    }
+
+
+def _inside(inner, outer):
+    ix, iy, iw, ih = inner
+    ox, oy, ow, oh = outer
+    return ox < ix and oy < iy and ix + iw < ox + ow and iy + ih < oy + oh
+
+
+def test_three_columns_outside_groups_resources():
     dg = network_diagram(_model(FIXTURE))
     depth = {n["label"]: n["depth"] for n in dg["nodes"]}
-    assert depth == {
-        "192.0.2.0/24": EXTERNAL,
-        "vpc-a": VPC,
-        "subnet-a": 2,
-        "sg-a": 3,
-        "lambda-a": 4,
-    }
-    assert EXTERNAL < VPC
+    assert depth == {"192.0.2.0/24": EXTERNAL, "sg-a": GROUP, "lambda-a": PLACED}
+    assert (EXTERNAL, GROUP, PLACED) == (0, 1, 2)
+    ids = {n["label"]: n["id"] for n in dg["nodes"]}
+    boxes = _boxes_by_id(tab_svg(_model(FIXTURE), "network"))
+    x = {name: boxes[ids[name]][0] for name in depth}
+    assert x["192.0.2.0/24"] < x["sg-a"] < x["lambda-a"]
+    # what is outside is lined up with the group it reaches
+    assert boxes[ids["192.0.2.0/24"]][1] == boxes[ids["sg-a"]][1]
+
+
+def test_vpc_and_subnets_are_frames_around_what_is_in_them():
+    dg = network_diagram(_model(FIXTURE))
+    assert [(f["id"], f["parent"]) for f in dg["frames"]] == [
+        ("aws_vpc.vpc-a", None),
+        ("aws_subnet.subnet-a", "aws_vpc.vpc-a"),
+    ]
     svg = tab_svg(_model(FIXTURE), "network")
-    x = {
-        name: int(m.group(1))
-        for name in depth
-        if (m := re.search(rf'<rect x="(\d+)"[^>]*/><text[^>]*>{re.escape(name)}</text>', svg))
-    }
-    assert x["192.0.2.0/24"] < x["vpc-a"] < x["subnet-a"] < x["sg-a"] < x["lambda-a"]
-    assert x["192.0.2.0/24"] == min(x.values())
+    boxes, frames = _boxes_by_id(svg), _frames(svg)
+    vpc, subnet = frames["aws_vpc.vpc-a"], frames["aws_subnet.subnet-a"]
+    sg, fn = boxes["aws_security_group.sg-a"], boxes[LAMBDA_A]
+    cidr = next(b for nid, b in boxes.items() if nid not in (LAMBDA_A, "aws_security_group.sg-a"))
+    assert _inside(subnet, vpc) and _inside(fn, subnet)
+    assert _inside(sg, vpc) and not _inside(sg, subnet)
+    assert cidr[0] + cidr[2] < vpc[0]  # outside is outside
+    # each frame named, with its code reference; drawn under the boxes, rules over them
+    assert ">vpc-a</text>" in svg and ">subnet-a</text>" in svg
+    assert re.search(r">subnet · main\.tf:\d+-\d+</text>", svg)
+    first_box = svg.index("<g><title>")
+    assert svg.rindex('class="frame"') < first_box < svg.index('<path data-step="1"')
+    # the resource's box says where it is and what guards it
+    meta = {n["id"]: n["meta"] for n in dg["nodes"]}
+    assert meta[LAMBDA_A] == "subnet-a / sg-a"
+    assert ' class="meta">subnet-a / sg-a</text>' in svg
+    assert fn[3] > sg[3]  # the box grows a line for it
 
 
-def test_containment_lines_go_around_the_boxes():
+def test_network_has_no_containment_steps_only_rule_lines():
+    for fixture in (FIXTURE, "flows_per_compute"):
+        model = _model(fixture)
+        dg = network_diagram(model)
+        edges = {e["id"]: e for e in model["edges"]}
+        types = {n["id"]: n["type"] for n in model["nodes"]}
+        assert dg["steps"], fixture
+        for s in dg["steps"]:
+            assert s["kind"] == "rule" and not s["quiet"], s
+            assert s["verb"] not in ("contains", "has in it", "guards"), s
+            e = edges[s["evidence"][0]["edge"]]
+            assert e["kind"] == "NETWORK" and "direction" in e["attributes"], e
+            assert types.get(s["source"]) in SG_TYPES or types.get(s["target"]) in SG_TYPES
+        svg = tab_svg(model, "network")
+        assert 'class="contains"' not in svg
+        drawn = sorted({int(n) for n in re.findall(r'<path data-step="(\d+)"', svg)})
+        assert drawn == [s["n"] for s in dg["steps"]]
+
+
+def test_no_rule_line_passes_through_a_box():
     for fixture in (FIXTURE, "flows_per_compute"):
         svg = tab_svg(_model(fixture), "network")
-        paths = _check_containment_clear_of_boxes(svg)
-        if fixture == FIXTURE:
-            # vpc-a -> sg-a and subnet-a -> lambda-a skip a column: along the bottom
-            bottom = max(b[1] + b[3] for b in _boxes(svg))
-            assert sum(1 for d in paths if max(s[1] for s in _segments(d)) > bottom) == 2
-    iam = tab_svg(_model("flows_per_compute"), "iam")
-    _check_containment_clear_of_boxes(iam)
+        boxes = list(_boxes_by_id(svg).values())
+        steps = sorted({int(n) for n in re.findall(r'<path data-step="(\d+)"', svg)})
+        assert steps
+        for n in steps:
+            _, p = _path(svg, n)
+            for px, py in _curve_points(p):
+                hit = [b for b in boxes if b[0] < px < b[0] + b[2] and b[1] < py < b[1] + b[3]]
+                assert not hit, (fixture, n, (px, py), hit)
 
 
-def test_rule_lines_are_drawn_over_the_boxes():
-    svg = tab_svg(_model(FIXTURE), "network")
-    last_box = max(m.start() for m in re.finditer(r"<g><title>", svg))
-    first_rule = svg.index('<path data-step="1"')
-    last_contains = max(m.start() for m in re.finditer('class="contains"', svg))
-    assert last_contains < last_box < first_rule
+def test_public_rules_keep_their_red():
+    svg = tab_svg(_model("flows_per_compute"), "network")
+    # 1 and 4 reach / come from 0.0.0.0/0; 2 and 3 do not
+    for n, colour in ((1, "#cf222e"), (2, "#bc4c00"), (3, "#bc4c00"), (4, "#cf222e")):
+        assert re.search(rf'<path data-step="{n}"[^>]* stroke="{colour}"', svg), n
+    assert svg.count(">(public)</text>") == 2
+    assert ">public rule</text>" in svg
+
+
+def test_iam_containment_still_goes_around_the_boxes():
+    _check_containment_clear_of_boxes(tab_svg(_model("flows_per_compute"), "iam"))
 
 
 def test_deterministic():

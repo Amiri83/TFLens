@@ -11,7 +11,8 @@ stated in words:
   (what it creates, the outputs it exposes, who reads them, per environment);
 * **network**: VPCs, subnets, security groups, endpoints, transit gateways -> the
   **Network** view (VPC -> subnets -> endpoints / security groups, what can reach what,
-  and a diagram: VPC -> subnets -> security groups -> resources, the rules labelled);
+  and a diagram: outside -> security groups -> resources in VPC / subnet frames, the
+  rules labelled);
 * **module library**: no backend, no provider configuration, nothing calls it -> the
   **Module catalog** (inputs, outputs, resources, example usage, who calls it);
 * **other**: none of the above (a composition of remote modules, a data store, ...) ->
@@ -528,8 +529,10 @@ def build_root_view(model: dict[str, Any], root: str, view: str = "") -> dict[st
         out["sections"] = iam_sections(sub)
     else:
         out["sections"] = catalog_sections(model, entry, sub)
-    if view in DIAGRAM_VIEWS and TAB_DIAGRAMS[view][0](sub)["nodes"]:
-        out["diagram"] = view  # api/diagram?name=<view>&root=<dir>
+    if view in DIAGRAM_VIEWS:
+        dg = TAB_DIAGRAMS[view][0](sub)
+        if dg["nodes"] or dg.get("frames"):  # a VPC with nothing in it is still a frame
+            out["diagram"] = view  # api/diagram?name=<view>&root=<dir>
     return out
 
 

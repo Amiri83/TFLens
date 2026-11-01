@@ -902,6 +902,11 @@ def render_flows_markdown(flows: dict[str, Any], level: int = 1) -> str:
 FONT = "Helvetica, Arial, sans-serif"
 NODE_W, NODE_H, SIDE_H = 240, 80, 72
 COL_GAP, ROW_GAP, PAD = 210, 26, 24
+META_H = 22  # a box's summary line (the Network diagram's "subnet-a / sg-a, sg-b")
+FRAME_HEAD, FRAME_PAD = 48, 12  # a frame's name and code reference; its margin
+FRAME_FILL = ("#f6f8fa", "#ffffff")  # by nesting level: VPC, subnet
+# where a step's label may sit along its own edge, best first
+LABEL_TS = (0.5, 0.42, 0.58, 0.34, 0.66, 0.26, 0.74, 0.18, 0.82)
 STYLE = {  # (kind, status) -> colour, dash
     ("trigger", ""): ("#bc4c00", ""),
     ("send", "verified"): ("#1a7f37", ""),
@@ -955,6 +960,114 @@ def _t(
     return f'<text x="{x:.0f}" y="{y:.0f}" font-size="{size}" fill="{fill}"{extra}>{escape(text)}</text>'
 
 
+def _bezier(p: tuple[float, ...], t: float) -> tuple[float, float]:
+    """The point at ``t`` of the cubic ``x1, y1, c1x, c1y, c2x, c2y, x2, y2``."""
+    x1, y1, ax, ay, bx, by, x2, y2 = p
+    u = 1 - t
+    return (
+        u**3 * x1 + 3 * u * u * t * ax + 3 * u * t * t * bx + t**3 * x2,
+        u**3 * y1 + 3 * u * u * t * ay + 3 * u * t * t * by + t**3 * y2,
+    )
+
+
+def _free(p: tuple[float, float], w: float, h: float, taken: list[tuple[float, ...]]) -> bool:
+    """Is a ``w`` x ``h`` label at ``p`` clear of every (left, right, top, bottom)?"""
+    x, y = p
+    return not any(x < b[1] and b[0] < x + w and y < b[3] and b[2] < y + h for b in taken)
+
+
+def _node_h(n: dict[str, Any]) -> float:
+    return NODE_H + META_H if n.get("meta") else NODE_H
+
+
+def _col_x(depth: int) -> float:
+    return PAD + depth * (NODE_W + COL_GAP)
+
+
+def framed_layout(
+    chain: dict[str, Any], main: list[dict[str, Any]], top: float
+) -> tuple[dict[str, tuple[float, float, float, float]], list[tuple[Any, ...]], float]:
+    """Box positions for a diagram drawn in frames (the Network diagram's VPCs and
+    subnets): each top-level frame is a band across the columns it spans, its nodes
+    stacked in their columns and its child frames nested below them; the nodes in no
+    frame follow, except those of the leftmost column (what is outside), each lined up
+    with what it connects to. Returns the positions, the frames (frame, level, x, y, w, h;
+    outer first) and the bottom."""
+    ids = {f["id"] for f in chain["frames"]}
+    kids: dict[str | None, list[dict[str, Any]]] = {}
+    for f in chain["frames"]:
+        kids.setdefault(f.get("parent") if f.get("parent") in ids else None, []).append(f)
+    members: dict[str | None, list[dict[str, Any]]] = {}
+    for n in main:
+        members.setdefault(n.get("frame") if n.get("frame") in ids else None, []).append(n)
+    pos: dict[str, tuple[float, float, float, float]] = {}
+    rects: list[tuple[Any, ...]] = []
+
+    def span(f: dict[str, Any]) -> list[int]:
+        ds = [*f["columns"], *(n["depth"] for n in members.get(f["id"], []))]
+        for k in kids.get(f["id"], []):
+            ds += span(k)
+        return [min(ds), max(ds)]
+
+    def nesting(f: dict[str, Any]) -> int:
+        return 1 + max((nesting(k) for k in kids.get(f["id"], [])), default=0)
+
+    def stack(nodes: list[dict[str, Any]], col_y: dict[int, float]) -> None:
+        for n in nodes:
+            d, h = n["depth"], _node_h(n)
+            pos[n["id"]] = (_col_x(d), col_y[d], NODE_W, h)
+            col_y[d] += h + ROW_GAP
+
+    def place(f: dict[str, Any], y: float, level: int) -> float:
+        lo, hi = span(f)
+        inset = FRAME_PAD * nesting(f)
+        i = len(rects)
+        rects.append(())  # the frame before what is in it: drawn under it
+        col_y = dict.fromkeys(range(lo, hi + 1), y + FRAME_HEAD)
+        stack(members.get(f["id"], []), col_y)
+        for k in kids.get(f["id"], []):
+            klo, khi = span(k)
+            kb = place(k, max(col_y[d] for d in range(klo, khi + 1)), level + 1)
+            for d in range(klo, khi + 1):
+                col_y[d] = kb + ROW_GAP
+        b = max(y + FRAME_HEAD, max(col_y.values()) - ROW_GAP) + FRAME_PAD
+        x = _col_x(lo) - inset
+        rects[i] = (f, level, x, y, _col_x(hi) + NODE_W + inset - x, b - y)
+        return b
+
+    lead = min((n["depth"] for n in main), default=0)
+    framed_lead = any(n["depth"] == lead for f in ids for n in members.get(f, [])) or any(
+        span(f)[0] <= lead for f in chain["frames"]
+    )
+    loose = members.get(None, [])
+    outside = [] if framed_lead else [n for n in loose if n["depth"] == lead]
+    y = float(top)
+    for f in kids.get(None, []):
+        y = place(f, y, 0) + ROW_GAP
+    col_y = {n["depth"]: y for n in loose}
+    stack([n for n in loose if n not in outside], col_y)
+    bottom = max([y, *col_y.values()])
+    centre = {nid: p[1] + p[3] / 2 for nid, p in pos.items()}
+
+    def want(n: dict[str, Any]) -> float:
+        ys = [
+            centre[o]
+            for s in chain["steps"]
+            for a, o in ((s["source"], s["target"]), (s["target"], s["source"]))
+            if a == n["id"] and o in centre
+        ]
+        return sum(ys) / len(ys) - _node_h(n) / 2 if ys else float(top)
+
+    y = float(top)
+    for n in sorted(outside, key=want):  # stable: ties keep the diagram's order
+        h = _node_h(n)
+        ny = max(want(n), y)
+        pos[n["id"]] = (_col_x(lead), ny, NODE_W, h)
+        y = ny + h + ROW_GAP
+        bottom = max(bottom, y)
+    return pos, rects, bottom
+
+
 def parallel_lanes(steps: list[dict[str, Any]]) -> dict[int, tuple[int, int]]:
     """Step number -> (lane, lanes) for steps that share their source and target with
     another (a compute that reads and writes one table, two rules between two groups),
@@ -973,7 +1086,9 @@ def flow_svg(
     """One chain, left to right by step depth, at natural size (every font >= 14px).
     Side branches and context (what a compute runs in / as) hang below the node they
     belong to. Every box shows its code reference (``file:line``). Also draws the
-    Network and IAM tab diagrams (same shape: nodes with a depth, numbered steps)."""
+    Network and IAM tab diagrams (same shape: nodes with a depth, numbered steps); a
+    diagram with ``frames`` (the Network one) has its boxes laid out in them
+    (:func:`framed_layout`), and a node's ``meta`` is a summary line in its box."""
     hung = ("side", "context")
     main = [n for n in chain["nodes"] if n["role"] not in hung]
     side: dict[str, list[dict[str, Any]]] = {}
@@ -1004,14 +1119,40 @@ def flow_svg(
             y = place_side(s["id"], x, y + SIDE_H + ROW_GAP)
         return y
 
-    for d in sorted(cols):
-        x = PAD + d * (NODE_W + COL_GAP)
-        y = float(top)
-        for n in cols[d]:
-            pos[n["id"]] = (x, y, NODE_W, NODE_H)
-            y = place_side(n["id"], x, y + NODE_H + ROW_GAP)
-        bottom = max(bottom, y)
+    frames: list[tuple[Any, ...]] = []
+    if chain.get("frames") is not None:  # boxes in nested frames (no side boxes there)
+        pos, frames, bottom = framed_layout(chain, main, top)
+    else:
+        for d in sorted(cols):
+            x = _col_x(d)
+            y = float(top)
+            for n in cols[d]:
+                h = _node_h(n)
+                pos[n["id"]] = (x, y, NODE_W, h)
+                y = place_side(n["id"], x, y + h + ROW_GAP)
+            bottom = max(bottom, y)
     width = PAD * 2 + (max(cols) + 1 if cols else 1) * (NODE_W + COL_GAP) - COL_GAP
+    for f, level, x, y, w, h in frames:
+        width = max(width, x + w + PAD)
+        ref = f.get("code_ref")
+        ref_text = location_label(ref) if ref else "no code reference"
+        dash = ' stroke-dasharray="6 4"' if level else ""
+        body.append(
+            f'<g class="frame" data-frame="{escape(f["id"])}">'
+            f"<title>{escape(f['id'])} ({escape(ref_text)})</title>"
+            f'<rect x="{x:.0f}" y="{y:.0f}" width="{w:.0f}" height="{h:.0f}" rx="10" '
+            f'fill="{FRAME_FILL[min(level, 1)]}" stroke="{ROLE_STROKE["network"]}" '
+            f'stroke-width="1.5"{dash}/>'
+            + _t(x + 10, y + 20, _cut(f["label"], w - 20, 14), 14, extra=' font-weight="700"')
+            + _t(
+                x + 10,
+                y + 38,
+                _cut(f"{f['kind_label']} · {ref_text}", w - 20, 14),
+                14,
+                "#57606a",
+            )
+            + "</g>"
+        )
     nodes_svg = []
     for n in chain["nodes"]:
         if n["id"] not in pos:
@@ -1022,8 +1163,14 @@ def flow_svg(
         name_size = 14 if n["role"] in hung else 16
         ref = n.get("code_ref", n.get("location"))
         ref_text = location_label(ref) if ref else "no code reference"
+        meta = n.get("meta") or ""
+        meta_svg = (
+            _t(x + 12, y + 70, _cut(meta, w - 24, 14), 14, extra=' class="meta"') if meta else ""
+        )
         nodes_svg.append(
-            f"<g><title>{escape(n['id'])} ({escape(ref_text)})</title>"
+            f"<g><title>{escape(n['id'])} ({escape(ref_text)})"
+            + (f" — {escape(meta)}" if meta else "")
+            + "</title>"
             f'<rect x="{x:.0f}" y="{y:.0f}" width="{w:.0f}" '
             f'height="{h:.0f}" rx="8" fill="#ffffff" stroke="{stroke}" stroke-width="2"{dash}/>'
             + _t(
@@ -1040,9 +1187,10 @@ def flow_svg(
                 14,
                 "#57606a",
             )
+            + meta_svg
             + _t(
                 x + 12,
-                y + (62 if h == SIDE_H else 70),
+                y + (62 if h == SIDE_H else 92 if meta else 70),
                 _cut(ref_text, w - 24, 14),
                 14,
                 "#0969da",
@@ -1053,7 +1201,8 @@ def flow_svg(
     drawn = [s for s in chain["steps"] if s["source"] in pos and s["target"] in pos]
     lanes = parallel_lanes([s for s in drawn if not s.get("quiet")])
     quiet_svg, edges_svg, labels_svg = [], [], []
-    placed: list[tuple[float, float, float, float]] = []
+    placed: list[tuple[float, ...]] = []
+    boxes = [(bx, bx + bw, by, by + bh) for bx, by, bw, bh in pos.values()]
     routed = 0  # quiet edges sent along the bottom, each in its own lane
     for s in drawn:
         sx, sy, _, sh = pos[s["source"]]
@@ -1091,7 +1240,7 @@ def flow_svg(
                 x1, x2, c1, c2 = sx + NODE_W, tx + NODE_W, sx + NODE_W + 90, tx + NODE_W + 90
             cy1, cy2 = y1 + 2 * o, y2 + 2 * o
             d = f"M{x1:.0f},{y1:.0f} C{c1:.0f},{cy1:.0f} {c2:.0f},{cy2:.0f} {x2:.0f},{y2:.0f}"
-            mx, my = (x1 + 3 * c1 + 3 * c2 + x2) / 8, (y1 + 3 * cy1 + 3 * cy2 + y2) / 8
+            curve = (x1, y1, c1, cy1, c2, cy2, x2, y2)
         dash_attr = f' stroke-dasharray="{dash}"' if dash else ""
         marker = (
             f' marker-start="url(#fa-{s["n"]})"'
@@ -1108,21 +1257,26 @@ def flow_svg(
         )
         if s.get("quiet"):  # the boxes say enough
             continue
-        # the label sits in the gap just before the target: one per incoming step, stacked;
-        # a parallel step's on the middle of its own lane
+        # the label sits on its own edge (its own lane, for a parallel step): at the middle,
+        # or slid along the edge clear of the boxes and of the labels already placed; a
+        # loop's label may also lean right of the column it loops around
         line1 = f"{s['n']}. {s['verb'].split(' (')[0]}"
         line2 = {"unverified": "(unverified)", "iam_only": "(IAM only)", "public": "(public)"}.get(
             s["status"], ""
         )
         lw = max(_w(line1, 14), _w(line2, 14)) + 10
         lh = 40 if line2 else 22
-        if m > 1:
-            lx, ly = mx - lw / 2, my - lh / 2
-        else:
-            lx = x2 - 10 - lw if tx > sx else x2 + 10 if leftward else x1 + 20
-            ly = y2 - lh - 4
-        while any(lx < b[1] and b[0] < lx + lw and ly < b[3] and b[2] < ly + lh for b in placed):
-            ly -= lh + 4
+        loop = tx <= sx and not leftward
+        spots = []
+        for t in LABEL_TS:
+            px, py = _bezier(curve, t)
+            for lx in (px - lw / 2, x1 + 4, px - 6) if loop else (px - lw / 2,):
+                if lx <= px <= lx + lw:  # on the edge, always
+                    spots.append((lx, py - lh / 2))
+        lx, ly = next(
+            (p for p in spots if _free(p, lw, lh, placed + boxes)),
+            next((p for p in spots if _free(p, lw, lh, placed)), spots[0]),
+        )
         placed.append((lx, lx + lw, ly, ly + lh))
         labels_svg.append(
             f'<g data-step="{s["n"]}"{lane_attr}><title>{escape(s["text"])}</title>'
