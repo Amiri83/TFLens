@@ -14,6 +14,7 @@ from conftest import FIXTURES
 
 from tflens.cli import main
 from tflens.output import dumps, run_analysis
+from tflens.pipeline import discover
 from tflens.report import render_report
 from tflens.server import is_loopback
 from tflens.snippets import format_snippet, snippet_lines
@@ -53,7 +54,7 @@ def test_model_is_regenerated_when_missing(repo, api):
     assert path.is_file()
     assert summary["generated"] is True
     assert summary["model_path"] == str(path)
-    assert json.loads(path.read_text()) == run_analysis(repo).model
+    assert json.loads(path.read_text()) == discover(repo).model
 
 
 def test_existing_model_is_read_and_reloaded_on_change(repo, tmp_path):

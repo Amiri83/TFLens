@@ -181,3 +181,29 @@ details.drilldown > summary { cursor: pointer; font-weight: 600; }
 .shape-other { background: #57606a; }
 #root-list .shape-group { margin-top: 6px; text-transform: uppercase; }
 #root-list .root-link.active { font-weight: 600; }
+
+/* Discover progress screen (discover.js) */
+.discover-modal { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: flex-start; justify-content: center; padding-top: 6vh; background: rgba(31, 35, 40, .45); }
+.discover-modal[hidden] { display: none; }
+.discover-box { width: min(46rem, 94vw); max-height: 86vh; overflow: auto; padding: 16px 20px; background: #fff; color: #1f2328; border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .25); }
+.discover-box h2 { margin: 0 0 8px; font-size: 18px; }
+.discover-phases { margin: 0 0 8px; padding-left: 0; list-style: none; }
+.discover-phases .phase { padding: 3px 6px; border-left: 4px solid #d0d7de; margin-bottom: 2px; }
+.discover-phases .phase.current { border-left-color: #0969da; background: #ddf4ff; font-weight: 600; }
+.discover-phases .phase-done { border-left-color: #1a7f37; }
+.discover-phases .phase-off, .discover-phases .phase-skipped, .discover-phases .phase-not-run { color: #57606a; }
+.discover-phases .phase-cancelled, .discover-phases .phase-failed { border-left-color: #cf222e; }
+.discover-phases .phase-status { font-size: 12px; color: #57606a; font-weight: normal; }
+.discover-now { margin: 6px 0; font-size: 13px; }
+.discover-log { height: 14rem; margin: 0; padding: 6px 8px; overflow: auto; font-size: 12px; white-space: pre-wrap; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; }
+.discover-messages { margin: 8px 0 0; padding-left: 0; list-style: none; }
+.discover-actions { display: flex; gap: 8px; justify-content: flex-end; margin: 10px 0 0; }
+.discover-badge { position: fixed; right: 16px; bottom: 16px; z-index: 999; padding: 6px 12px; border-radius: 16px; background: #0969da; color: #fff; border: 0; cursor: pointer; max-width: 30rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.discover-badge[hidden] { display: none; }
+.discover-form { display: inline-flex; align-items: center; gap: 6px; }
+.discover-form.hidden { display: none; }
+.st-confirmed { color: #1a7f37; font-weight: 600; }
+.st-hint-only { color: #9a6700; font-weight: 600; }
+.st-contradicted { color: #cf222e; font-weight: 600; }
+table.validation td { vertical-align: top; }
+pre.discovery-tree { max-width: none; max-height: 70vh; overflow: auto; }

@@ -17,6 +17,7 @@ repository-relative paths): per environment the counts of the resource types peo
 from __future__ import annotations
 
 import posixpath
+from collections.abc import Callable
 from typing import Any
 
 from .analyze import analyze
@@ -554,8 +555,11 @@ def analyze_environments(
     active: str | None = None,
     stack_list: list[dict[str, Any]] | None = None,
     library_roots: set[str] | frozenset[str] = frozenset(),
+    step: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     """The ``environment_analysis`` section (None when no environment was detected).
+    ``step`` (when given) is called before each column is analyzed: progress, and the
+    point where a cancelled run stops.
 
     ``columns``: one per environment name, every stack that has it analyzed together with
     its own tfvars (``dev`` = the dev of every stack). Each real resource is counted once:
@@ -595,6 +599,8 @@ def analyze_environments(
     row_by_id: dict[str, dict[str, Any]] = {}
     columns = []
     for col in columns_run:
+        if step is not None:
+            step(f"environment column {col['id'] or '(no environment)'}")
         engine, graph = analyze_roots(
             repo, col["root_var_files"], "" if col.get("no_environment") else col["id"]
         )

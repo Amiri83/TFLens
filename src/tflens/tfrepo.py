@@ -836,12 +836,20 @@ def create_run(
     id. A run whose discovery finds nothing to analyze is recorded as failed, with the
     reason and a listing of what the repository contains (its model is still written, so
     the run opens and shows every file). Precondition errors raise ValueError."""
-    from .handoff import render_handoff
-    from .output import dumps, listing_text, run_analysis
-    from .overview import build_overview, render_overview_markdown
-    from .report import render_report
-    from .snapshots import diff_runs, previous_run, store_snapshot
-    from .visuals import export_diagrams
+    from .pipeline import discover
+
+    opts = discover_options(repo, env, decrypt)
+    return discover(
+        analysis_root(repo), opts, write=lambda a: record_run(conn, repo, env, out_dir, a)
+    ).written
+
+
+def discover_options(
+    repo: dict[str, Any], env: dict[str, Any] | None, decrypt: Decrypt | None
+) -> Any:
+    """The :class:`pipeline.Options` of a run of ``repo`` (with ``env``'s tfvars and
+    variables); ValueError when the repository or a tfvars file is not there."""
+    from .pipeline import Options
 
     root = analysis_root(repo)
     if not root.is_dir():
@@ -854,13 +862,28 @@ def create_run(
     for f in var_files:
         if not (root / f).is_file() or not _inside(root / f, root):
             raise ValueError(f"tfvars file {f} not found in the repository")
-    analysis = run_analysis(
-        root,
-        var_files,
-        env_vars(env, decrypt) if env else {},
+    return Options(
+        var_files=var_files,
+        cli_vars=env_vars(env, decrypt) if env else {},
         scope=env_scope(env),
         git_root=Path(repo["path"]),
     )
+
+
+def record_run(
+    conn: sqlite3.Connection,
+    repo: dict[str, Any],
+    env: dict[str, Any] | None,
+    out_dir: Path,
+    analysis: Any,
+) -> int:
+    """Record an analysis (:class:`output.Analysis`) as a run: its files are written to a
+    temporary directory renamed to ``out/<repo>/<run>/`` once complete, and the row is
+    part of the caller's transaction (rolled back, and the files removed, on error): no
+    half-written run. Returns the run id."""
+    from .output import listing_text
+
+    root = analysis_root(repo)
     listing = listing_text(analysis.model["discovery"]["inventory"])
     error = f"{analysis.failure}\n{listing}" if analysis.failed else ""
     run_id = _insert_run(
@@ -872,10 +895,42 @@ def create_run(
         status=FAILED if analysis.failed else OK,
         error=error,
     )
-    run_dir = run_dir_for(out_dir, repo, run_id)
-    run_dir.mkdir(parents=True, exist_ok=True)
-    model_path = run_dir / "model.json"
-    model_path.write_text(dumps(analysis.model), encoding="utf-8")
+    final_dir = run_dir_for(out_dir, repo, run_id)
+    run_dir = final_dir.with_name(f".{final_dir.name}.partial")
+    if run_dir.exists():
+        _safe_rmtree(run_dir, out_dir)
+    run_dir.mkdir(parents=True)
+    try:
+        _write_run_files(conn, repo, env, analysis, run_id, run_dir, final_dir, listing)
+        if final_dir.exists():
+            _safe_rmtree(final_dir, out_dir)
+        run_dir.rename(final_dir)
+    except BaseException:
+        if run_dir.exists():
+            _safe_rmtree(run_dir, out_dir)
+        raise
+    return run_id
+
+
+def _write_run_files(
+    conn: sqlite3.Connection,
+    repo: dict[str, Any],
+    env: dict[str, Any] | None,
+    analysis: Any,
+    run_id: int,
+    run_dir: Path,
+    final_dir: Path,
+    listing: str,
+) -> None:
+    from .handoff import render_handoff
+    from .output import dumps
+    from .overview import build_overview, render_overview_markdown
+    from .report import render_report
+    from .snapshots import diff_runs, previous_run, store_snapshot
+    from .visuals import export_diagrams
+
+    model_path = final_dir / "model.json"
+    (run_dir / "model.json").write_text(dumps(analysis.model), encoding="utf-8")
     title = repo["name"] + (f" ({env['env']})" if env else "")
     (run_dir / "report.md").write_text(
         render_report(analysis.model, title, analysis.repo.lines), encoding="utf-8"
@@ -902,7 +957,6 @@ def create_run(
         render_handoff(analysis.model, title, analysis.repo.lines, changes, run["commit_sha"]),
         encoding="utf-8",
     )
-    return run_id
 
 
 def _insert_run(

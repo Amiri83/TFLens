@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,10 @@ def run_analysis(
     env: str | None = None,
     auto_env: bool = False,
     stack_envs: dict[str, str] | None = None,
+    *,
+    repo: RepoSource | None = None,
+    crawled: dict[str, Any] | None = None,
+    step: Callable[[str], None] | None = None,
 ) -> Analysis:
     """Analyze ``root``. ``scope`` limits the roots to one directory (an environment).
     The git history is read when ``git_root`` (default ``root``) is a git checkout.
@@ -72,8 +77,20 @@ def run_analysis(
     Every stack (root) is analyzed: with ``auto_env`` or ``stack_envs`` (stack id ->
     environment id, '' for none) each stack gets its own environment (the one chosen,
     else its default), so the stacks all show up side by side (``model["stacks"]``).
-    ``env`` applies one environment and limits the analysis to its directory."""
-    repo = load_repo(root)
+    ``env`` applies one environment and limits the analysis to its directory.
+
+    ``repo`` / ``crawled``: an already loaded repository and its crawl (the discovery
+    pipeline's phase 1), so neither is done twice. ``step`` is called between the steps
+    (progress; it may raise to stop a cancelled run)."""
+
+    def mark(text: str) -> None:
+        if step is not None:
+            step(text)
+
+    if repo is None:
+        mark("loading the repository")
+        repo = load_repo(root)
+    mark("detecting roots and environments")
     # a managed run of one environment passes its var files / scope: no per-env section
     explicit = bool(var_files or cli_vars or scope)
     probe = Engine(repo)
@@ -109,9 +126,14 @@ def run_analysis(
         engine.root_envs = dict(per_stack["root_envs"])
     elif selected is not None:
         engine.root_envs = {r: selected["name"] for r in env_roots(selected, all_roots)}
+    mark("evaluating the Terraform code")
     engine.run()
+    mark("building the resource graph")
     graph = analyze(repo, engine)
-    crawled = crawl(repo, git_root, git)
+    if crawled is None:
+        mark("crawling docs, CI and git history")
+        crawled = crawl(repo, git_root, git)
+    mark("building the model")
     model = build_model(repo, engine, graph, crawled)
     environments = model["structure"]["environments"]
     sel_id = env_id(selected, environments) if selected is not None else ""
@@ -148,6 +170,7 @@ def run_analysis(
             model["environment"]["id"] if model["environment"] else None,
             model["stacks"],
             library_roots(model),
+            step=step,
         )
     )
     return Analysis(repo, engine, graph, model)

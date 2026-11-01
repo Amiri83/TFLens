@@ -815,10 +815,10 @@ def test_changes_page_and_run_files(client, tmp_path):
     shutil.copytree(FIXTURES / "module_only", repo_dir)
     resp = _post(client, "/repos", {"source": "local", "path": str(repo_dir)})
     repo_id = int(resp.headers["Location"].rstrip("/").rsplit("/", 1)[1])
-    _post(client, f"/repos/{repo_id}/analyze")
+    _post(client, f"/repos/{repo_id}/discover")
     main_tf = repo_dir / "main.tf"
     main_tf.write_text(main_tf.read_text().replace('"4.2.0"', '"4.3.0"'))
-    run_url = _post(client, f"/repos/{repo_id}/analyze", {"open": "1"}).headers["Location"]
+    run_url = _post(client, f"/repos/{repo_id}/discover").headers["Location"]
     run_id = int(run_url.strip("/").rsplit("/", 1)[1])
     page = client.get(f"/runs/{run_id}/changes").data.decode()
     assert "Module version changes" in page and "version: 4.2.0 → 4.3.0" in page

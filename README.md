@@ -7,7 +7,8 @@ tfvars, locals, local modules and their outputs, `aws_iam_policy_document`), and
 builds a graph of AWS resources and their relationships, each relationship
 backed by evidence (file, line range, snippet).
 
-No `terraform` binary, no `terraform init`, no AWS API calls, no LLM. Anything
+No `terraform` binary, no `terraform init`, no AWS API calls (unless a Discover run's
+optional, read-only AWS check is turned on), no LLM. Anything
 that cannot be resolved statically is reported as **unknown, with a reason**,
 never guessed. Output is deterministic: the same input gives byte-identical
 output.
@@ -68,9 +69,11 @@ Nothing has to be configured before a first analysis:
   configurations are matched to their environment by name (`backend.dev.hcl`,
   `dev.tfbackend`, `backend/dev.hcl`, or `env/dev.hcl` when its settings are backend
   settings). An environment with tfvars but no backend configuration and no CI / script
-  line using it is listed as **not wired** (and still analyzed). In the managed app they
-  are created automatically (on add / Sync / **Detect environments**), bound to
-  their root, and can be edited; an edited environment is never overwritten.
+  line using it is listed as **not wired** (and still analyzed). A `-var-file` /
+  `-backend-config` line in CI, a script or the docs is a hint only: it is attached to an
+  environment real files established and never creates one. In the managed app they
+  are recorded by **Discover**, bound to their root, and can be edited; an edited
+  environment is never overwritten.
 - **Environments view** (the analyzer's first tab, what *Start here* opens): the
   detected environments and their files (tfvars, backend config, CI lines), the state
   file of each (`bucket` / `key` / `region` / `dynamodb_table` from its backend config),
@@ -132,6 +135,52 @@ Nothing has to be configured before a first analysis:
   repository deploys and, per root, backend, providers, modules, resources by
   service, the top ACCESS / TRIGGER / NETWORK relationships and the unknowns.
   Every line links to its `file:line`.
+
+## Discover: a phased pipeline
+
+Discovery is one run in four phases, started by the single **Discover** button (managed:
+the repository's page; standalone: the analyzer's header) and followed on a progress
+screen: the four phases with their outcome, the current phase and step, the elapsed time
+and a live log. **Hide** keeps the run going behind a small badge that reopens it;
+**Cancel** stops it after its current step, before anything is written (no model, no
+run, no environment record; the worker thread ends). Without JavaScript the form posts
+normally and the run goes to the end.
+
+1. **Crawl + hypothesis**: every file is listed, as `tree` prints it (`.terraform`,
+   `.venv`, `.git`, `dist`, `node_modules`, ... are skipped and listed with why). READMEs,
+   other Markdown files, `docs/`, HANDOFF notes, CI files, scripts and the git log are read
+   as **hints only**: a draft map of environments (environment words, `envs/<name>` paths,
+   `-var-file` / `-backend-config` values), stacks (`-chdir`, `working-directory`, `cd`,
+   paths named next to *stack* / *root* / *deploy*) and links between stacks. Every item
+   is marked `hint` and carries its sources (`file:line`, docs / ci / git) and its number
+   of mentions.
+2. **Validate**: each hint is checked against real repository files only (`.tf`,
+   `.tfvars`, `backend-*.hcl` / `*.tfbackend`). An environment is a real tfvars / backend
+   file (or an environment directory holding Terraform code) in that stack's tree: docs
+   and CI never create one. Each environment, stack and link is **confirmed** (with its
+   evidence files), **hint-only** (named in docs / CI / git, nothing in the code) or
+   **contradicted** (the hint names a file or directory that is not there, or a link the
+   code does not have). The docs-vs-code mismatches are listed, including code the docs
+   never mention and resources the docs name that the code does not declare.
+3. **AWS** (optional, **off by default**, turned on per run): read-only existence checks
+   (`sts:GetCallerIdentity`, `s3:HeadBucket`, `sqs:GetQueueUrl`, `dynamodb:DescribeTable`,
+   `lambda:GetFunctionConfiguration`, `sns:GetTopicAttributes`,
+   `ecr:DescribeRepositories`) of the confirmed resources whose name is known statically,
+   with the run's own AWS credentials: an account from **Accounts** (managed) or
+   `--aws-profile NAME` (standalone). Needs `pip install 'tflens[aws]'`. With no account,
+   no boto3 or credentials that do not work the phase is skipped with the reason; it never
+   fails the run and never reports a result it did not get. Credentials are never written
+   to a file, put on a command line or logged.
+4. **Render**: the inventory (one column per confirmed environment), the diagrams and
+   the graph are built from confirmed data only, then written atomically (a temporary
+   file / directory renamed into place).
+
+The analyzer's **Discovery** tab shows the phases, the mismatches, each environment /
+stack / link with its status, evidence and hint sources, the AWS check and the file
+tree; it is `pipeline` in model.json. The Environments view's debug list is grouped by
+environment: one line per environment with its status, its evidence count and how many
+times docs / CI / git mention it (never one line per mention); the rejected candidate
+files are one group. The CLI (`tflens --dir`) runs phases 1, 2 and 4.
 
 ## Deep crawl
 
@@ -229,10 +278,11 @@ tflens serve --dir path/to/terraform --port 0 --no-browser
 | `--no-browser` | do not open a browser |
 | `--allow-remote` | required to bind a non-loopback `--host` |
 | `--var-file`, `--var` | as for the analyzer, used when (re)generating the model |
+| `--aws-profile NAME`, `--aws-region REGION` | the AWS named profile Discover's optional AWS check may use (off unless turned on for a run) |
 
 This mode never creates or reads `~/.tflens` and needs no database (`tflens --dir`
 doesn't either). The server re-reads model.json when it changes and regenerates
-it when it is missing or unusable; the **Regenerate** button re-analyzes on demand.
+it when it is missing or unusable; the **Discover** button runs the pipeline on demand.
 
 ### Managed: repositories, environments and run history
 
@@ -255,20 +305,20 @@ first save; just starting the server or browsing writes neither.
   Fernet-encrypted and goes to git only through its environment
   (`http.extraHeader`). It is never put on the command line or in a file, never
   logged, and never shown. URLs with embedded credentials are refused.
-- **Environments** per repository: tfvars files plus extra `-var KEY=VALUE` lines
-  (values stored encrypted, only names shown). **Analyze** runs the static
-  analyzer read-only and records a run.
+- **Environments** per repository: recorded by **Discover** (which also records a run
+  analyzing every confirmed environment) and editable: tfvars files plus extra
+  `-var KEY=VALUE` lines (values stored encrypted, only names shown).
 - **Runs**: history per repository. A run's `model.json`, `report.md` and
   `overview.md` stay on disk under `out/<repo>/<run>/`; the database stores only
   the path, summary counts and status. **Open** shows the run in the analyzer at
   `/runs/<id>/` (read-only). A failed run is listed with its reason (and, when
   nothing was analyzable, what the repository contains).
 - **Accounts**: AWS account records in the same form as IPLens (encrypted or
-  memory-only secrets, masked display). The analysis never uses them; TFLens makes
-  no AWS calls.
+  memory-only secrets, masked display). The static analysis never uses them; a Discover
+  run with its AWS check turned on uses the account chosen for it, read-only.
 - **Settings**: log directory; server host / port / allow-remote (applied at the
   next start, and the `--host` / `--port` / `--allow-remote` flags take precedence);
-  auto-regenerate (analyze every environment after a successful Sync); how many
+  auto-regenerate (Discover after a successful Sync, without the AWS check); how many
   runs to keep per repository × environment.
 - **Logs**: the last N entries of the rotating log file. Credentials and tokens
   are redacted before they are written.
@@ -295,8 +345,12 @@ JSON API (all GET; under `/runs/<id>/` for a run): `api/summary`, `api/graph`,
 `api/file?path=`, `api/overview`, `api/source?file=&start=&end=`, `api/model`,
 `api/diagram?name=architecture|module-tree|env-matrix&format=svg|mmd`,
 `api/diagram?name=flow-<n>|network|iam&format=svg|drawio[&root=<dir>]`, `api/handoff`
-(add `download=1` for an attachment); `POST api/regenerate` (standalone only, needs the
-header `X-TFLens: 1`).
+(add `download=1` for an attachment), `api/discovery`, `api/job[?id=]`; `POST
+api/discover[?aws=1]`, `POST api/job/cancel?id=` and `POST api/regenerate` (a synchronous
+Discover without progress) (standalone only, need the header `X-TFLens: 1`). Managed:
+`POST /repos/<id>/discover` (form; `background=1` returns the job as JSON),
+`GET /repos/<id>/jobs/current`, `GET /repos/<id>/jobs/<job>`,
+`POST /repos/<id>/jobs/<job>/cancel`.
 
 ## Remote modules
 

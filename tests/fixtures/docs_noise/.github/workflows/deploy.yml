@@ -1,0 +1,23 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, intg, uat, prod, staging]
+    steps:
+      - uses: actions/checkout@v4
+      - name: plan
+        run: |
+          terraform init -backend-config=backend-${{ matrix.env }}.hcl
+          terraform plan -var-file=envs/${{ matrix.env }}.tfvars
+  qa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: legacy qa plan
+        run: terraform plan -var-file=envs/qa.tfvars
