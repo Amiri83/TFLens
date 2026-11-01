@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -20,9 +21,11 @@ from .drawio import MIME as DRAWIO_MIME
 from .drawio import chain_drawio, tab_drawio
 from .envs import difference_lines, env_counts_text, inventory_rows, node_root, summarize
 from .flow import build_flows, chain_svg
+from .jobs import JobBusy, JobContext, JobManager
 from .model import EDGE_KINDS, SCHEMA_VERSION
-from .output import dumps, library_roots, run_analysis
+from .output import dumps, library_roots
 from .overview import build_overview
+from .pipeline import Options, discover
 from .report import describe_node
 from .shapes import build_root_view, build_shapes, root_entries, root_model
 from .snippets import SourceLines, snippet_lines
@@ -71,6 +74,19 @@ def default_model_path(root: Path) -> Path:
     return root / "tflens-out" / "model.json"
 
 
+def write_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through a temporary file in the same directory and a
+    rename: a reader never sees a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 class ModelUnavailable(RuntimeError):
     """A read-only store's model.json is missing or unusable."""
 
@@ -93,8 +109,12 @@ class ModelStore:
         title: str = "",
         env: str | None = None,
         auto_env: bool = False,
+        aws: Any = None,
     ) -> None:
         self.root = root.resolve()
+        # the AWS account Discover may check against (awscheck.AwsTarget; None: none
+        # configured, the AWS phase is then unavailable)
+        self.aws = aws
         self.readonly = readonly
         self.title = title or self.root.name
         self.model_path = model_path or default_model_path(self.root)
@@ -141,25 +161,44 @@ class ModelStore:
         )
 
     def regenerate(self) -> dict[str, Any]:
+        """Discover synchronously (no progress, no AWS check) and serve the result."""
         if self.readonly:
             raise ModelUnavailable("a recorded run cannot be regenerated")
         with self._lock:
-            model = run_analysis(
-                self.root,
-                self.var_files,
-                self.cli_vars,
+            return self.discover()
+
+    def discover(self, progress: Any = None, aws: bool = False) -> dict[str, Any]:
+        """Run the discovery pipeline with the current environment selection; the model
+        is written (atomically) and served only once the run can no longer be cancelled.
+        The store's lock is held only while the result is put in place, so the analyzer
+        keeps serving the previous model while a Discover runs."""
+        if self.readonly:
+            raise ModelUnavailable("a recorded run cannot be regenerated")
+        with self._lock:
+            opts = Options(
+                var_files=list(self.var_files),
+                cli_vars=dict(self.cli_vars),
                 env=self.env,
                 auto_env=self.auto_env,
                 stack_envs=dict(self.stack_envs) if not self.env else None,
-            ).model
-            try:
-                self.model_path.parent.mkdir(parents=True, exist_ok=True)
-                self.model_path.write_text(dumps(model), encoding="utf-8")
-                self.note = f"regenerated {self.model_path}"
-            except OSError as exc:
-                self.note = f"regenerated in memory only (cannot write {self.model_path}: {exc})"
-            self._set(model, self._stat(), generated=True)
+                aws=self.aws if aws else None,
+                aws_requested=aws,
+            )
+
+        def write(analysis: Any) -> dict[str, Any]:
+            model = analysis.model
+            with self._lock:
+                try:
+                    write_atomic(self.model_path, dumps(model))
+                    self.note = f"regenerated {self.model_path}"
+                except OSError as exc:
+                    self.note = (
+                        f"regenerated in memory only (cannot write {self.model_path}: {exc})"
+                    )
+                self._set(model, self._stat(), generated=True)
             return model
+
+        return discover(self.root, opts, progress, write).written
 
     def select_env(self, env: str | None) -> dict[str, Any]:
         """Re-analyze with a detected environment's tfvars (None / '': no environment, not
@@ -721,7 +760,97 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
     if rows:
         total = analysis["total"]
         out["total"] = {**total, "text": env_counts_text(total)}
+    out["env_debug"] = env_debug(model)
     return out
+
+
+def env_debug(model: dict[str, Any]) -> dict[str, Any]:
+    """The environment debug list, grouped by environment: one line per environment
+    (its status, the number of real files that are its evidence, how many times docs / CI
+    / git mention it), its files and hint sources behind it; the rejected candidate files
+    in one group. Never one line per doc mention."""
+    validation = (model.get("pipeline") or {}).get("validation")
+    trace = (model.get("structure") or {}).get("env_files", [])
+    files_of: dict[str, list[dict[str, Any]]] = {}
+    for t in trace:
+        if t["accepted"] and t.get("env"):
+            files_of.setdefault(t["env"], []).append(t)
+    if validation is not None:
+        items = validation["envs"]
+    else:  # a model written before the pipeline: from the detected environments
+        by_name: dict[str, dict[str, Any]] = {}
+        for e in (model.get("structure") or {}).get("environments", []):
+            it = by_name.setdefault(
+                e["name"],
+                {
+                    "name": e["name"],
+                    "status": "confirmed",
+                    "stacks": [],
+                    "evidence": [],
+                    "hint_mentions": 0,
+                    "hint_sources": [],
+                    "via": [],
+                    "kinds": [],
+                },
+            )
+            it["stacks"].append(e["root"])
+            it["evidence"] = sorted(
+                set(it["evidence"]) | set(e.get("var_files", [])) | set(e.get("backend_hcl", []))
+            )
+            it["kinds"] = sorted(set(it["kinds"]) | set(e.get("kinds", [])))
+        items = [{**it, "evidence_count": len(it["evidence"])} for _, it in sorted(by_name.items())]
+    groups = []
+    for it in items:
+        groups.append(
+            {
+                "env": it["name"],
+                "status": it["status"],
+                "evidence_count": it.get("evidence_count", 0),
+                "evidence": it.get("evidence", []),
+                "stacks": it.get("stacks", []),
+                "kinds": it.get("kinds", []),
+                "hint_mentions": it.get("hint_mentions", 0),
+                "hint_via": it.get("via", []),
+                "hint_sources": it.get("hint_sources", [])[:10],
+                "reason": it.get("reason", ""),
+                "files": [
+                    {
+                        "file": t["file"],
+                        "stack": t["stack"],
+                        "kind": t["kind"],
+                        "reason": t["reason"],
+                    }
+                    for t in files_of.get(it["name"], [])
+                ],
+            }
+        )
+    order = {"confirmed": 0, "contradicted": 1, "hint-only": 2}
+    groups.sort(key=lambda g: (order.get(g["status"], 3), g["env"]))
+    rejected: dict[str, dict[str, Any]] = {}
+    for t in trace:
+        if not t["accepted"]:
+            r = rejected.setdefault(
+                t["file"],
+                {"file": t["file"], "stack": t["stack"], "reason": t["reason"], "count": 0},
+            )
+            r["count"] += 1
+    return {
+        "groups": groups,
+        "confirmed": sum(1 for g in groups if g["status"] == "confirmed"),
+        "rejected": [rejected[k] for k in sorted(rejected)],
+    }
+
+
+def discovery_view(model: dict[str, Any]) -> dict[str, Any]:
+    """The Discovery tab: the phases, the crawl (tree), the hints and their validation,
+    the docs-vs-code mismatches and the AWS check."""
+    pipe = model.get("pipeline")
+    if pipe is None:
+        return {
+            "available": False,
+            "note": "this model was written before phased discovery: run Discover",
+        }
+    return {"available": True, **pipe}
 
 
 def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
@@ -773,13 +902,70 @@ def _not_found(what: str) -> Response:
 
 
 class Api:
-    def __init__(self, store: ModelStore) -> None:
+    def __init__(self, store: ModelStore, jobs: JobManager | None = None) -> None:
         self.store = store
+        self.jobs = jobs or JobManager()
+
+    def _job_key(self) -> str:
+        return f"standalone:{self.store.root}"
+
+    def start_discover(self, aws: bool = False, background: bool = True) -> dict[str, Any]:
+        """Start a Discover run of this store (raises :class:`JobBusy`)."""
+        store = self.store
+
+        def work(ctx: JobContext) -> dict[str, Any]:
+            store.discover(ctx, aws=aws)
+            ctx.message("ok", f"Discover finished: {store.note}")
+            return {"reload": True}
+
+        return self.jobs.start(
+            self._job_key(), f"Discover {store.title}", work, background=background
+        )
+
+    def _jobs_api(self, method: str, path: str, query: dict[str, str]) -> Response | None:
+        if path == "/api/discover" and method == "POST":
+            if self.store.readonly:
+                return json_response({"error": "a recorded run is read-only"}, 405)
+            try:
+                job = self.start_discover(aws=query.get("aws") == "1")
+            except JobBusy as exc:
+                return json_response({"ok": False, "error": str(exc), "job": exc.job}, 409)
+            return json_response({"ok": True, "job": job})
+        if path == "/api/job" and method in ("GET", "HEAD"):
+            job = (
+                self.jobs.status(query["id"], self._job_key())
+                if query.get("id")
+                else self.jobs.current(self._job_key())
+            )
+            if query.get("id") and job is None:
+                return _not_found(f"job {query['id']!r}")
+            return json_response({"job": job, "aws": self.aws_option()})
+        if path == "/api/job/cancel" and method == "POST":
+            ok = self.jobs.cancel(query.get("id", ""), self._job_key())
+            return json_response({"ok": ok, "job": self.jobs.status(query.get("id", ""))})
+        return None
+
+    def aws_option(self) -> dict[str, Any]:
+        """Whether the AWS phase can be turned on for a run (and why not)."""
+        target = self.store.aws
+        if self.store.readonly:
+            return {"available": False, "reason": "a recorded run is read-only"}
+        if target is None:
+            return {
+                "available": False,
+                "reason": "no AWS account configured (start with --aws-profile NAME)",
+            }
+        if target.problem:
+            return {"available": False, "reason": f"{target.label}: {target.problem}"}
+        return {"available": True, "label": target.label}
 
     def handle(self, method: str, target: str) -> Response:
         url = urlsplit(target)
         path = url.path
         query = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
+        handled = self._jobs_api(method, path, query)
+        if handled is not None:
+            return handled
         if method == "POST":
             if path == "/api/regenerate":
                 if self.store.readonly:
@@ -818,6 +1004,8 @@ class Api:
             return json_response(model)
         if path == "/api/environments":
             return json_response(environments_view(model, self.store))
+        if path == "/api/discovery":
+            return json_response(discovery_view(model))
         if path == "/api/graph":
             return json_response(graph_view(model))
         if path == "/api/nodes":

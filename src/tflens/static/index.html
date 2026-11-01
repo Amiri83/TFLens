@@ -19,14 +19,37 @@
       <button type="button" class="tab" data-view="graph">Graph</button>
       <button type="button" class="tab" data-view="diagrams">Diagrams</button>
       <button type="button" class="tab" data-view="repo">Repository</button>
+      <button type="button" class="tab" data-view="discovery">Discovery</button>
     </nav>
     <a id="changes" class="home hidden" href="changes">Changes</a>
     <label id="env-switch" class="env-switch hidden" title="Re-analyze with an environment's tfvars applied">Environment
       <select id="env"></select>
     </label>
     <div id="summary"></div>
-    <button type="button" id="regenerate" title="Re-analyze the repository and rewrite model.json">Regenerate</button>
+    <form id="discover-form" class="discover-form hidden" method="post" action="api/discover" data-discover>
+      <label class="inline" title="Read-only existence checks of the confirmed resources, this run only">
+        <input type="checkbox" name="aws" value="1" id="discover-aws" disabled> AWS check
+        <span id="discover-aws-why" class="muted small"></span></label>
+      <button type="submit" id="discover" title="Crawl → validate → (AWS) → render, and rewrite model.json">Discover</button>
+    </form>
   </header>
+  <div id="discover-modal" class="discover-modal" hidden role="dialog" aria-modal="true" aria-labelledby="discover-title"
+       data-api="1" data-current-url="api/job" data-status-url="api/job?id=__ID__" data-cancel-url="api/job/cancel?id=__ID__">
+    <div class="discover-box">
+      <h2 id="discover-title">Discover</h2>
+      <ol id="discover-phases" class="discover-phases"></ol>
+      <p class="discover-now"><b>Now:</b> <span id="discover-step"></span>
+        · <span id="discover-state"></span> · <span id="discover-elapsed"></span></p>
+      <pre id="discover-log" class="discover-log" aria-live="polite"></pre>
+      <ul id="discover-messages" class="discover-messages"></ul>
+      <p class="discover-actions">
+        <button type="button" id="discover-hide">Hide</button>
+        <button type="button" id="discover-cancel">Cancel</button>
+        <button type="button" id="discover-close" hidden>Close</button>
+      </p>
+    </div>
+  </div>
+  <button type="button" id="discover-badge" class="discover-badge" hidden></button>
   <div id="failure" class="failure hidden"></div>
   <main>
     <aside id="sidebar">
@@ -61,6 +84,10 @@
       <section class="view-repo hidden">
         <div id="tree"></div>
       </section>
+      <section class="view-discovery hidden">
+        <h3>Contents</h3>
+        <div id="discovery-toc"></div>
+      </section>
       <section class="view-diagrams hidden">
         <h3>Diagrams</h3>
         <a class="file link" href="#dg-architecture">Architecture</a>
@@ -76,6 +103,7 @@
       <div id="graph" class="view-graph hidden"></div>
       <div id="diagrams" class="view-diagrams hidden"><p class="muted">Loading the diagrams…</p></div>
       <div id="file" class="view-repo hidden"><p class="muted">Select a file to list the resources defined in it.</p></div>
+      <div id="discovery" class="view-discovery hidden"><p class="muted">Loading the discovery…</p></div>
     </section>
     <aside id="detail">
       <p class="muted">Click a file:line reference, a node or an edge to see its evidence.</p>
@@ -83,5 +111,6 @@
   </main>
   <script src="/static/vendor/cytoscape.min.js"></script>
   <script src="/static/app.js"></script>
+  <script src="/static/discover.js"></script>
 </body>
 </html>

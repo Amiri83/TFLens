@@ -34,6 +34,7 @@ from flask import (
     abort,
     current_app,
     flash,
+    jsonify,
     redirect,
     render_template,
     request,
@@ -46,9 +47,11 @@ from markupsafe import Markup
 from . import __version__, tfrepo
 from .accounts import AUTH_MODE_LABELS, AUTH_MODES, Account, AccountStore, MemoryVault
 from .accounts import discover_profiles as _discover_profiles
+from .awscheck import target_from_account
 from .config import AppPaths, default_paths
 from .crypto import LazySecretBox
 from .db import reading, writing
+from .jobs import JobBusy, JobContext, JobFailed, JobManager
 from .logging_setup import LEVELS, LOG_FILE, configure_logging, read_log
 from .server import CSP
 from .settings import (
@@ -176,12 +179,14 @@ def create_app(
         "managed": store is None,
         "port": port,
         "allow_remote": allow_remote,
+        # Discover runs (background, cancellable): one per repository
+        "jobs": JobManager(),
     }
     app.extensions["tflens"] = ext
     if store is not None:
         # Standalone: a per-process session key, nothing written anywhere.
         app.config["SECRET_KEY"] = secrets.token_bytes(32)
-        ext["api"] = Api(store)
+        ext["api"] = Api(store, ext["jobs"])
         _register_common(app)
         _register_standalone(app)
         return app
@@ -421,97 +426,107 @@ def _forget_run(run_id: int) -> None:
         _ext()["runs"].pop(run_id, None)
 
 
-def _record_failure(repo: dict[str, Any], env: dict[str, Any] | None, reason: str) -> None:
-    """Keep a failed run in the history with its reason (best effort)."""
-    try:
-        with _write() as conn:
-            tfrepo.record_failed_run(conn, repo, env, reason)
-    except Exception:
-        log.exception("cannot record the failed run of repo=%s", repo["id"])
+def _jobs() -> JobManager:
+    return _ext()["jobs"]
 
 
-def _analyze(repo: dict[str, Any], env: dict[str, Any] | None) -> int | None:
-    """Create a run (flashes the outcome); returns its id if it produced a model (also
-    for a run whose discovery failed: it opens to show the repository), else None.
-    Every failure is recorded as a failed run with its reason."""
-    label = repo["name"] + (f" / {env['env']}" if env else "")
-    try:
-        with _write() as conn:
-            run_id = tfrepo.create_run(conn, repo, env, _paths().out_dir, _ext()["box"].decrypt)
-            pruned = tfrepo.prune_runs(
-                conn,
-                _paths().out_dir,
-                _store().load().retention_runs,
-                repo["id"],
-                env["env"] if env else "",
+def _job_key(repo_id: int) -> str:
+    return f"repo:{repo_id}"
+
+
+def _aws_target(raw: str) -> Any:
+    """The AWS account a run checks against (its own credentials, fetched now so the
+    worker needs no request context); None when none is chosen / configured."""
+    if not raw.isdigit():
+        return None
+    acct = _accounts().get(int(raw), with_secret=True)
+    return target_from_account(acct) if acct is not None else None
+
+
+def _discover_work(repo: dict[str, Any], aws_requested: bool, aws_target: Any):
+    """The Discover job of a repository: the pipeline's four phases; in the last one
+    (after the last cancellation point) the environments are refreshed and the run is
+    recorded in one transaction, its files written to a directory renamed into place."""
+    out_dir = _paths().out_dir
+    db_path = _paths().db_path
+    decrypt = _ext()["box"].decrypt
+    keep = _store().load().retention_runs
+    runs_cache, runs_lock = _ext()["runs"], _ext()["runs_lock"]
+    run_url = url_for("run_view", run_id=0).replace("/0/", "/{}/")
+
+    def work(ctx: JobContext) -> dict[str, Any]:
+        from .pipeline import discover
+
+        try:
+            opts = tfrepo.discover_options(repo, None, decrypt)
+        except ValueError as exc:  # kept in the history with its reason
+            with writing(db_path) as conn:
+                tfrepo.record_failed_run(conn, repo, None, str(exc))
+            raise JobFailed(f"Discover {repo['name']} failed: {exc}") from None
+        opts.aws, opts.aws_requested = aws_target, aws_requested
+        recorded: dict[str, Any] = {}
+
+        def write(analysis: Any) -> int:
+            with writing(db_path) as conn:
+                found = tfrepo.discover_envs(conn, repo)
+                run_id = tfrepo.record_run(conn, repo, None, out_dir, analysis)
+                recorded["pruned"] = tfrepo.prune_runs(conn, out_dir, keep, repo["id"], "")
+                recorded["envs"] = found.found
+                recorded["failed"] = analysis.failed
+                recorded["reason"] = analysis.failure
+            return run_id
+
+        try:
+            run_id = discover(tfrepo.analysis_root(repo), opts, ctx, write).written
+        except ValueError as exc:
+            raise JobFailed(f"Discover {repo['name']} failed: {exc}") from None
+        if recorded.get("pruned"):
+            with runs_lock:
+                runs_cache.clear()  # pruned runs must not be served from the cache
+        log.info(
+            "run %s: repo=%s discovered (%s environment(s), %d old run(s) pruned)",
+            run_id,
+            repo["id"],
+            recorded.get("envs"),
+            recorded.get("pruned", 0),
+        )
+        url = run_url.format(run_id)
+        if recorded.get("failed"):
+            ctx.message(
+                "error",
+                f"Discover {repo['name']}: {recorded['reason']}",
+                url,
+                f"open run {run_id} to see the repository",
             )
-            run = tfrepo.get_run(conn, run_id)
-    except ValueError as exc:
-        _record_failure(repo, env, str(exc))
-        flash(f"Analyze {label} failed: {exc}", "error")
-        return None
-    except Exception as exc:
-        log.exception("analysis of repo=%s env=%s failed", repo["id"], env and env["id"])
-        _record_failure(repo, env, f"internal error ({type(exc).__name__}): see the log")
-        flash(f"Analyze {label} failed. See the log for details.", "error")
-        return None
-    if pruned:
-        with _ext()["runs_lock"]:
-            _ext()["runs"].clear()  # pruned runs must not be served from the cache
-    log.info(
-        "run %s: repo=%s env=%s status=%s nodes=%s edges=%s (%d old run(s) pruned)",
-        run_id,
-        repo["id"],
-        env["env"] if env else "-",
-        run["status"] if run else "?",
-        run["node_count"] if run else "?",
-        run["edge_count"] if run else "?",
-        pruned,
-    )
-    if run and run["status"] == tfrepo.FAILED:
-        flash(
-            Markup(
-                'Analyze {0} failed: {1} — <a href="{2}">open run {3}</a> to see the repository'
-            ).format(label, run["reason"], url_for("run_view", run_id=run_id), run_id),
-            "error",
-        )
-        return run_id
-    flash(
-        Markup('Analyzed {0}: run {1} — <a href="{2}">open in the analyzer</a>').format(
-            label, run_id, url_for("run_view", run_id=run_id)
-        ),
-        "ok",
-    )
-    return run_id
+        else:
+            ctx.message(
+                "ok", f"Discovered {repo['name']}: run {run_id}", url, "open in the analyzer"
+            )
+        return {"run_id": run_id, "url": url}
+
+    return work
 
 
-def _discover(repo: dict[str, Any], quiet: bool = False) -> None:
-    """Detect the repository's environments (flashes the outcome)."""
-    try:
-        with _write() as conn:
-            found = tfrepo.discover_envs(conn, repo)
-    except ValueError as exc:
-        if not quiet:
-            flash(f"Environments not detected: {exc}", "error")
-        return
-    except Exception:
-        log.exception("environment discovery of repo=%s failed", repo["id"])
-        flash("Environment detection failed. See the log for details.", "error")
-        return
-    log.info(
-        "environments of repo=%s: %d found, %d added, %d updated, %d gone",
-        repo["id"],
-        found.found,
-        found.added,
-        found.updated,
-        found.gone,
+def _start_discover(repo: dict[str, Any], *, background: bool, aws: bool, account: str):
+    target = _aws_target(account) if aws else None
+    work = _discover_work(repo, aws, target)
+    return _jobs().start(
+        _job_key(repo["id"]), f"Discover {repo['name']}", work, background=background
     )
-    if found.added or found.updated or found.gone or not quiet:
-        flash(
-            f"Environments detected: {found.found} found ({found.added} new, "
-            f"{found.updated} updated, {found.gone} no longer found)",
-            "ok",
-        )
+
+
+def _flash_job(job: dict[str, Any]) -> None:
+    for m in job.get("messages", []):
+        category = "ok" if m["category"] == "ok" else "error"
+        if m.get("link_url"):
+            flash(
+                Markup('{0} — <a href="{1}">{2}</a>').format(
+                    m["text"], m["link_url"], m.get("link_text", m["link_url"])
+                ),
+                category,
+            )
+        else:
+            flash(m["text"], category)
 
 
 def _sync(repo: dict[str, Any]) -> bool:
@@ -530,7 +545,6 @@ def _sync(repo: dict[str, Any]) -> bool:
     log.info("sync of repo=%s ok: commit %s", repo["id"], result.commit[:12] or "-")
     commit = f" at {result.commit[:12]}" if result.commit else ""
     flash(f"Synced {repo['name']}{commit} ({result.detail})", "ok")
-    _discover(repo, quiet=True)
     return True
 
 
@@ -731,22 +745,22 @@ def _register_managed(app: Flask) -> None:
             return redirect(url_for("tfrepos_page"))
         # Never the token; the URL has no credentials (refused by validate_git_url).
         log.info("repository added: id=%s source=%s auth=%s", repo_id, source, f.get("git_auth"))
-        flash("Repository added", "ok")
-        if source == "local":  # a git repository is detected after its first Sync
-            _discover(_repo_or_404(repo_id), quiet=True)
+        flash("Repository added: Discover it to find its stacks and environments", "ok")
         return redirect(url_for("settings_tfrepo", repo_id=repo_id))
 
     @app.get("/repos/<int:repo_id>")
     def settings_tfrepo(repo_id: int):
         repo = tfrepo.public_repo(_repo_or_404(repo_id))
         with _read() as conn:
-            envs = tfrepo.list_envs(conn, repo_id)
-            runs = tfrepo.list_runs(conn, repo_id, limit=20)
+            envs = tfrepo.list_envs(conn, repo_id) if conn is not None else []
+            runs = tfrepo.list_runs(conn, repo_id, limit=20) if conn is not None else []
+        accounts = [a.public_dict() for a in _accounts().list()]
         return render_template(
             "tfrepo.html",
             repo=repo,
             envs=envs,
             runs=runs,
+            accounts=accounts,
             auth_modes=tfrepo.GIT_AUTH_LABELS,
             root_exists=Path(repo["path"]).is_dir(),
         )
@@ -786,34 +800,59 @@ def _register_managed(app: Flask) -> None:
         repo = _repo_or_404(repo_id)
         ok = _sync(repo)
         if ok and _store().load().auto_regenerate:
-            repo = _repo_or_404(repo_id)
-            with _read() as conn:
-                envs = tfrepo.list_envs(conn, repo_id)
-            for env in envs or [None]:
-                _analyze(repo, env)
+            try:
+                _flash_job(
+                    _start_discover(_repo_or_404(repo_id), background=False, aws=False, account="")
+                )
+            except JobBusy as exc:
+                flash(str(exc), "error")
         return redirect(
             _safe_next(request.form.get("next"), url_for("settings_tfrepo", repo_id=repo_id))
         )
 
-    @app.post("/repos/<int:repo_id>/analyze")
-    def tfrepo_analyze(repo_id: int):
-        repo = _repo_or_404(repo_id)
-        env = None
-        raw = request.form.get("env_id", "")
-        if raw:
-            with _read() as conn:
-                env = tfrepo.get_env(conn, repo_id, int(raw)) if raw.isdigit() else None
-            if env is None:
-                abort(404)
-        run_id = _analyze(repo, env)
-        if run_id is not None and request.form.get("open") == "1":
-            return redirect(url_for("run_view", run_id=run_id))
-        return redirect(url_for("settings_tfrepo", repo_id=repo_id))
+    # -- Discover: the one entry point (crawl → validate → AWS → render) -------------
 
     @app.post("/repos/<int:repo_id>/discover")
     def tfrepo_discover(repo_id: int):
-        _discover(_repo_or_404(repo_id))
+        """Pages with JavaScript post ``background=1`` and follow the job on the progress
+        screen; a plain form post runs it to the end and opens the run."""
+        repo = _repo_or_404(repo_id)
+        background = request.form.get("background") == "1"
+        try:
+            job = _start_discover(
+                repo,
+                background=background,
+                aws=request.form.get("aws") == "1",
+                account=request.form.get("account_id", ""),
+            )
+        except JobBusy as exc:
+            if background:
+                return jsonify({"ok": False, "error": str(exc), "job": exc.job}), 409
+            flash(str(exc), "error")
+            return redirect(url_for("settings_tfrepo", repo_id=repo_id))
+        if background:
+            return jsonify({"ok": True, "job": job})
+        _flash_job(job)
+        if job["state"] == "done" and job["result"].get("run_id"):
+            return redirect(url_for("run_view", run_id=job["result"]["run_id"]))
         return redirect(url_for("settings_tfrepo", repo_id=repo_id))
+
+    @app.get("/repos/<int:repo_id>/jobs/current")
+    def job_current(repo_id: int):
+        _repo_or_404(repo_id)
+        return jsonify({"job": _jobs().current(_job_key(repo_id))})
+
+    @app.get("/repos/<int:repo_id>/jobs/<job_id>")
+    def job_status(repo_id: int, job_id: str):
+        job = _jobs().status(job_id[:64], _job_key(repo_id))
+        if job is None:
+            abort(404)
+        return jsonify({"job": job})
+
+    @app.post("/repos/<int:repo_id>/jobs/<job_id>/cancel")
+    def job_cancel(repo_id: int, job_id: str):
+        ok = _jobs().cancel(job_id[:64], _job_key(repo_id))
+        return jsonify({"ok": ok, "job": _jobs().status(job_id[:64], _job_key(repo_id))})
 
     @app.post("/repos/<int:repo_id>/envs")
     def tfrepo_env_add(repo_id: int):

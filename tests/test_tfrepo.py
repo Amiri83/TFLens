@@ -13,7 +13,8 @@ from conftest import FIXTURES
 from tflens import tfrepo
 from tflens.crypto import SecretBox
 from tflens.db import closing
-from tflens.output import dumps, run_analysis
+from tflens.output import dumps
+from tflens.pipeline import Options, discover
 
 FAKE_TOKEN = "ghp_" + "Example0Token0For0Tests0Only0000"
 FILE_PROTOCOLS = ("https", "ssh", "file")
@@ -360,7 +361,9 @@ def test_run_writes_model_on_disk_and_only_the_path_in_the_db(
     model_path = Path(run["model_path"])
     assert model_path == out_dir / f"{repo_id}-repo-a" / str(run_id) / "model.json"
     assert (model_path.parent / "report.md").is_file()
-    expected = run_analysis(local_repo, ["envs/dev.tfvars"], {"region": "us-east-1"}).model
+    expected = discover(
+        local_repo, Options(var_files=["envs/dev.tfvars"], cli_vars={"region": "us-east-1"})
+    ).model
     assert model_path.read_text() == dumps(expected)  # deterministic, byte-identical
     assert (run["repo"], run["env"], run["root_path"]) == ("repo-a", "dev", str(local_repo))
     assert run["summary"] == expected["summary"] and run["node_count"] > 0

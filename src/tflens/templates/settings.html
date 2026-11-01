@@ -31,7 +31,7 @@
 
   <h2 id="runs">Runs</h2>
   <label class="check"><input type="checkbox" name="auto_regenerate" value="1" {{ 'checked' if s.auto_regenerate }}>
-    Auto-regenerate: analyze every environment of a repository after each successful Sync</label>
+    Auto-regenerate: Discover a repository after each successful Sync (no AWS check)</label>
   <div class="row">
     <div><label for="retention_runs">Keep runs per repository × environment</label>
       <input id="retention_runs" name="retention_runs" type="number" value="{{ s.retention_runs }}"
@@ -45,7 +45,8 @@
 
 <div class="card muted">
   TFLens analyzes Terraform statically and read-only: no <span class="mono">terraform</span> binary, no
-  AWS API calls, no requests from the browser to anywhere but this server. The only network operation is
-  the <b>Sync</b> of a git repository (a shallow clone), and only when you click it.
+  AWS API calls by default, no requests from the browser to anywhere but this server. The network
+  operations are the <b>Sync</b> of a git repository (a shallow clone), and Discover's optional read-only AWS
+  check, each only when you ask for it.
 </div>
 {% endblock %}

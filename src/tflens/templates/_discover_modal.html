@@ -1,0 +1,20 @@
+{# Discover progress screen (static/discover.js): phases, current step, log, Hide, Cancel. #}
+<div id="discover-modal" class="discover-modal" hidden role="dialog" aria-modal="true" aria-labelledby="discover-title"
+     data-current-url="{{ current_url }}" data-status-url="{{ status_url }}" data-cancel-url="{{ cancel_url }}"
+     {% if csrf_token is defined %}data-csrf="{{ csrf_token }}"{% endif %}>
+  <div class="discover-box">
+    <h2 id="discover-title">Discover</h2>
+    <ol id="discover-phases" class="discover-phases"></ol>
+    <p class="discover-now"><b>Now:</b> <span id="discover-step"></span>
+      · <span id="discover-state"></span> · <span id="discover-elapsed"></span></p>
+    <pre id="discover-log" class="discover-log" aria-live="polite"></pre>
+    <ul id="discover-messages" class="discover-messages"></ul>
+    <p class="discover-actions">
+      <button type="button" id="discover-hide" class="secondary">Hide</button>
+      <button type="button" id="discover-cancel" class="danger">Cancel</button>
+      <button type="button" id="discover-close" hidden>Close</button>
+    </p>
+  </div>
+</div>
+<button type="button" id="discover-badge" class="discover-badge" hidden></button>
+<script src="{{ url_for('static', filename='discover.js') }}" defer></script>

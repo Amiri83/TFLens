@@ -361,21 +361,22 @@ def test_environments_are_detected_and_edits_are_kept(client, tmp_path):
     repo_dir = tmp_path / "repo-a"
     shutil.copytree(FIXTURES / "multi_root_envs", repo_dir)
     repo_id = _add(client, repo_dir)
+    # one Discover run: the environments are recorded, the run opens in the analyzer
+    resp = _post(client, f"/repos/{repo_id}/discover")
+    run_url = resp.headers["Location"]
+    assert re.fullmatch(r"/runs/\d+/", run_url)
     page = client.get(f"/repos/{repo_id}").data.decode()
-    assert "Environments detected: 4 found" in page
     assert "stacks/shared/vars/uat.tfvars" in page and "envs/prod/" in page
     db = client.application.extensions["tflens"]["paths"].db_path
     with closing(db) as conn:
         envs = {(e["env"], e["root_rel"]): e for e in tfrepo.list_envs(conn, repo_id)}
+    assert len(envs) == 4
     uat = envs[("uat", "stacks/shared")]
     assert uat["kinds"] == "tfvars" and not uat["confirmed"]
-    # analyzing a detected environment covers its root only
-    resp = _post(client, f"/repos/{repo_id}/analyze", {"env_id": str(uat["id"]), "open": "1"})
-    run_url = resp.headers["Location"]
     summary = client.get(run_url + "api/summary").get_json()
-    assert summary["roots"] == ["stacks/shared"] and summary["status"] == "ok"
+    assert "stacks/shared" in summary["roots"] and summary["status"] == "ok"
     overview = client.get(run_url + "api/overview").get_json()
-    assert overview["roots"][0]["dir"] == "stacks/shared"
+    assert "stacks/shared" in {r["dir"] for r in overview["roots"]}
     src = client.get(
         run_url + "api/source", query_string={"file": "stacks/shared/main.tf", "start": 3}
     ).get_json()
@@ -400,27 +401,27 @@ def test_failed_runs_are_listed_with_their_reason(client, tmp_path):
     empty = tmp_path / "repo-a"
     shutil.copytree(FIXTURES / "no_terraform", empty)
     repo_id = _add(client, empty)
-    resp = _post(client, f"/repos/{repo_id}/analyze", {"open": "1"})
+    resp = _post(client, f"/repos/{repo_id}/discover")
     run_url = resp.headers["Location"]
     assert re.fullmatch(r"/runs/\d+/", run_url)  # the failed run opens: the repository is shown
     tree = client.get(run_url + "api/tree").get_json()
     assert {n["path"] for n in _walk(tree) if n["type"] == "file"} >= {"README.md", "src/app.py"}
     assert client.get(run_url + "api/summary").get_json()["status"] == "failed"
     # a precondition failure is recorded too (no model)
-    _post(client, f"/repos/{repo_id}/envs", {"env": "dev", "var_files": "envs/missing.tfvars"})
     db = client.application.extensions["tflens"]["paths"].db_path
-    with closing(db) as conn:
-        env_id = conn.execute("SELECT id FROM tf_repo_envs WHERE env='dev'").fetchone()[0]
-    _post(client, f"/repos/{repo_id}/analyze", {"env_id": str(env_id)})
+    moved = tmp_path / "moved"
+    empty.rename(moved)
+    _post(client, f"/repos/{repo_id}/discover")
+    moved.rename(empty)
     runs = client.get("/runs").data.decode()
     assert runs.count('class="badge err">failed') == 2
     assert "nothing to analyze: no *.tf, *.tf.json or terragrunt.hcl" in runs
-    assert "tfvars file envs/missing.tfvars not found in the repository" in runs
+    assert "the directory does not exist" in runs
     assert "What is in the repository" in runs and "docs/img/" in runs
     with closing(db) as conn:
         failed = conn.execute("SELECT id FROM runs WHERE model_path=''").fetchone()[0]
     resp = client.get(f"/runs/{failed}/")
-    assert resp.status_code == 404 and b"envs/missing.tfvars not found" in resp.data
+    assert resp.status_code == 404 and b"the directory does not exist" in resp.data
 
 
 def test_standalone_analyzer_overview(tmp_path):

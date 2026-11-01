@@ -293,7 +293,10 @@ def test_local_repo_env_analyze_and_open_run(app, client, repo_dir):
     with closing(_paths(app).db_path) as conn:
         env_id = conn.execute("SELECT id FROM tf_repo_envs").fetchone()[0]
 
-    resp = _post(client, f"/repos/{repo_id}/analyze", {"env_id": str(env_id), "open": "1"})
+    assert env_id
+    # the separate Analyze entry point is gone: Discover is the only one
+    assert _post(client, f"/repos/{repo_id}/analyze").status_code in (404, 405)
+    resp = _post(client, f"/repos/{repo_id}/discover")
     assert resp.status_code == 302
     run_url = resp.headers["Location"]
     assert re.fullmatch(r"/runs/\d+/", run_url)
@@ -303,7 +306,7 @@ def test_local_repo_env_analyze_and_open_run(app, client, repo_dir):
     index = client.get(run_url)
     assert index.status_code == 200 and b"/static/app.js" in index.data
     summary = client.get(run_url + "api/summary").get_json()
-    assert summary["readonly"] is True and summary["title"] == f"repo-a (dev) · run {run_id}"
+    assert summary["readonly"] is True and summary["title"] == f"repo-a · run {run_id}"
     assert client.get(run_url + "api/graph").get_json()["filters"]["kinds"]
     node = "module.worker.aws_lambda_function.this"
     detail = client.get(run_url + "api/node", query_string={"id": node}).get_json()
@@ -318,7 +321,7 @@ def test_local_repo_env_analyze_and_open_run(app, client, repo_dir):
     assert FAKE_TOKEN not in _dump(app) and FAKE_TOKEN not in _log_text(app)
 
     runs = client.get("/runs").data.decode()
-    assert f'href="/runs/{run_id}/"' in runs and "dev" in runs
+    assert f'href="/runs/{run_id}/"' in runs
     assert f'href="/runs/{run_id}/"' in client.get(f"/runs?repo={repo_id}").data.decode()
 
     assert _post(client, f"/runs/{run_id}/delete").status_code == 302
@@ -327,11 +330,11 @@ def test_local_repo_env_analyze_and_open_run(app, client, repo_dir):
     assert not (repo_dir / "tflens-out").exists()  # nothing written into the repository
 
 
-def test_analyze_without_env_and_retention(app, client, repo_dir):
+def test_discover_and_retention(app, client, repo_dir):
     _post(client, "/settings", {"server_form": "1", "retention_runs": "2"})
     repo_id = _add_local_repo(client, repo_dir)
     for _ in range(3):
-        assert _post(client, f"/repos/{repo_id}/analyze").status_code == 302
+        assert _post(client, f"/repos/{repo_id}/discover").status_code == 302
     with closing(_paths(app).db_path) as conn:
         ids = [r[0] for r in conn.execute("SELECT id FROM runs ORDER BY id")]
     assert ids == [2, 3]
@@ -399,16 +402,15 @@ def test_git_sync_and_auto_regenerate(app, client, repo_dir):
         {"source": "git", "url": repo_dir.as_uri(), "git_auth": "none", "name": "repo-b"},
     )
     repo_id = int(resp.headers["Location"].rsplit("/", 1)[1])
-    _post(client, f"/repos/{repo_id}/envs", {"env": "dev", "var_files": "envs/dev.tfvars"})
-    _post(client, f"/repos/{repo_id}/envs", {"env": "prod"})
     resp = _post(client, f"/repos/{repo_id}/sync", follow_redirects=True)
     page = resp.data.decode()
-    assert "Synced repo-b at" in page and page.count("Analyzed repo-b /") == 2
+    # auto-regenerate: one Discover run after the sync (every environment in it)
+    assert "Synced repo-b at" in page and page.count("Discovered repo-b: run") == 1
     assert (_paths(app).repos_dir / str(repo_id) / "main.tf").is_file()
     with closing(_paths(app).db_path) as conn:
-        envs = [r[0] for r in conn.execute("SELECT env FROM runs ORDER BY env")]
-        commits = {r[0] for r in conn.execute("SELECT commit_sha FROM runs")}
-    assert envs == ["dev", "prod"] and len(next(iter(commits))) == 40
+        runs = conn.execute("SELECT env, commit_sha FROM runs").fetchall()
+        envs = [r[0] for r in conn.execute("SELECT env FROM tf_repo_envs")]
+    assert len(runs) == 1 and len(runs[0][1]) == 40 and envs == ["dev"]
     # removing the repository deletes its clone, keeps the run history
     assert _post(client, f"/repos/{repo_id}/delete").status_code == 302
     assert not (_paths(app).repos_dir / str(repo_id)).exists()

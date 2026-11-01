@@ -23,7 +23,7 @@
     {{ nav_link('settings_page', 'Settings', ep.startswith('settings_page') or ep == 'settings_save') }}
     {{ nav_link('logs', 'Logs', ep == 'logs') }}
   </nav>
-  <span class="ctx">static, read-only Terraform analysis · no cloud calls · v{{ version }}</span>
+  <span class="ctx">static, read-only Terraform analysis · no cloud calls unless a run's AWS check is on · v{{ version }}</span>
   {% endif %}
 </header>
 <main>

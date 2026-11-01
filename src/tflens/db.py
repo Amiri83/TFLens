@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT
 );
 
--- AWS accounts (kept for parity with IPLens; TFLens itself makes no AWS calls). Secrets
+-- AWS accounts (parity with IPLens; used only by Discover's optional read-only AWS check). Secrets
 -- are Fernet-encrypted (crypto.SecretBox); memory-only credentials are never written here.
 CREATE TABLE IF NOT EXISTS accounts (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,

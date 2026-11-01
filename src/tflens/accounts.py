@@ -1,7 +1,8 @@
 """AWS account records: auth configuration, credentials and named-profile discovery.
 
-Kept in step with IPLens's ``accounts`` module so the two can merge: TFLens's analysis
-never uses these records (it makes no AWS calls at all).
+Kept in step with IPLens's ``accounts`` module so the two can merge. The static analysis
+never uses these records; Discover's optional AWS check (:mod:`tflens.awscheck`, off by
+default, turned on per run) makes read-only calls with the account chosen for that run.
 
 Secret values (secret access key, session token) are stored Fernet-encrypted
 (:class:`~tflens.crypto.SecretBox`) or, for memory-only accounts, held in a

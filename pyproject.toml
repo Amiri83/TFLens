@@ -18,6 +18,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Discover's optional, read-only AWS check (phase 3); without it the phase is skipped
+aws = [
+    "boto3>=1.28",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",

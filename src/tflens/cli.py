@@ -22,8 +22,9 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .output import dumps, listing_text, run_analysis
+from .output import dumps, listing_text
 from .overview import build_overview, render_overview_markdown
+from .pipeline import Options, discover
 from .report import render_report
 from .settings import DEFAULT_HOST, DEFAULT_PORT
 
@@ -112,14 +113,16 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        analysis = run_analysis(
+        analysis = discover(
             root,
-            args.var_file,
-            dict(args.var),
-            git=not args.no_git,
-            env=args.env,
-            auto_env=auto_env,
-        )
+            Options(
+                var_files=list(args.var_file or []),
+                cli_vars=dict(args.var),
+                git=not args.no_git,
+                env=args.env,
+                auto_env=auto_env,
+            ),
+        ).analysis
     except ValueError as exc:
         print(f"tflens: error: {exc}", file=sys.stderr)
         return 2
@@ -261,6 +264,13 @@ def serve_main(argv: list[str]) -> int:
     )
     parser.add_argument("--no-browser", action="store_true", help="do not open a browser")
     parser.add_argument(
+        "--aws-profile",
+        metavar="NAME",
+        help="with --dir: the AWS named profile Discover's optional, read-only AWS check uses "
+        "(off unless turned on for a run; never stored)",
+    )
+    parser.add_argument("--aws-region", metavar="REGION", default="", help="with --aws-profile")
+    parser.add_argument(
         "--allow-remote",
         action="store_true",
         help="allow a non-loopback --host (there is NO authentication)",
@@ -271,9 +281,18 @@ def serve_main(argv: list[str]) -> int:
 
     standalone = args.dir is not None
     if not standalone and (
-        args.model or args.regenerate or args.var_file or args.var or args.env or args.no_env
+        args.model
+        or args.regenerate
+        or args.var_file
+        or args.var
+        or args.env
+        or args.no_env
+        or args.aws_profile
     ):
-        parser.error("--model, --regenerate, --var-file, --var, --env and --no-env need --dir")
+        parser.error(
+            "--model, --regenerate, --var-file, --var, --env, --no-env and --aws-profile need "
+            "--dir (managed mode: add an account under Accounts)"
+        )
     if standalone and args.home:
         parser.error("--home has no effect with --dir (standalone mode uses no data directory)")
 
@@ -303,6 +322,7 @@ def serve_main(argv: list[str]) -> int:
     from .web import create_app
 
     if standalone:
+        from .awscheck import target_from_profile
         from .webapi import ModelStore, default_model_path
 
         root = args.dir.resolve()
@@ -313,6 +333,9 @@ def serve_main(argv: list[str]) -> int:
             dict(args.var),
             env=args.env,
             auto_env=auto_env,
+            aws=target_from_profile(args.aws_profile, args.aws_region)
+            if args.aws_profile
+            else None,
         )
         try:
             if args.regenerate or args.env:
@@ -358,6 +381,9 @@ def serve_main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+    finally:
+        # a Discover still running is cancelled and its worker joined: none left behind
+        app.extensions["tflens"]["jobs"].shutdown()
     return 0
 
 

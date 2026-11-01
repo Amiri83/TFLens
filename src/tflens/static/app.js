@@ -67,7 +67,7 @@
   }
 
   // ------------------------------------------------------------ views
-  const VIEWS = ["environments", "roots", "flow", "overview", "graph", "repo", "diagrams"];
+  const VIEWS = ["environments", "roots", "flow", "overview", "graph", "repo", "diagrams", "discovery"];
   let graphFitted = false; // the graph is laid out while hidden: fit it when first shown
 
   function setView(view) {
@@ -226,22 +226,43 @@
     return el("table", { class: "env-stacks" }, el("thead", {}, head), el("tbody", {}, ...rows));
   }
 
-  // Debug: per stack, every environment file found for it (tfvars, backend-<env>.hcl,
-  // environment directories, CI lines), accepted or not, and why; when none was
-  // accepted, why no environment was detected.
+  // Debug, grouped by environment: one line per environment with its status, the number
+  // of real files that are its evidence and how many times docs / CI / git mention it
+  // (hints, never evidence); its files and a few hint sources inside. The rejected
+  // candidate files are one group of their own. Never one line per doc mention.
   function envFilesDebug(envs) {
-    return el("div", { class: "env-debug" }, ...(envs.stacks || []).map((s) => {
-      const files = s.env_files || [];
-      const items = files.map((t) => el("li", { class: t.accepted ? "ov-line" : "ov-line st-unknown" },
-        el("span", { class: "tag" }, t.accepted ? "accepted " : "rejected "),
-        locLink({ file: t.file, start_line: 1, end_line: 1 }),
-        ` — ${t.kind}${t.env ? ` → ${t.env}` : ""}: ${t.reason}`));
-      if (s.no_env_reason) items.push(el("li", { class: "ov-line st-unknown" }, `No environment: ${s.no_env_reason}`));
-      if (!items.length) items.push(el("li", { class: "ov-line muted" }, "no environment files"));
-      const title = `${s.id}${s.library ? " (reusable module, not deployed from here)" : ""} — ${s.environments.length} environment(s), ${files.filter((t) => t.accepted).length} file(s) accepted`;
-      return el("details", { class: "drilldown", "data-stack": s.id, open: s.environments.length ? null : "" },
-        el("summary", { class: "mono" }, title), el("ul", { class: "overview-lines" }, ...items));
-    }));
+    const dbg = envs.env_debug || { groups: [], rejected: [] };
+    const groups = dbg.groups.map((g) => {
+      const cls = g.status === "confirmed" ? "ov-line" : "ov-line st-unknown";
+      const mentions = g.hint_mentions ? ` · ${g.hint_mentions} mention(s) in ${g.hint_via.join(", ")} (hints)` : " · not mentioned in docs / CI";
+      const where = g.stacks.length ? ` · ${g.stacks.length} stack(s): ${g.stacks.join(", ")}` : "";
+      const head = `${g.env} — ${g.status} · ${g.evidence_count} evidence file(s)${where}${mentions}`;
+      const items = g.files.map((t) => el("li", { class: "ov-line" },
+        locLink({ file: t.file, start_line: 1, end_line: 1 }), ` — ${t.kind} (stack ${t.stack}): ${t.reason}`));
+      for (const f of g.evidence.filter((f) => !g.files.some((t) => t.file === f))) {
+        items.push(el("li", { class: "ov-line" }, locLink({ file: f, start_line: 1, end_line: 1 })));
+      }
+      if (g.reason && g.status !== "confirmed") items.push(el("li", { class: "ov-line st-unknown" }, g.reason));
+      if (g.hint_sources.length) {
+        items.push(el("li", { class: "ov-line muted" }, `hint sources (first ${g.hint_sources.length} of ${g.hint_mentions}): ` +
+          g.hint_sources.map((h) => (h.line ? `${h.file}:${h.line}` : h.file)).join(", ")));
+      }
+      return el("details", { class: "drilldown env-group", "data-env": g.env, "data-status": g.status },
+        el("summary", { class: `mono ${cls}` }, head), el("ul", { class: "overview-lines" }, ...items));
+    });
+    if (dbg.rejected.length) {
+      groups.push(el("details", { class: "drilldown env-group", "data-env": "" },
+        el("summary", { class: "mono" }, `rejected candidate files — ${dbg.rejected.length}`),
+        el("ul", { class: "overview-lines" }, ...dbg.rejected.map((r) => el("li", { class: "ov-line st-unknown" },
+          locLink({ file: r.file, start_line: 1, end_line: 1 }), ` (stack ${r.stack}): ${r.reason}`)))));
+    }
+    const noEnv = (envs.stacks || []).filter((s) => s.no_env_reason && !s.library);
+    if (noEnv.length) {
+      groups.push(el("ul", { class: "overview-lines" }, ...noEnv.map((s) =>
+        el("li", { class: "ov-line st-unknown" }, `${s.id}: no environment — ${s.no_env_reason}`))));
+    }
+    if (!groups.length) groups.push(el("p", { class: "muted" }, "no environment files"));
+    return el("div", { class: "env-debug" }, ...groups);
   }
 
   function stackLinksList(envs) {
@@ -414,8 +435,9 @@
         stacksTable(envs));
     }
     if ((envs.stacks || []).length) {
-      section("env-debug", "Environment files per stack (debug)",
-        el("p", { class: "muted" }, "Every tfvars / backend-<env>.hcl / environment directory / CI line found at any depth below each stack, accepted or rejected, and why. The environment name is the file stem."),
+      const dbg = envs.env_debug || { confirmed: 0 };
+      section("env-debug", `Environments (debug): ${dbg.confirmed} confirmed`,
+        el("p", { class: "muted" }, "Grouped by environment. Evidence = real tfvars / backend-<env>.hcl / environment directory files in a stack's tree; docs, CI and git mentions are hints and never create an environment."),
         envFilesDebug(envs));
     }
     if ((envs.stack_links || []).length) {
@@ -1248,11 +1270,67 @@
     return el("div", { class: "diagram-panel" }, bar, view);
   }
 
+  // ------------------------------------------------------------ discovery
+  function statusTag(status) {
+    return el("span", { class: `tag st-${status}` }, status);
+  }
+
+  function hintSources(it) {
+    if (!it.hint_sources || !it.hint_sources.length) return null;
+    return el("details", { class: "small" }, el("summary", {}, `${it.hint_mentions} mention(s) in ${it.via.join(", ")}`),
+      el("ul", { class: "overview-lines" }, ...it.hint_sources.map((h) => el("li", { class: "ov-line" },
+        h.line ? locLink({ file: h.file, start_line: h.line, end_line: h.line }) : h.file, ` — ${h.text}`))));
+  }
+
+  function validationTable(items, label) {
+    const head = el("tr", {}, el("th", {}, label), el("th", {}, "Status"), el("th", {}, "Evidence (code)"), el("th", {}, "Hints (docs / CI / git)"));
+    const rows = items.map((it) => el("tr", { class: `val-row val-${it.status}`, "data-name": it.name },
+      el("td", { class: "mono" }, it.name), el("td", {}, statusTag(it.status)),
+      el("td", {}, it.reason || ""), el("td", {}, hintSources(it) || el("span", { class: "muted" }, "none"))));
+    return el("table", { class: "validation" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
+  function renderDiscovery(d) {
+    const box = document.getElementById("discovery");
+    if (!d.available) {
+      box.replaceChildren(el("p", { class: "muted" }, d.note));
+      document.getElementById("discovery-toc").replaceChildren();
+      return;
+    }
+    const toc = [];
+    const parts = [];
+    const section = (id, title, ...content) => {
+      toc.push([id, title]);
+      parts.push(el("h2", { id, class: "rv-section" }, title), ...content);
+    };
+    section("dc-phases", "Phases", el("ol", { class: "overview-lines" }, ...d.phases.map((p) =>
+      el("li", { class: "ov-line" }, el("b", {}, p.label), ` — ${p.status}${p.detail ? `: ${p.detail}` : ""}`))));
+    const v = d.validation;
+    section("dc-mismatch", `Docs vs code (${v.mismatches.length})`, v.mismatches.length
+      ? el("ul", { class: "overview-lines" }, ...v.mismatches.map((m) => el("li", { class: "ov-line st-unknown" },
+        statusTag(m.status), ` ${m.kind} `, el("span", { class: "mono" }, m.name), `: ${m.text} `, m.location ? locLink(m.location) : null)))
+      : el("p", { class: "muted" }, "None: docs, CI and the code agree."));
+    section("dc-envs", "Environments", validationTable(v.envs, "Environment"));
+    section("dc-stacks", "Stacks", validationTable(v.stacks, "Stack"));
+    section("dc-links", "Links between stacks", v.links.length ? validationTable(v.links, "Link") : el("p", { class: "muted" }, "None."));
+    const aws = d.aws;
+    section("dc-aws", "AWS check", el("p", { class: aws.status === "done" ? "" : "muted" }, `${aws.status}: ${aws.message}`),
+      aws.checks.length ? el("ul", { class: "overview-lines" }, ...aws.checks.map((c) => el("li", { class: c.status === "exists" ? "ov-line" : "ov-line st-unknown" },
+        link(c.id, () => showDetail("node", c.id)), ` ${c.name}: ${c.status}${c.detail ? ` (${c.detail})` : ""}`))) : null);
+    section("dc-hints", `Hint files read (${d.crawl.hint_files.length})`, el("ul", { class: "overview-lines" },
+      ...d.crawl.hint_files.map((h) => el("li", { class: "ov-line" }, `${h.via}: `, locLink({ file: h.file, start_line: 1, end_line: 1 })))));
+    section("dc-tree", `Files (${d.crawl.files}${d.crawl.truncated ? ", truncated" : ""}; ${d.crawl.skipped.length} director(ies) skipped)`,
+      el("pre", { class: "listing discovery-tree" }, d.crawl.tree.join("\n")));
+    box.replaceChildren(...parts);
+    document.getElementById("discovery-toc").replaceChildren(...tocLinks(toc));
+  }
+
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree, ov, fl, shapes, envs] = await Promise.all(
+    const [summary, graph, tree, ov, fl, shapes, envs, disc] = await Promise.all(
       [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview"), api("api/flow"),
-        api("api/shapes"), api("api/environments")]);
+        api("api/shapes"), api("api/environments"), api("api/discovery")]);
+    renderDiscovery(disc);
     renderEnvSwitch(envs);
     renderEnvironments(envs);
     renderOverview(ov, envs);
@@ -1260,8 +1338,8 @@
     renderRoots(shapes);
     renderFailure(summary, ov);
     document.getElementById("title").textContent = summary.title;
-    // a recorded run (managed mode) is read-only: no Regenerate, a way back to the runs
-    document.getElementById("regenerate").classList.toggle("hidden", Boolean(summary.readonly));
+    // a recorded run (managed mode) is read-only: no Discover, a way back to the runs
+    document.getElementById("discover-form").classList.toggle("hidden", Boolean(summary.readonly));
     document.getElementById("home").classList.toggle("hidden", !location.pathname.startsWith("/runs/"));
     // a recorded run: diff against the previous run (managed mode only)
     document.getElementById("changes").classList.toggle("hidden", !location.pathname.startsWith("/runs/"));
@@ -1289,16 +1367,6 @@
       if (e.key === "Escape") {
         clearFocus();
         hideTooltip();
-      }
-    });
-    const regen = document.getElementById("regenerate");
-    regen.addEventListener("click", async () => {
-      regen.disabled = true;
-      try {
-        await api("api/regenerate", { method: "POST", headers: { "X-TFLens": "1" } });
-        await loadAll();
-      } finally {
-        regen.disabled = false;
       }
     });
     const envSelect = document.getElementById("env");

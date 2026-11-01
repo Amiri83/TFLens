@@ -216,8 +216,8 @@ def stack_env_debug(
     else:
         why = (
             f"no candidates: no *.tfvars (other than terraform.tfvars / *.auto.tfvars), "
-            f"backend-<env>.hcl / <env>.tfbackend, environment directory or CI -var-file / "
-            f"-backend-config line at or below {where}"
+            f"backend-<env>.hcl / <env>.tfbackend or environment directory at or below "
+            f"{where} (CI / doc lines are hints only)"
         )
     out["no_env_reason"] = why
     return out
@@ -846,9 +846,10 @@ def detect_environments(
     Each is ``{name, root, kinds, var_files, backend_hcl, var_file_cli, evidence, roots}``:
     its tfvars files, its partial backend configurations (``backend.<env>.hcl``,
     ``<env>.tfbackend``, ``backend/<env>.hcl``) and the ``-var-file`` / ``-backend-config``
-    options naming them in CI files and docs. Backend files and CLI usages are attached to
-    the environment found from the layout or tfvars; they only add a kind (``backend`` /
-    ``ci``) when they are what reveals the environment.
+    options naming them in CI files and docs. Backend files are attached to the
+    environment found from the layout or tfvars and add the kind ``backend`` when they are
+    what reveals it. CI / script / doc lines are hints: they are attached to an
+    environment real files established and never create one (rejected in ``trace``).
 
     Detection is per stack: a tfvars file or a partial backend configuration at any depth
     below a root belongs to that root (the deepest one) and its stem names the
@@ -1026,6 +1027,15 @@ def detect_environments(
             add(owner, name, kind, loc, owner if owner in roots else None)
         return envs[key]
 
+    def existing(owner: str, name: str) -> dict[str, Any] | None:
+        """The environment ``name`` of ``owner`` (or of a directory covering it), if one
+        was found from real files; never created."""
+        key = (owner, env_name(name))
+        if key in envs:
+            return envs[key]
+        covering = [k for k in envs if k[1] == key[1] and in_scope(owner, k[0])]
+        return envs[max(covering, key=lambda k: len(k[0]))] if covering else None
+
     # 3. partial backend configurations: backend.<env>.hcl, <env>.tfbackend, backend/<env>.hcl,
     # env/<env>.hcl: matched to the environment of the same name
     configs = backend_files(repo)
@@ -1076,7 +1086,9 @@ def detect_environments(
             e["backend_hcl"].append(f)
         if f not in repo.files:
             repo.files.append(f)  # listed, so its source can be shown
-    # 4. -backend-config / -var-file in CI files, scripts and docs
+    # 4. -backend-config / -var-file in CI files, scripts and docs: hints only. They are
+    # attached to an environment that a real tfvars / backend file / environment
+    # directory already established; they never create one.
     for use in cli_env_files(repo, roots):
         if use["env"] is None:
             # a literal path: the environment that already lists the file
@@ -1084,12 +1096,20 @@ def detect_environments(
                 (x for x in envs.values() if use["file"] in x["var_files"] + x["backend_hcl"]),
                 None,
             )
-            stem = posixpath.basename(use["file"]).split(".")[0]
-            if e is None and stem.lower() in ENV_WORDS:
-                e = attach(use["owner"], stem, "ci", use["loc"])
         else:
-            e = attach(use["owner"], use["env"], "ci", use["loc"])
+            e = existing(use["owner"], use["env"])
         if e is None:
+            src = use["loc"]
+            note(
+                use["file"],
+                use["owner"],
+                use["env"],
+                "ci",
+                False,
+                f"{use['flag']} {use['value']} in {src.file}:{src.start_line}: a CI / doc line "
+                "is a hint, not evidence; no tfvars / backend file of this stack defines "
+                "the environment",
+            )
             continue
         src = use["loc"]
         note(
