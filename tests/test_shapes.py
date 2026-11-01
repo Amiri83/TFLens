@@ -396,11 +396,11 @@ def test_per_root_flow_diagram(tmp_path):
     )
 
 
-def test_root_view_is_the_landing_tab_with_switchers(tmp_path):
+def test_root_view_follows_the_environments_tab_with_switchers(tmp_path):
     api = _api(tmp_path)
     html = api.handle("GET", "/").body.decode()
-    assert '<button type="button" class="tab active" data-view="roots">Root view</button>' in html
-    assert '<div id="roots" class="view-roots">' in html
+    assert '<button type="button" class="tab" data-view="roots">Root view</button>' in html
+    assert '<div id="roots" class="view-roots hidden">' in html
     assert '<div id="root-list"></div>' in html  # the per-root switcher
     js = api.handle("GET", "/static/app.js").body.decode()
     assert 'api("api/shapes")' in js and "renderRoots(shapes)" in js

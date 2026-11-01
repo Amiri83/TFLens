@@ -67,7 +67,7 @@
   }
 
   // ------------------------------------------------------------ views
-  const VIEWS = ["roots", "flow", "overview", "graph", "repo", "diagrams"];
+  const VIEWS = ["environments", "roots", "flow", "overview", "graph", "repo", "diagrams"];
   let graphFitted = false; // the graph is laid out while hidden: fit it when first shown
 
   function setView(view) {
@@ -108,7 +108,8 @@
 
   // ------------------------------------------------------------ overview
   function overviewLine(ln) {
-    const parts = [ln.text];
+    // a line naming a view (Start here's "Environments ...") opens it
+    const parts = [ln.view ? link(ln.text, () => setView(ln.view)) : ln.text];
     if (ln.location) parts.push(" ", locLink(ln.location));
     if (ln.node) parts.push(" ", link("details", () => showDetail("node", ln.node)));
     if (ln.edge) parts.push(" ", link("evidence", () => showDetail("edge", ln.edge)));
@@ -140,15 +141,17 @@
       const files = [...r.backend_hcl, ...r.var_files];
       return el("tr", { class: r.id === envs.active ? "env-row active" : "env-row", "data-env": r.id },
         el("td", {}, r.id),
-        ...types.map((t) => el("td", { class: "num" }, String(r.counts[t.type] || 0),
-          r.uncertain[t.type] ? el("span", { class: "st-unknown", title: "count not known statically" }, " ?") : null)),
+        ...types.map((t) => el("td", { class: r.uncertain[t.type] ? "num st-unknown" : "num",
+          title: r.uncertain[t.type] ? "blocks whose count is not known statically are not counted" : "" },
+          countText(r.counts[t.type] || 0, r.uncertain[t.type] || 0))),
         el("td", { class: r.unknown_count ? "num st-unknown" : "num" }, String(r.unknown_count)),
         el("td", {}, ...files.flatMap((f, i) => [i ? ", " : "",
           locLink({ file: f, start_line: 1, end_line: 1 })])));
     });
     const t = envs.total;
     const total = el("tr", { class: "env-total" }, el("td", {}, el("strong", {}, "Total")),
-      ...types.map((x) => el("td", { class: "num" }, el("strong", {}, String(t.counts[x.type] || 0)))),
+      ...types.map((x) => el("td", { class: "num" },
+        el("strong", {}, countText(t.counts[x.type] || 0, (t.uncertain || {})[x.type] || 0)))),
       el("td", { class: "num" }, el("strong", {}, String(t.unknown_count))), el("td", {}, ""));
     return el("table", { class: "env-counts" }, el("thead", {}, head), el("tbody", {}, ...rows, total));
   }
@@ -164,6 +167,190 @@
       items.push(el("li", { class: "ov-line" }, `… ${shown.unknown_count - shown.unknowns.length} more`));
     }
     return [el("h3", {}, `${title} (${shown.unknown_count})`), el("ul", { class: "overview-lines" }, ...items)];
+  }
+
+  // "4", or "4 (+3 uncertain)": a block whose count is not known is never counted as 1
+  function countText(known, uncertain) {
+    return uncertain ? `${known} (+${uncertain} uncertain)` : String(known);
+  }
+
+  // ------------------------------------------------------------ environments view
+  // The first tab (what Start here opens): the detected environments and their files,
+  // the state file of each, the service inventory with one column per environment (the
+  // rows that differ highlighted; click a count for the names, file:line and why it is
+  // counted so), and the differences between environments. Flows, Network and IAM
+  // follow the environment selected here or in the switcher.
+  function fileLinks(files) {
+    if (!files.length) return [el("span", { class: "muted" }, "—")];
+    return files.flatMap((f, i) => [i ? ", " : "", locLink({ file: f, start_line: 1, end_line: 1 })]);
+  }
+
+  function envFilesTable(envs) {
+    const head = el("tr", {}, el("th", {}, "Environment"), el("th", {}, "Wired"),
+      el("th", {}, "tfvars"), el("th", {}, "Backend config"), el("th", {}, "CI / script lines"));
+    const rows = envs.environments.map((r) => {
+      const ci = r.var_file_cli.map((u) => el("div", {}, `${u.flag}=${u.value} `, locLink(u.location)));
+      const wired = r.wired
+        ? el("td", { title: r.wiring.join("; ") }, "yes")
+        : el("td", { class: "st-unknown", title: r.not_wired_reason || "" }, "not wired");
+      return el("tr", { class: `env-row${r.id === envs.active ? " active" : ""}${r.wired ? "" : " not-wired"}`, "data-env": r.id },
+        el("td", {}, envButton(envs, r.id)), wired,
+        el("td", {}, ...fileLinks(r.var_files)), el("td", {}, ...fileLinks(r.backend_hcl)),
+        el("td", {}, ...(ci.length ? ci : [el("span", { class: "muted" }, "—")])));
+    });
+    return el("table", { class: "env-files" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
+  // An environment's name; a button applying it when the analysis can switch.
+  function envButton(envs, id) {
+    const label = id === envs.active ? `${id} (shown)` : id;
+    if (!envs.switchable || id === envs.active) return el("strong", {}, label);
+    return el("button", { type: "button", class: "env-apply", title: `Analyze as ${id}`, onclick: () => selectEnv(id) }, label);
+  }
+
+  function stateTable(envs) {
+    const keys = [];
+    for (const r of envs.environments) {
+      for (const s of (r.state && r.state.settings) || []) if (!keys.includes(s.key)) keys.push(s.key);
+    }
+    const head = el("tr", {}, el("th", {}, "Environment"), el("th", {}, "Backend"),
+      ...keys.map((k) => el("th", {}, k)));
+    const rows = envs.environments.map((r) => {
+      const st = r.state || { type: "?", settings: [] };
+      const by = new Map(st.settings.map((s) => [s.key, s]));
+      return el("tr", { class: r.id === envs.active ? "env-row active" : "env-row" },
+        el("td", {}, r.id), el("td", { title: st.origin || st.note || "" }, st.type),
+        ...keys.map((k) => {
+          const s = by.get(k);
+          if (!s) return el("td", { class: "muted" }, "—");
+          if (!s.known) return el("td", { class: "st-unknown", title: s.reason || "" }, "UNKNOWN");
+          return el("td", { class: "mono" }, s.value, " ", locLink(s.location));
+        }));
+    });
+    return el("table", { class: "env-state" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
+  function whySteps(why) {
+    return el("ol", { class: "why-steps" }, ...why.steps.map((s) => el("li", { class: s.instances === null ? "st-unknown" : "" },
+      `${s.address}: ${s.meta} = ${s.expression} → ${s.instances === null ? "not known" : s.instances} `,
+      locLink(s.location), s.reason ? el("div", { class: "tag" }, s.reason) : null,
+      s.sources.length ? el("ul", {}, ...s.sources.map(whySource)) : null)));
+  }
+
+  function whySource(s) {
+    const what = {
+      unset: `${s.ref} is not set (no default, no value in tfvars)`,
+      tfvars: `${s.ref} = ${s.value} from tfvars`,
+      default: `${s.ref} = ${s.value} (variable default)`,
+      "--var": `${s.ref} = ${s.value} (--var)`,
+    }[s.origin] || `${s.ref} = ${s.value} (${s.origin}${s.expression ? `: ${s.expression}` : ""})`;
+    return el("li", { class: s.known ? "" : "st-unknown" }, what, " ", locLink(s.location),
+      s.from && s.from.length ? el("ul", {}, ...s.from.map(whySource)) : null);
+  }
+
+  function showInventoryCell(row, column, cell) {
+    const panel = document.getElementById("detail");
+    const title = column ? `${row.label} in ${column}` : row.label;
+    const parts = [el("h2", {}, `${title}: ${countText(cell.count, cell.uncertain)}`)];
+    if (cell.uncertain) {
+      parts.push(el("p", { class: "st-unknown" },
+        `${cell.uncertain} block(s) with a count not known statically: not counted (never assumed to be 1); see why below.`));
+    }
+    if (!cell.items.length) parts.push(el("p", { class: "muted" }, "None created."));
+    for (const it of cell.items) {
+      const only = row.only[it.id];
+      parts.push(el("div", { class: `inv-item${it.created === null ? " uncertain" : ""}` },
+        el("strong", {}, it.name), " ", link(it.id, () => showDetail("node", it.id)), " ", locLink(it.location),
+        el("div", { class: "tag" }, it.created === null ? "count not known" : `${it.created} instance${it.created === 1 ? "" : "s"}`,
+          only ? ` · only in ${only.join(", ")}` : ""),
+        it.why ? el("div", {}, el("div", { class: "tag" }, "Why counted:"), whySteps(it.why)) : null));
+    }
+    panel.replaceChildren(...parts);
+    panel.scrollTop = 0;
+  }
+
+  function inventoryGrid(envs) {
+    const perEnv = envs.inventory_columns === "environments";
+    const cols = perEnv ? envs.environments.map((r) => [r.id, r.inventory, r.wired]) : [["", envs.current.inventory, true]];
+    const head = el("tr", {}, el("th", {}, "Service"),
+      ...cols.map(([id, , wired]) => el("th", { class: wired ? "num" : "num st-unknown", title: wired ? "" : "not wired" },
+        id || (envs.active ? envs.active : "shown (variable defaults)"))));
+    const rows = envs.inventory.map((row) => {
+      const values = cols.map(([, inv]) => countText(inv[row.key].count, inv[row.key].uncertain));
+      const common = mostCommon(values);
+      return el("tr", { class: row.differs ? "inv-row differs" : "inv-row", "data-row": row.key },
+        el("td", {}, row.label, row.differs ? el("span", { class: "tag st-unknown" }, " differs") : null),
+        ...cols.map(([id, inv], i) => {
+          const cell = inv[row.key];
+          const cls = ["num", "inv-cell"];
+          if (row.differs && values[i] !== common) cls.push("diff");
+          if (cell.uncertain) cls.push("st-unknown");
+          return el("td", { class: cls.join(" ") },
+            link(values[i], () => showInventoryCell(row, id, cell)));
+        }));
+    });
+    return el("table", { class: "env-inventory" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
+  function mostCommon(values) {
+    const n = new Map();
+    for (const v of values) n.set(v, (n.get(v) || 0) + 1);
+    return [...n.entries()].sort((a, b) => b[1] - a[1])[0][0];
+  }
+
+  function renderEnvironments(envs) {
+    const box = document.getElementById("environments");
+    const toc = [];
+    const parts = [];
+    const section = (id, title, ...content) => {
+      toc.push([id, title]);
+      parts.push(el("h2", { id, class: "rv-section" }, title), ...content);
+    };
+    if (!envs.environments.length) {
+      parts.push(el("p", { class: "muted" },
+        "No environment detected (no env/*.tfvars, backend .hcl per environment, env directories or CI -var-file / -backend-config lines): the inventory below is the code with the variables' defaults."));
+    } else {
+      const shown = envs.active ? `${envs.active}${envs.default ? " (default)" : ""}` : "no environment (variable defaults)";
+      parts.push(el("p", {}, `Shown: ${shown}. The flows, the Root view (Network, IAM) and the graph follow the environment selected here or in the switcher above.`));
+      if (envs.not_wired.length) {
+        parts.push(el("p", { class: "st-unknown" },
+          `Not wired: ${envs.not_wired.join(", ")} — tfvars only (no backend configuration, no CI / script line uses it); still analyzed.`));
+      }
+      section("env-files", `Detected environments (${envs.environments.length})`, envFilesTable(envs));
+      section("env-state", "State file per environment", stateTable(envs));
+    }
+    section("env-inventory", "Service inventory",
+      el("p", { class: "muted" }, "Instances each environment creates with its own tfvars. Click a count for the names, file:line and why it is counted so; \"(+N uncertain)\": blocks whose count is not known statically (not counted)."),
+      inventoryGrid(envs));
+    if (envs.environments.length) {
+      section("env-diffs", "Differences between environments",
+        envs.differences.length
+          ? el("ul", { class: "overview-lines" }, ...envs.differences.map((d) =>
+            el("li", { class: d.startsWith(" ") ? "ov-line lvl-1" : "ov-line" }, d.trim())))
+          : el("p", { class: "muted" }, "None: every environment creates the same services."));
+    }
+    const shownRow = envs.environments.find((r) => r.id === envs.active) || envs.current;
+    if (shownRow.uncertain_items && shownRow.uncertain_items.length) {
+      section("env-uncertain", "Uncertain counts", ...shownRow.uncertain_items.map((it) =>
+        el("div", { class: "inv-item uncertain" }, link(it.id, () => showDetail("node", it.id)), " ", locLink(it.location),
+          it.why ? whySteps(it.why) : el("div", { class: "tag" }, "count not known"))));
+    }
+    toc.push(["env-unknowns", "Unknowns"]);
+    parts.push(el("div", { id: "env-unknowns" }, ...envUnknowns(envs)));
+    box.replaceChildren(...parts);
+    document.getElementById("env-toc").replaceChildren(...tocLinks(toc));
+  }
+
+  async function selectEnv(name) {
+    const select = document.getElementById("env");
+    select.disabled = true;
+    try {
+      await api(`api/env?name=${encodeURIComponent(name)}`, { method: "POST", headers: { "X-TFLens": "1" } });
+      await loadAll();
+    } catch (err) {
+      document.getElementById("detail").replaceChildren(el("p", {}, `Environment not applied: ${err.message}`));
+      select.disabled = false;
+    }
   }
 
   function renderEnvSwitch(envs) {
@@ -364,8 +551,13 @@
       ...g.roots.map((r) => el("a", { class: "file link root-link", "data-root": r.dir,
         title: r.summary, onclick: () => showRootView(r.dir, "") }, r.title)),
     ]));
-    showRootView(shapes.default_root, "");
+    // after an environment switch, the same root in the same view (Network, IAM, ...),
+    // now with that environment's analysis
+    const kept = shownRoot && shapes.roots.some((r) => r.dir === shownRoot.root);
+    showRootView(kept ? shownRoot.root : shapes.default_root, kept ? shownRoot.view : "");
   }
+
+  let shownRoot = null; // {root, view} last shown in the Root view
 
   function shapesSummary(shapes) {
     const head = shapes.mixed
@@ -387,6 +579,7 @@
       box.replaceChildren(el("p", { class: "muted" }, `${root}: ${err.message}`));
       return;
     }
+    shownRoot = { root, view: view || "" };
     const s = d.shape;
     const toc = [["rv-shapes", "Roots by shape"], ["rv-root", `Root ${s.title}`]];
     const parts = [shapesSummary(shapesData),
@@ -912,6 +1105,7 @@
       [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview"), api("api/flow"),
         api("api/shapes"), api("api/environments")]);
     renderEnvSwitch(envs);
+    renderEnvironments(envs);
     renderOverview(ov, envs);
     renderFlow(fl, ov);
     renderRoots(shapes);
@@ -959,17 +1153,7 @@
       }
     });
     const envSelect = document.getElementById("env");
-    envSelect.addEventListener("change", async () => {
-      envSelect.disabled = true;
-      try {
-        await api(`api/env?name=${encodeURIComponent(envSelect.value)}`,
-          { method: "POST", headers: { "X-TFLens": "1" } });
-        await loadAll();
-      } catch (err) {
-        document.getElementById("detail").replaceChildren(el("p", {}, `Environment not applied: ${err.message}`));
-        envSelect.disabled = false;
-      }
-    });
+    envSelect.addEventListener("change", () => selectEnv(envSelect.value));
     loadAll().catch((err) => {
       document.getElementById("detail").replaceChildren(el("p", {}, `Failed to load: ${err.message}`));
     });

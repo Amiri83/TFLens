@@ -174,9 +174,16 @@ def _label(n: dict[str, Any]) -> str:
     return n["name"]
 
 
-def _friendly(rtype: str, count: int) -> str:
+def _friendly(rtype: str, nodes: list[dict[str, Any]]) -> str:
+    """``4 Lambda functions``: the instances the blocks create; a block whose count is
+    not known is not assumed to be 1 but shown as uncertain (``4 (+3 uncertain) ...``)."""
     one, many = FRIENDLY[rtype]
-    return f"{count} {one if count == 1 else many}"
+    created = [(n.get("properties") or {}).get("created", 1) for n in nodes]
+    known = sum(c for c in created if c is not None)
+    uncertain = sum(1 for c in created if c is None)
+    if uncertain:
+        return f"{known} (+{uncertain} uncertain) {many}"
+    return f"{known} {one if known == 1 else many}"
 
 
 def _join(items: list[str]) -> str:
@@ -204,7 +211,7 @@ def resource_counts(model: dict[str, Any]) -> list[tuple[str, list[dict[str, Any
 
 def purpose_text(model: dict[str, Any]) -> str:
     """``deploys 2 Lambda functions, 1 SQS queue and 1 S3 bucket`` ('' if nothing known)."""
-    main = [_friendly(t, len(ns)) for t, ns in resource_counts(model) if t not in SUPPORTING]
+    main = [_friendly(t, ns) for t, ns in resource_counts(model) if t not in SUPPORTING]
     return f"deploys {_join(main)}" if main else ""
 
 
@@ -218,20 +225,30 @@ def purpose_lines(model: dict[str, Any], nodes: dict[str, dict[str, Any]]) -> li
     if main:
         text = f"Guess: this repository {purpose_text(model)}"
         if support:
-            text += ", with " + _join([_friendly(t, len(ns)) for t, ns in support])
+            text += ", with " + _join([_friendly(t, ns) for t, ns in support])
         lines.append(_line(text + ".", main[0][1][0]["location"], node=main[0][1][0]["id"]))
     elif counts:
         text = "Guess: supporting infrastructure only: " + _join(
-            [_friendly(t, len(ns)) for t, ns in counts]
+            [_friendly(t, ns) for t, ns in counts]
         )
         lines.append(_line(text + ".", counts[0][1][0]["location"]))
     for t, ns in main + support:
         names = ", ".join(_label(n) for n in ns[:5]) + (
             f", … {len(ns) - 5} more" if len(ns) > 5 else ""
         )
-        lines.append(
-            _line(f"{_friendly(t, len(ns))}: {names}", ns[0]["location"], 1, node=ns[0]["id"])
-        )
+        lines.append(_line(f"{_friendly(t, ns)}: {names}", ns[0]["location"], 1, node=ns[0]["id"]))
+        for n in ns:
+            why = (n.get("properties") or {}).get("count_why")
+            if why and not why["known"]:
+                lines.append(
+                    _line(
+                        f"why counted: {why['text']}",
+                        next(s["location"] for s in why["steps"] if s["instances"] is None),
+                        2,
+                        node=n["id"],
+                        status="unknown",
+                    )
+                )
     resources = [n for n in nodes.values() if n["kind"] == "resource" and n["location"]]
     if not resources:
         roots = (model.get("structure") or {}).get("roots", [])

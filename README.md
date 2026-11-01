@@ -62,12 +62,27 @@ Nothing has to be configured before a first analysis:
   `.terraform.lock.hcl`, `required_version`, and `provider` configurations.
 - **Modules**: every call, classified local / registry / git / s3 / gcs / http,
   with its version (`version` or `?ref=`), call site and inputs.
-- **Environments**: from tfvars files (`envs/dev.tfvars`, `vars/prod.tfvars`,
-  with `common.tfvars` applied to each), `envs/*` or env-named root directories,
-  and Terragrunt layouts (`live/<env>/...`, `env.hcl`). In the managed app they
+- **Environments**: from tfvars files (`env/dev.tfvars`, `envs/`, `environments/`,
+  `vars/`, `tfvars/`, with `common.tfvars` applied to each), `envs/*` or env-named root
+  directories, and Terragrunt layouts (`live/<env>/...`, `env.hcl`). Partial backend
+  configurations are matched to their environment by name (`backend.dev.hcl`,
+  `dev.tfbackend`, `backend/dev.hcl`, or `env/dev.hcl` when its settings are backend
+  settings). An environment with tfvars but no backend configuration and no CI / script
+  line using it is listed as **not wired** (and still analyzed). In the managed app they
   are created automatically (on add / Sync / **Detect environments**), bound to
   their root, and can be edited; an edited environment is never overwritten.
-- **Root view** (the analyzer's first tab, the `## Roots by shape` section of
+- **Environments view** (the analyzer's first tab, what *Start here* opens): the
+  detected environments and their files (tfvars, backend config, CI lines), the state
+  file of each (`bucket` / `key` / `region` / `dynamodb_table` from its backend config),
+  and the service inventory with one column per environment (SNS, SQS, DynamoDB, EC2,
+  Lambda, ALB / NLB, EventBridge rules, log groups, ECS clusters / services, ECR, S3,
+  EBS): click a count for the names and `file:line`; rows that differ between
+  environments are highlighted (e.g. a bucket only in prod). Flows, the Root view
+  (Network, IAM) and the graph follow the environment selected in the switcher.
+  A `count` / `for_each` that cannot be resolved is never assumed to be 1: counts read
+  `4 (+3 uncertain)`, each uncertain block with a *why counted* note (the expression,
+  its value, and the variable / local / default / tfvars it comes from).
+- **Root view** (the analyzer's second tab, the `## Roots by shape` section of
   `handoff.md`): each root is classified by shape, with the reason (resource counts and
   backend) spelled out, and shown in the view that shape calls for:
   *app / pipeline* (compute fed by triggers or queues) → **Flow**;

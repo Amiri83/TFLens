@@ -14,6 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from .countwhy import count_why
 from .engine import Engine, ModuleInstance
 from .loader import Block, RepoSource
 from .model import Edge, Evidence, Graph, Node
@@ -259,6 +260,9 @@ class Analyzer:
                         v.reason if isinstance(v, Unknown) else reason,
                         attr.loc,
                     )
+            why = count_why(inst, None, inst.module_id)
+            if why is not None:
+                props["count_why"] = why
             remote = inst.parent.child_remote.get(call.labels[0])
             if remote is not None:
                 props["remote_source"] = remote.source
@@ -330,6 +334,9 @@ class Analyzer:
             props["created"] = item.created
             if item.created is None:
                 props["created_unknown"] = item.created_reason
+        why = count_why(item.inst, item.block, item.id)
+        if why is not None:
+            props["count_why"] = why
         return Node(
             id=item.id,
             kind="data" if item.data else "resource",
