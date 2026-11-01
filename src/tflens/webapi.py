@@ -16,6 +16,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .drawio import MIME as DRAWIO_MIME
+from .drawio import chain_drawio, tab_drawio
 from .envs import env_counts_text, summarize
 from .flow import build_flows, chain_svg
 from .model import EDGE_KINDS, SCHEMA_VERSION
@@ -90,6 +92,7 @@ class ModelStore:
         readonly: bool = False,
         title: str = "",
         env: str | None = None,
+        auto_env: bool = False,
     ) -> None:
         self.root = root.resolve()
         self.readonly = readonly
@@ -98,6 +101,9 @@ class ModelStore:
         self.var_files = var_files or []
         self.cli_vars = cli_vars or {}
         self.env = env or None  # a detected environment applied to the analysis
+        # no environment asked for: apply the default one (dev, else the first) until
+        # one, or none, is chosen in the switcher
+        self.auto_env = auto_env and not (self.env or self.var_files or self.cli_vars)
         self.generated = False  # whether the current model was produced by this process
         self.note = ""
         self._model: dict[str, Any] | None = None
@@ -115,14 +121,28 @@ class ModelStore:
                 if self.readonly:
                     raise ModelUnavailable(f"model {self.model_path} is missing or unusable")
                 return self.regenerate()
+            if self._wants_default(loaded):
+                return self.regenerate()
             self._set(loaded, mtime, generated=False)
             return loaded
+
+    def _wants_default(self, model: dict[str, Any]) -> bool:
+        """A model on disk analyzed with no environment although environments are
+        detected and none was chosen: it is re-analyzed with the default one."""
+        return (
+            self.auto_env
+            and not self.readonly
+            and model.get("environment") is None
+            and bool((model.get("structure") or {}).get("environments"))
+        )
 
     def regenerate(self) -> dict[str, Any]:
         if self.readonly:
             raise ModelUnavailable("a recorded run cannot be regenerated")
         with self._lock:
-            model = run_analysis(self.root, self.var_files, self.cli_vars, env=self.env).model
+            model = run_analysis(
+                self.root, self.var_files, self.cli_vars, env=self.env, auto_env=self.auto_env
+            ).model
             try:
                 self.model_path.parent.mkdir(parents=True, exist_ok=True)
                 self.model_path.write_text(dumps(model), encoding="utf-8")
@@ -133,16 +153,18 @@ class ModelStore:
             return model
 
     def select_env(self, env: str | None) -> dict[str, Any]:
-        """Re-analyze with a detected environment's tfvars (None / '': no environment);
-        ``ValueError`` for an environment that is not detected (the selection is kept)."""
+        """Re-analyze with a detected environment's tfvars (None / '': no environment, not
+        even the default one); ``ValueError`` for an environment that is not detected (the
+        selection is kept)."""
         if self.readonly:
             raise ModelUnavailable("a recorded run cannot switch environments")
         with self._lock:
-            previous, self.env = self.env, env or None
+            previous = self.env, self.auto_env
+            self.env, self.auto_env = env or None, False
             try:
                 return self.regenerate()
             except ValueError:
-                self.env = previous
+                self.env, self.auto_env = previous
                 raise
 
     def lines(self, file: str) -> list[str] | None:
@@ -628,6 +650,7 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
     out: dict[str, Any] = {
         "active": active["id"] if active else None,
         "active_name": active["name"] if active else None,
+        "default": bool(active and active.get("default")),  # applied as none was chosen
         "switchable": store is not None and not store.readonly,
         "types": analysis.get("types", []),
         "environments": rows,
@@ -759,30 +782,29 @@ class Api:
             return json_response(data)
         if path == "/api/diagram":
             name, fmt = query.get("name", ""), query.get("format", "svg")
-            if name.startswith("flow-") and fmt == "svg":
-                # one chain of the Flow view (not exported: it is built from the model);
-                # with root=<dir>, a chain of that root's own Flow view
+            if (name.startswith("flow-") or name in TAB_DIAGRAMS) and fmt in ("svg", "drawio"):
+                # one chain of the Flow view, or the Root view's Network / IAM diagram (not
+                # exported: built from the model), as SVG or as an editable draw.io file;
+                # with root=<dir>, that root's own
                 source = model
                 if "root" in query:
                     if query["root"] not in {r["dir"] for r in root_entries(model)}:
                         return _not_found(f"root {query['root']!r}")
                     source = root_model(model, query["root"])
-                body = chain_svg(source, name, self.store.title)
+                flow = name.startswith("flow-")
+                draw = {
+                    ("svg", True): chain_svg,
+                    ("svg", False): tab_svg,
+                    ("drawio", True): chain_drawio,
+                    ("drawio", False): tab_drawio,
+                }[(fmt, flow)]
+                body = draw(source, name, self.store.title)
                 if body is None:
-                    return _not_found(f"flow diagram {name!r}")
-                return _download(body, "image/svg+xml; charset=utf-8", f"{name}.svg", query)
-            if name in TAB_DIAGRAMS and fmt == "svg":
-                # the Root view's Network / IAM diagram: the repository's, or with
-                # root=<dir> that root's
-                source = model
-                if "root" in query:
-                    if query["root"] not in {r["dir"] for r in root_entries(model)}:
-                        return _not_found(f"root {query['root']!r}")
-                    source = root_model(model, query["root"])
-                body = tab_svg(source, name, self.store.title)
-                if body is None:
-                    return _not_found(f"{name} diagram: nothing to draw")
-                return _download(body, "image/svg+xml; charset=utf-8", f"{name}.svg", query)
+                    return _not_found(
+                        f"flow diagram {name!r}" if flow else f"{name} diagram: nothing to draw"
+                    )
+                ctype = "image/svg+xml" if fmt == "svg" else DRAWIO_MIME
+                return _download(body, f"{ctype}; charset=utf-8", f"{name}.{fmt}", query)
             if name not in DIAGRAMS or fmt not in ("svg", "mmd"):
                 return _not_found(f"diagram {name!r} ({fmt})")
             if fmt == "mmd":

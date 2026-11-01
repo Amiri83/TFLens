@@ -13,7 +13,7 @@ from .analyze import analyze
 from .crawl import crawl
 from .detect import detect_environments, detect_structure
 from .engine import Engine, ModuleInstance, in_scope
-from .envs import analyze_environments, env_id, find_env
+from .envs import analyze_environments, default_env, env_id, find_env
 from .loader import RepoSource, load_repo
 from .model import SCHEMA_VERSION, Graph
 from .values import to_json
@@ -46,26 +46,31 @@ def run_analysis(
     git_root: Path | None = None,
     git: bool = True,
     env: str | None = None,
+    auto_env: bool = False,
 ) -> Analysis:
     """Analyze ``root``. ``scope`` limits the roots to one directory (an environment).
     The git history is read when ``git_root`` (default ``root``) is a git checkout.
 
     ``env`` applies a detected environment (its tfvars files, and its directory as the
-    scope); ``ValueError`` if there is no such environment. Without explicit var files,
-    variables or scope, every detected environment is also analyzed on its own
-    (``environment_analysis``: counts per environment and a total)."""
+    scope); ``ValueError`` if there is no such environment. With ``auto_env`` and no
+    ``env`` (nor explicit var files, variables or scope), the default environment is
+    applied when environments are detected (:func:`envs.default_env`: dev, else the
+    first). Without explicit var files, variables or scope, every detected environment
+    is also analyzed on its own (``environment_analysis``: counts per environment and a
+    total)."""
     repo = load_repo(root)
     # a managed run of one environment passes its var files / scope: no per-env section
     explicit = bool(var_files or cli_vars or scope)
     selected = None
-    if env:
+    if env or (auto_env and not explicit):
         probe = Engine(repo)
         probe.discover_roots()
         environments = detect_environments(repo, probe)
-        selected = find_env(environments, env)
-        if selected is None:
+        selected = find_env(environments, env) if env else default_env(environments)
+        if env and selected is None:
             known = ", ".join(env_id(e, environments) for e in environments) or "none"
             raise ValueError(f"unknown environment {env!r} (detected: {known})")
+    if selected is not None:
         var_files = list(selected["var_files"]) + list(var_files or [])
         if scope is None and selected["root"] != ".":
             scope = selected["root"]
@@ -82,6 +87,7 @@ def run_analysis(
             "root": selected["root"],
             "var_files": list(engine.var_files),
             "backend_hcl": list(selected.get("backend_hcl", [])),
+            "default": not env,  # applied because none was asked for
         }
         if selected is not None
         else None

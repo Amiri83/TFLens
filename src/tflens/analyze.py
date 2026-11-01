@@ -35,6 +35,9 @@ from .values import (
 
 # Meta-arguments that are not part of the resource's configuration graph.
 _SKIP_ATTRS = {"provider", "lifecycle"}
+LAMBDA_ALIAS = "aws_lambda_alias"
+# the variable / local an attribute's raw expression reads (var.topic_arn, local.x)
+_VAR_REF = re.compile(r"\b(var|local)\.([A-Za-z_][\w-]*)")
 
 
 @dataclass(frozen=True)
@@ -201,6 +204,7 @@ class Analyzer:
         # principal-bearing resource -> [(role/profile id, evidence, via)]
         self.runs_as: dict[str, list[tuple[str, list[Evidence], list[str]]]] = {}
         self._identity: dict[str, list[tuple[str, str, str]]] | None = None
+        self._alias_of: dict[str, list[str]] = {}  # aws_lambda_alias -> its function(s)
 
     # ------------------------------------------------------------------ driver
     def run(self) -> Graph:
@@ -471,6 +475,13 @@ class Analyzer:
         attributes: dict[str, Any] | None = None,
         via: list[str] | None = None,
     ) -> None:
+        if kind in ("TRIGGER", "ACCESS") and self.type_of(target) == LAMBDA_ALIAS:
+            # a trigger / permission on an alias is one on its function (the alias in via)
+            functions = self.alias_functions(target)
+            if functions:
+                for f in functions:
+                    self.edge(kind, source, f, label, evidence, attributes, [*(via or []), target])
+                return
         self.graph.add_edge(
             Edge(
                 kind, source, target, label, dict(attributes or {}), list(evidence), list(via or [])
@@ -479,6 +490,40 @@ class Analyzer:
 
     def unknown(self, subject: str, attribute: str, reason: str, loc: Location | None) -> None:
         self.graph.add_unknown(subject, attribute, reason, loc)
+
+    def type_of(self, node_id: str) -> str:
+        node = self.graph.nodes.get(node_id)
+        return node.type if node is not None else ""
+
+    def alias_functions(self, alias_id: str) -> list[str]:
+        """The Lambda function(s) an ``aws_lambda_alias`` points at ([] if not known)."""
+        if alias_id not in self._alias_of:
+            self._alias_of[alias_id] = []  # cycle-safe
+            item = self.by_id.get(alias_id)
+            if item is not None:
+                self._alias_of[alias_id] = self.resolve(
+                    item,
+                    self.get(item, "function_name"),
+                    "function_name",
+                    self.attr_loc(item, "function_name"),
+                    {"aws_lambda_function"},
+                    "lambda_function",
+                )
+        return self._alias_of[alias_id]
+
+    def variable_name(self, item: Item, attr: str) -> str | None:
+        """``var.NAME`` (or ``local.NAME``) the attribute's expression reads, if any."""
+        a = item.block.attrs.get(attr)
+        m = _VAR_REF.search(str(a.raw)) if a is not None else None
+        return f"{m.group(1)}.{m.group(2)}" if m else None
+
+    def named_external(self, item: Item, attr: str, kind: str) -> str | None:
+        """An external node for a value with no usable name (unknown, or empty), labelled
+        from the variable it comes from: an SNS topic passed in as ``var.topic_arn``."""
+        var = self.variable_name(item, attr)
+        if var is None:
+            return None
+        return self.graph.external(kind, var, var)
 
     def external(self, kind: str, value: str) -> str:
         label = value
@@ -502,12 +547,15 @@ class Analyzer:
         types: set[str] | None = None,
         external: str = "arn",
         data_ok: bool = False,
+        from_var: bool = False,
     ) -> list[str]:
         """Resolve a value (or list of values) to node ids.
 
         Resource references win; otherwise literal names/ARNs are matched against
         the identities of resources in the same root; anything else becomes an
-        external node. Values that cannot be resolved are recorded as UNKNOWN.
+        external node. Values that cannot be resolved are recorded as UNKNOWN; with
+        ``from_var`` (a trigger's source), one that comes from a variable is still an
+        external node, named after the variable. An empty value never names a node.
         """
         out: list[str] = []
         for el in as_list(value):
@@ -516,8 +564,14 @@ class Analyzer:
                 out.extend(ids)
                 continue
             pattern = pattern_of(el)
-            if pattern is None:
-                self.unknown(item.id, attr, _why(el), loc)
+            if pattern is None or pattern == "":
+                if pattern is None:
+                    self.unknown(item.id, attr, _why(el), loc)
+                named = self.named_external(item, attr, external)
+                if named and (pattern == "" or from_var):
+                    out.append(named)
+                elif pattern == "":
+                    self.unknown(item.id, attr, "value is an empty string", loc)
                 continue
             if pattern == "*":
                 out.append(self.external("wildcard" if external == "arn" else external, "*"))
@@ -571,7 +625,14 @@ class Analyzer:
                 name = spec.extract(arn[5])
                 if name and fnmatch.fnmatchcase(ident, name):
                     out.append(node_id)
-            elif types is not None and fnmatch.fnmatchcase(ident, plain):
+            elif types is not None and (
+                fnmatch.fnmatchcase(ident, plain)
+                # a qualified function name (function:alias / function:version)
+                or (
+                    rtype == "aws_lambda_function"
+                    and fnmatch.fnmatchcase(ident, plain.split(":")[0])
+                )
+            ):
                 out.append(node_id)
         return out
 

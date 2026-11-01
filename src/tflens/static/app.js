@@ -170,8 +170,9 @@
     const box = document.getElementById("env-switch");
     const select = document.getElementById("env");
     box.classList.toggle("hidden", !envs.environments.length);
-    select.replaceChildren(el("option", { value: "" }, "none (variable defaults)"),
-      ...envs.environments.map((r) => el("option", { value: r.id }, `${r.id} — ${r.text}`)));
+    select.replaceChildren(el("option", { value: "" }, "no environment (variable defaults)"),
+      ...envs.environments.map((r) => el("option", { value: r.id },
+        `${r.id}${envs.default && r.id === envs.active ? " (default)" : ""} — ${r.text}`)));
     select.value = envs.active || "";
     select.disabled = !envs.switchable;
   }
@@ -301,13 +302,22 @@
         el("li", {}, `${label.get(n.parent) || n.parent} ${n.relation}: ${n.label} `, locLink(n.code_ref))))];
   }
 
+  // The download links of a flow / Network / IAM diagram: the SVG, and the same diagram
+  // as an editable draw.io file (full names, same colours and legend).
+  function diagramLinks(name, query) {
+    const href = (fmt) => `api/diagram?name=${name}&format=${fmt}${query || ""}&download=1`;
+    return [el("a", { class: "link", href: href("svg"), download: `${name}.svg` }, "SVG"), " · ",
+      el("a", { class: "link", href: href("drawio"), download: `${name}.drawio`,
+        title: "The same diagram as an editable draw.io (diagrams.net) file" }, "Download .drawio")];
+  }
+
   function flowChain(c, pre, diagramQuery, toc) {
     const id = `${pre}-${c.id}`;
     toc.push([id, `Flow ${c.n}: ${c.entry_label}`]);
     const entry = c.no_trigger
       ? el("p", { class: "muted" }, `No trigger: ${c.entry_label} (${c.entry_kind}). `)
       : el("p", { class: "muted" }, `Entry point: ${c.entry_label} (${c.entry_kind}). `);
-    entry.append(el("a", { class: "link", href: `api/diagram?name=${c.id}&format=svg${diagramQuery}&download=1`, download: `${c.id}.svg` }, "SVG"));
+    entry.append(...diagramLinks(c.id, diagramQuery));
     const parts = [el("h2", { id, class: "flow-title" }, `Flow ${c.n}: ${c.title}`), entry,
       diagramPanel(c.id, `Flow ${c.n}`, diagramQuery),
       c.steps.length ? el("ol", { class: "flow-steps" }, ...c.steps.map(flowStep))
@@ -410,7 +420,7 @@
         const id = `rv-diagram-${d.diagram}`;
         toc.push([id, `${d.view_label} diagram`]);
         parts.push(el("h2", { id, class: "rv-section" }, `${d.view_label} diagram `,
-          el("a", { class: "link", href: `api/diagram?name=${d.diagram}&format=svg${q}&download=1`, download: `${d.diagram}.svg` }, "SVG")),
+          ...diagramLinks(d.diagram, q)),
           diagramPanel(d.diagram, `${d.view_label} diagram`, q));
       }
     }

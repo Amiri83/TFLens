@@ -31,6 +31,8 @@ tflens                           # no arguments: the web UI, same as `tflens ser
 | `--no-git` | do not read the git history |
 | `--var-file FILE` | extra tfvars for root modules (relative to `--dir`), repeatable |
 | `--var NAME=VALUE` | set a root variable, repeatable |
+| `--env NAME` | apply a detected environment (its tfvars and directory); default: `dev` when detected, else the first detected one, so names resolve |
+| `--no-env` | apply no environment (variable defaults only), even when environments are detected |
 
 With none of `--out`, `--report` or `--overview`, the model JSON goes to stdout.
 If the repository has nothing to analyze, `tflens` exits with status 1 and prints
@@ -165,6 +167,13 @@ download links:
 A PNG is written only when an offline SVG renderer is installed (`rsvg-convert`,
 `cairosvg` or `inkscape`); otherwise the run says so and the SVG is the export.
 
+The Flow, Network and IAM diagrams take the prefix every name in a diagram shares
+(`dev-app-`) off the boxes and show it once in the title; a long name takes two lines,
+and a box's tooltip has its full name and `file:lines`. Next to each one's **SVG** link,
+**Download .drawio** gives the same diagram as an editable draw.io (diagrams.net) file:
+the same boxes, positions, colours and legend, names in full, VPCs and subnets as
+containers, steps as edges attached to their boxes.
+
 ## Run history and Changes
 
 Each managed run stores a snapshot in the database (`run_files`, `run_modules`,
@@ -270,7 +279,7 @@ JSON API (all GET; under `/runs/<id>/` for a run): `api/summary`, `api/graph`,
 `api/nodes`, `api/edges`, `api/node?id=`, `api/edge?id=`, `api/tree`,
 `api/file?path=`, `api/overview`, `api/source?file=&start=&end=`, `api/model`,
 `api/diagram?name=architecture|module-tree|env-matrix&format=svg|mmd`,
-`api/diagram?name=flow-<n>|network|iam&format=svg[&root=<dir>]`, `api/handoff`
+`api/diagram?name=flow-<n>|network|iam&format=svg|drawio[&root=<dir>]`, `api/handoff`
 (add `download=1` for an attachment); `POST api/regenerate` (standalone only, needs the
 header `X-TFLens: 1`).
 

@@ -346,16 +346,25 @@ def iam_diagram(model: dict[str, Any]) -> dict[str, Any]:
 DIAGRAMS = {"network": (network_diagram, NETWORK_LEGEND), "iam": (iam_diagram, IAM_LEGEND)}
 
 
-def tab_svg(model: dict[str, Any], name: str, title: str = "") -> str | None:
-    """The SVG of the ``network`` or ``iam`` diagram (None: unknown name, or nothing to
-    draw)."""
+def tab_diagram(
+    model: dict[str, Any], name: str, title: str = ""
+) -> tuple[dict[str, Any], str, tuple[tuple[str, str, str], ...]] | None:
+    """The ``network`` or ``iam`` diagram, its full title and its legend (None: unknown
+    name, or nothing to draw)."""
     if name not in DIAGRAMS:
         return None
     build, legend = DIAGRAMS[name]
     dg = build(model)
     if not dg["nodes"] and not dg.get("frames"):
         return None
-    return flow_svg(dg, f"{dg['title']} — {title}" if title else dg["title"], legend)
+    return dg, f"{dg['title']} — {title}" if title else dg["title"], legend
+
+
+def tab_svg(model: dict[str, Any], name: str, title: str = "") -> str | None:
+    """The SVG of the ``network`` or ``iam`` diagram (None: unknown name, or nothing to
+    draw)."""
+    found = tab_diagram(model, name, title)
+    return None if found is None else flow_svg(*found)
 
 
 def iam_sections(sub: dict[str, Any]) -> list[dict[str, Any]]:

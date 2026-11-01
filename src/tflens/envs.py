@@ -75,6 +75,15 @@ def find_env(environments: list[dict[str, Any]], wanted: str) -> dict[str, Any] 
     return next((e for e in environments if e["name"] == wanted), None)
 
 
+def default_env(environments: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The environment applied when none is asked for: ``dev`` when there is one, else
+    the first detected (None when there is none), so names resolve instead of showing
+    the blocks' labels."""
+    return next((e for e in environments if e["name"].lower() == "dev"), None) or next(
+        iter(environments), None
+    )
+
+
 def counts(nodes: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int]]:
     """``(instances, uncertain)`` per recognized resource type: the instances that would
     be created, and how many blocks among them have a count that is not known (each

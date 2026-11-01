@@ -53,8 +53,21 @@ def _add_var_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--env",
         default=None,
-        help="apply a detected environment (its tfvars files and directory), e.g. dev",
+        help="apply a detected environment (its tfvars files and directory), e.g. dev; "
+        "default: dev when detected, else the first detected environment",
     )
+    parser.add_argument(
+        "--no-env",
+        action="store_true",
+        help="apply no environment (variable defaults only), even when environments are detected",
+    )
+
+
+def _auto_env(parser: argparse.ArgumentParser, args: argparse.Namespace) -> bool:
+    """Whether the default environment is applied (none asked for, and not --no-env)."""
+    if args.no_env and args.env:
+        parser.error("--env and --no-env cannot be used together")
+    return not args.no_env
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,6 +104,7 @@ def main(argv: list[str] | None = None) -> int:
     _add_var_options(parser)
     parser.add_argument("--version", action="version", version=f"tflens {__version__}")
     args = parser.parse_args(argv)
+    auto_env = _auto_env(parser, args)
 
     root: Path = args.dir
     if not root.is_dir():
@@ -99,7 +113,12 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         analysis = run_analysis(
-            root, args.var_file, dict(args.var), git=not args.no_git, env=args.env
+            root,
+            args.var_file,
+            dict(args.var),
+            git=not args.no_git,
+            env=args.env,
+            auto_env=auto_env,
         )
     except ValueError as exc:
         print(f"tflens: error: {exc}", file=sys.stderr)
@@ -248,10 +267,13 @@ def serve_main(argv: list[str]) -> int:
     )
     _add_var_options(parser)
     args = parser.parse_args(argv)
+    auto_env = _auto_env(parser, args)
 
     standalone = args.dir is not None
-    if not standalone and (args.model or args.regenerate or args.var_file or args.var or args.env):
-        parser.error("--model, --regenerate, --var-file, --var and --env need --dir")
+    if not standalone and (
+        args.model or args.regenerate or args.var_file or args.var or args.env or args.no_env
+    ):
+        parser.error("--model, --regenerate, --var-file, --var, --env and --no-env need --dir")
     if standalone and args.home:
         parser.error("--home has no effect with --dir (standalone mode uses no data directory)")
 
@@ -290,12 +312,13 @@ def serve_main(argv: list[str]) -> int:
             args.var_file,
             dict(args.var),
             env=args.env,
+            auto_env=auto_env,
         )
         try:
             if args.regenerate or args.env:
                 store.regenerate()
-            else:
-                store.model()
+            elif store.model().get("environment") and args.no_env:
+                store.regenerate()  # a model.json analyzed with an environment: without
         except ValueError as exc:
             print(f"tflens serve: error: {exc}", file=sys.stderr)
             return 2
