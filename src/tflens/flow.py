@@ -844,9 +844,14 @@ def env_lines(
     if active:
         head += f"; analyzed as {active['name']}"
     lines = [_line(head, environments[0]["evidence"][0] if environments[0]["evidence"] else None)]
+    lines[0]["view"] = "environments"  # the UI opens the Environments view from here
     for e in environments:
         where = f" ({e['root']}/)" if e["root"] != "." else ""
+        if not e.get("wired", True):
+            where += f" — not wired: {e.get('not_wired_reason') or 'not deployed from here'}"
         lines.append(_line(f"{e['name']}{where}", e["evidence"][0] if e["evidence"] else None, 1))
+        if not e.get("wired", True):
+            lines[-1]["status"] = "skipped"
         for label, files in (
             ("backend config", e.get("backend_hcl", [])),
             ("tfvars", e["var_files"]),

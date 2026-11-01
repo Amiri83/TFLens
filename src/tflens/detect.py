@@ -49,7 +49,10 @@ ENV_WORDS = frozenset(
         "uat",
         "sit",
         "int",
+        "intg",
+        "integ",
         "integration",
+        "e2e",
         "stage",
         "staging",
         "stg",
@@ -81,10 +84,15 @@ COMMON_STEMS = frozenset({"common", "shared", "global", "defaults", "default", "
 GENERIC_STEMS = frozenset({"terraform", "vars", "variables", "values", "main", "inputs"})
 _REGION_RE = re.compile(r"^[a-z]{2}(-gov)?-[a-z]+-\d$")
 _ENV_NAME_BAD = re.compile(r"[^A-Za-z0-9_.-]+")
+# Partial backend configurations named so: dev.tfbackend, backend.dev.hcl, backend-dev.hcl,
+# dev.backend.hcl, backend/dev.hcl, backend-config/dev.hcl (an ``*.hcl`` only named after an
+# environment, env/dev.hcl, is one when its settings are backend settings: is_backend_file)
 _BACKEND_FILE_RE = re.compile(
-    r"(\.tfbackend|(^|/)backend[^/]*\.(hcl|tfvars|conf)|(^|/)backends?/[^/]+\.(hcl|tfvars|conf))$"
+    r"(\.tfbackend|(^|/)backend[^/]*\.(hcl|tfvars|conf)|[._-]backends?\.(hcl|tfvars|conf)"
+    r"|(^|/)backends?([-_]?configs?)?/[^/]+\.(hcl|tfvars|conf))$"
 )
 _BACKEND_WORD_RE = re.compile(r"(^|[._-])backends?(?=[._-]|$)", re.I)
+_BACKEND_DIR_RE = re.compile(r"^backends?([-_]?configs?)?$", re.I)
 # CI / docs: terraform init -backend-config=FILE, plan -var-file=FILE (key=value pairs and
 # CI expressions in the path are handled below)
 _CLI_FLAG_RE = re.compile(r"(?<![\w-])--?(backend-config|var-file)(?:=|\s+)['\"]?([^\s'\";|&)]+)")
@@ -108,6 +116,25 @@ BACKEND_KEYS: dict[str, tuple[str, ...]] = {
     "local": ("path",),
     "oss": ("bucket", "prefix", "key"),
     "cos": ("bucket", "prefix", "key"),
+}
+# settings of the backend types and the common optional ones: what a partial backend
+# configuration named only after its environment (env/dev.hcl) must consist of
+_BACKEND_SETTINGS = frozenset(k for keys in BACKEND_KEYS.values() for k in keys) | {
+    "encrypt",
+    "kms_key_id",
+    "profile",
+    "role_arn",
+    "assume_role",
+    "workspace_key_prefix",
+    "use_lockfile",
+    "acl",
+    "subscription_id",
+    "tenant_id",
+    "use_azuread_auth",
+    "skip_region_validation",
+    "skip_credentials_validation",
+    "skip_metadata_api_check",
+    "dynamodb_endpoint",
 }
 _CALL_META = {"source", "version", "providers", "count", "for_each", "depends_on"}
 
@@ -482,9 +509,9 @@ def _settings(
 def _backend_files(repo: RepoSource, root: str) -> list[dict[str, Any]]:
     """Partial backend configurations (``*.tfbackend``, ``backend*.hcl``) of a root."""
     out = []
-    for f in repo.all_files:
+    for f in backend_files(repo):
         d = posixpath.dirname(f) or "."
-        if not _BACKEND_FILE_RE.search(f) or not (root == "." or in_scope(d, root)):
+        if not (root == "." or in_scope(d, root)):
             continue
         attrs = read_attrs(repo, f) or {}
         if f not in repo.files:
@@ -907,25 +934,31 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
             add(owner, name, kind, loc, owner if owner in roots else None)
         return envs[key]
 
-    # 3. partial backend configurations: backend.<env>.hcl, <env>.tfbackend, backend/<env>.hcl
-    backend_files = [f for f in repo.all_files if _BACKEND_FILE_RE.search(f)]
+    # 3. partial backend configurations: backend.<env>.hcl, <env>.tfbackend, backend/<env>.hcl,
+    # env/<env>.hcl: matched to the environment of the same name
+    configs = backend_files(repo)
     per_dir: dict[str, int] = {}
-    for f in backend_files:
+    for f in configs:
         d = posixpath.dirname(f) or "."
         per_dir[d] = per_dir.get(d, 0) + 1
-    for f in backend_files:
+    for f in configs:
         d = posixpath.dirname(f) or "."
         name = backend_env(f)
         if name is None:
             continue
-        if not (name.lower() in ENV_WORDS or per_dir[d] >= 2 or env_segment(d) is not None):
+        known = any(k[1] == env_name(name) for k in envs)
+        if not (
+            name.lower() in ENV_WORDS or known or per_dir[d] >= 2 or env_segment(d) is not None
+        ):
             continue
         owner = _owner(d, roots)
-        if posixpath.basename(d).lower() in ("backend", "backends") and d != owner:
-            owner = _owner(posixpath.dirname(d) or ".", roots)
+        if d != owner:
+            owner = _owner(_backend_owner_dir(d), roots)
         e = attach(owner, name, "backend", Location(f, 1, 1))
         if f not in e["backend_hcl"]:
             e["backend_hcl"].append(f)
+        if f not in repo.files:
+            repo.files.append(f)  # listed, so its source can be shown
     # 4. -backend-config / -var-file in CI files, scripts and docs
     for use in cli_env_files(repo, roots):
         if use["env"] is None:
@@ -958,7 +991,126 @@ def detect_environments(repo: RepoSource, engine: Engine) -> list[dict[str, Any]
         e["roots"].sort()
         e["backend_hcl"].sort()
         e["var_file_cli"].sort(key=lambda u: (u["location"]["file"], u["location"]["start_line"]))
+        e.update(_wiring(e))
+        e["state"] = _env_state(repo, engine, e)
     return out
+
+
+def _wiring(env: dict[str, Any]) -> dict[str, Any]:
+    """Is the environment deployed from this repository? It is *wired* when a backend
+    configuration or a CI / script line is used for it, or when it is its own root
+    directory; an environment with only tfvars is listed as not wired (and analyzed)."""
+    how = []
+    if env["backend_hcl"]:
+        how.append("backend config: " + ", ".join(env["backend_hcl"]))
+    ci = sorted({u["location"]["file"] for u in env["var_file_cli"]})
+    if ci:
+        how.append("CI / scripts: " + ", ".join(ci))
+    if {"dir", "terragrunt"} & set(env["kinds"]):
+        how.append("its own root directory")
+    out: dict[str, Any] = {"wired": bool(how), "wiring": how}
+    if not how:
+        out["not_wired_reason"] = (
+            "tfvars only: no backend configuration and no CI / script line uses it"
+        )
+    return out
+
+
+def _env_state(repo: RepoSource, engine: Engine, env: dict[str, Any]) -> dict[str, Any]:
+    """The state file of an environment: the backend type and its key settings (``bucket``
+    / ``key`` / ``region`` / ``dynamodb_table`` for s3) from the root's backend block and
+    the environment's partial configurations (later files override earlier ones, as with
+    repeated ``-backend-config``); a setting found nowhere is UNKNOWN with the reason."""
+    root = env["roots"][0] if env["roots"] else env["root"]
+    unit = engine.units.get(root)
+    if unit is not None and unit.remote_state is not None:
+        rs = _remote_state(repo, unit)
+        return {"type": rs["type"], "origin": rs["origin"], "files": [], "settings": rs["settings"]}
+    mod = repo.modules.get(engine.root_modules.get(root, root))
+    block = None
+    for tb in mod.terraform if mod else []:
+        found = tb.blocks.get("backend") or tb.blocks.get("cloud")
+        if found:
+            block = found[0]
+            break
+    files = list(env["backend_hcl"])
+    if block is None and not files:
+        return {
+            "type": "local",
+            "origin": "default (no backend block)",
+            "files": [],
+            "settings": [],
+            "note": "no backend configured: state is kept in a local terraform.tfstate",
+        }
+    btype = UNKNOWN
+    values: dict[str, tuple[Any, Location | None]] = {}
+    origin = "partial backend configuration"
+    if block is not None:
+        btype = "cloud" if block.type == "cloud" else (block.labels[0] if block.labels else UNKNOWN)
+        origin = f"{block.type} block" + (f" + {', '.join(files)}" if files else "")
+        reason = "backend settings cannot use variables"
+        values = {k: (_static(a.raw, reason), a.loc) for k, a in block.attrs.items()}
+    for f in files:
+        for k, a in (read_attrs(repo, f) or {}).items():
+            values[k] = (_static(a.raw, "backend settings cannot use variables"), a.loc)
+    wanted = BACKEND_KEYS.get(btype, ())
+    settings = []
+    for key in list(wanted) + sorted(k for k in values if k not in wanted):
+        if key in values:
+            settings.append(_setting(key, *values[key]))
+        else:
+            if files:
+                reason = f"not set in {', '.join(files)} nor in the backend block"
+            else:
+                reason = "no backend configuration for this environment, not set in the block"
+            settings.append(
+                {
+                    "key": key,
+                    "value": UNKNOWN,
+                    "known": False,
+                    "location": None,
+                    "reason": reason + ": supplied by terraform init -backend-config (or the "
+                    "environment) at run time",
+                }
+            )
+    return {
+        "type": btype,
+        "origin": origin,
+        "location": _loc(block.loc) if block is not None else None,
+        "files": files,
+        "settings": settings,
+    }
+
+
+def backend_files(repo: RepoSource) -> list[str]:
+    """The repository's partial backend configurations (``terraform init
+    -backend-config=FILE``): files named so (:data:`_BACKEND_FILE_RE`), and ``*.hcl``
+    files named after an environment (``env/dev.hcl`` next to ``env/dev.tfvars``) whose
+    top-level settings are backend settings (``bucket``, ``key``, ``region``, ...)."""
+    stems = {
+        posixpath.basename(f).removesuffix(".json").removesuffix(".tfvars").lower()
+        for f in repo.tfvars
+    }
+    configs = {u.file for u in repo.units} | {p.file for u in repo.units for p in u.parents}
+    out = []
+    for f in repo.all_files:
+        if _BACKEND_FILE_RE.search(f):
+            out.append(f)
+            continue
+        base = posixpath.basename(f)
+        stem = base.removesuffix(".hcl").lower()
+        if not base.endswith(".hcl") or f in configs or stem not in ENV_WORDS | stems:
+            continue
+        keys = set(read_attrs(repo, f) or {})
+        if keys and keys <= _BACKEND_SETTINGS and keys & {"bucket", "key", "prefix", "path"}:
+            out.append(f)
+    return out
+
+
+def _backend_owner_dir(d: str) -> str:
+    """The directory a partial backend configuration belongs to: backend/dev.hcl and
+    backend-config/dev.hcl belong to the directory above."""
+    return (posixpath.dirname(d) or ".") if _BACKEND_DIR_RE.match(posixpath.basename(d)) else d
 
 
 def backend_env(path: str) -> str | None:
@@ -1002,6 +1154,7 @@ def cli_env_files(repo: RepoSource, roots: list[str]) -> list[dict[str, Any]]:
     pool = set(repo.all_files)
     out = []
     for src in _cli_sources(repo):
+        text = "\n".join(repo.lines(src))
         for n, line in enumerate(repo.lines(src), 1):
             if "-var-file" not in line and "-backend-config" not in line:
                 continue
@@ -1017,13 +1170,15 @@ def cli_env_files(repo: RepoSource, roots: list[str]) -> list[dict[str, Any]]:
                 names = {env for _, env in matches if env is not None}
                 if len(names) == 1 and next(iter(names)).lower() not in ENV_WORDS:
                     continue  # one match that does not look like an environment
+                # env: [dev, uat, prod] in the same file: the expression stands for those
+                # only, not for every file it matches (env/intg.tfvars is not deployed)
+                listed = {e for e in names if _mentions(text, e)}
+                if listed:
+                    matches = [(f, e) for f, e in matches if e is None or e in listed]
                 for f, env in matches:
                     d = posixpath.dirname(f) or "."
-                    if flag == "-backend-config" and posixpath.basename(d).lower() in (
-                        "backend",
-                        "backends",
-                    ):
-                        d = posixpath.dirname(d) or "."
+                    if flag == "-backend-config":
+                        d = _backend_owner_dir(d)
                     out.append(
                         {
                             "flag": flag,
@@ -1035,6 +1190,11 @@ def cli_env_files(repo: RepoSource, roots: list[str]) -> list[dict[str, Any]]:
                         }
                     )
     return out
+
+
+def _mentions(text: str, name: str) -> bool:
+    """Whether ``name`` appears in ``text`` as a word (``[dev, uat]``, ``ENV=dev``)."""
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", text) is not None
 
 
 def _match_cli_path(value: str, bases: list[str], pool: set[str]) -> list[tuple[str, str | None]]:

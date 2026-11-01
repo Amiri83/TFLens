@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .drawio import MIME as DRAWIO_MIME
 from .drawio import chain_drawio, tab_drawio
-from .envs import env_counts_text, summarize
+from .envs import difference_lines, env_counts_text, inventory_rows, summarize
 from .flow import build_flows, chain_svg
 from .model import EDGE_KINDS, SCHEMA_VERSION
 from .output import dumps, run_analysis
@@ -641,12 +641,20 @@ def source_view(
 
 
 def environments_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
-    """The environment switcher and the per-environment counts: one row per detected
-    environment (its tfvars applied), a total row, and the counts of the model shown."""
+    """The Environments view and the switcher: one row per detected environment (its
+    tfvars applied) with its files, wiring and state file, the service inventory (one
+    column per environment, the rows that differ between them flagged), a total row, and
+    the counts of the model shown. Without environments the inventory has one column:
+    the model shown (variable defaults)."""
     analysis = model.get("environment_analysis") or {}
     active = model.get("environment")
     rows = [{**r, "text": env_counts_text(r)} for r in analysis.get("environments", [])]
     current = summarize(None, model["nodes"], model["unknowns"])
+    per_env = bool(rows) and all("inventory" in r for r in rows)  # older model.json: no
+    inventory = analysis.get("inventory") if per_env else None
+    if inventory is None:
+        columns = [(r["id"], r["inventory"]) for r in rows] if per_env else []
+        inventory = inventory_rows(columns or [("", current["inventory"])])
     out: dict[str, Any] = {
         "active": active["id"] if active else None,
         "active_name": active["name"] if active else None,
@@ -654,6 +662,10 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
         "switchable": store is not None and not store.readonly,
         "types": analysis.get("types", []),
         "environments": rows,
+        "inventory": inventory,
+        "differences": difference_lines({**analysis, "inventory": inventory}) if per_env else [],
+        "inventory_columns": "environments" if per_env else "current",
+        "not_wired": [r["id"] for r in rows if not r.get("wired", True)],
         "total": None,
         "skipped": analysis.get("skipped", []),
         "current": {**current, "text": env_counts_text(current)},
