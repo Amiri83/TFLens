@@ -129,7 +129,54 @@
     return el("details", { class: "drilldown" }, ...parts);
   }
 
-  function renderOverview(ov) {
+  // ------------------------------------------------------------ environments
+  // One row per detected environment (its tfvars applied) and a total row; the shown
+  // environment is highlighted, its remaining unknowns listed with the reason.
+  function envCountsTable(envs) {
+    const types = envs.types || [];
+    const head = el("tr", {}, el("th", {}, "Environment"),
+      ...types.map((t) => el("th", {}, t.label)), el("th", {}, "Unknowns"), el("th", {}, "Files"));
+    const rows = envs.environments.map((r) => {
+      const files = [...r.backend_hcl, ...r.var_files];
+      return el("tr", { class: r.id === envs.active ? "env-row active" : "env-row", "data-env": r.id },
+        el("td", {}, r.id),
+        ...types.map((t) => el("td", { class: "num" }, String(r.counts[t.type] || 0),
+          r.uncertain[t.type] ? el("span", { class: "st-unknown", title: "count not known statically" }, " ?") : null)),
+        el("td", { class: r.unknown_count ? "num st-unknown" : "num" }, String(r.unknown_count)),
+        el("td", {}, ...files.flatMap((f, i) => [i ? ", " : "",
+          locLink({ file: f, start_line: 1, end_line: 1 })])));
+    });
+    const t = envs.total;
+    const total = el("tr", { class: "env-total" }, el("td", {}, el("strong", {}, "Total")),
+      ...types.map((x) => el("td", { class: "num" }, el("strong", {}, String(t.counts[x.type] || 0)))),
+      el("td", { class: "num" }, el("strong", {}, String(t.unknown_count))), el("td", {}, ""));
+    return el("table", { class: "env-counts" }, el("thead", {}, head), el("tbody", {}, ...rows, total));
+  }
+
+  function envUnknowns(envs) {
+    const row = envs.environments.find((r) => r.id === envs.active);
+    const shown = row || envs.current;
+    const title = row ? `Unknowns in ${row.id} after applying its variables` : "Unknowns (no environment applied)";
+    if (!shown.unknown_count) return [el("p", { class: "muted" }, `${title}: none.`)];
+    const items = shown.unknowns.map((u) => el("li", { class: "ov-line st-unknown" },
+      `${u.subject}.${u.attribute} — ${u.category}: ${u.reason} `, locLink(u.location)));
+    if (shown.unknown_count > shown.unknowns.length) {
+      items.push(el("li", { class: "ov-line" }, `… ${shown.unknown_count - shown.unknowns.length} more`));
+    }
+    return [el("h3", {}, `${title} (${shown.unknown_count})`), el("ul", { class: "overview-lines" }, ...items)];
+  }
+
+  function renderEnvSwitch(envs) {
+    const box = document.getElementById("env-switch");
+    const select = document.getElementById("env");
+    box.classList.toggle("hidden", !envs.environments.length);
+    select.replaceChildren(el("option", { value: "" }, "none (variable defaults)"),
+      ...envs.environments.map((r) => el("option", { value: r.id }, `${r.id} — ${r.text}`)));
+    select.value = envs.active || "";
+    select.disabled = !envs.switchable;
+  }
+
+  function renderOverview(ov, envs) {
     const box = document.getElementById("overview");
     const toc = [];
     const parts = [];
@@ -139,6 +186,12 @@
     }
     parts.push(el("h2", { id: "ov-top" }, "What this repository deploys"), overviewList(ov.summary));
     toc.push(["ov-top", "What it deploys"]);
+    if (envs && envs.environments.length) {
+      toc.push(["ov-env-counts", "Counts per environment"]);
+      parts.push(el("h2", { id: "ov-env-counts" }, "Counts per environment"),
+        el("p", { class: "muted" }, "Each environment analyzed with its own tfvars: only the blocks its count / for_each / conditionals create are counted."),
+        envCountsTable(envs), ...envUnknowns(envs));
+    }
     if (ov.inventory) {
       parts.push(el("h3", {}, "What is in the repository"), inventoryTable(ov.inventory));
     }
@@ -845,10 +898,11 @@
 
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree, ov, fl, shapes] = await Promise.all(
+    const [summary, graph, tree, ov, fl, shapes, envs] = await Promise.all(
       [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview"), api("api/flow"),
-        api("api/shapes")]);
-    renderOverview(ov);
+        api("api/shapes"), api("api/environments")]);
+    renderEnvSwitch(envs);
+    renderOverview(ov, envs);
     renderFlow(fl, ov);
     renderRoots(shapes);
     renderFailure(summary, ov);
@@ -863,7 +917,10 @@
     const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
     const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
     const f = summary.flow;
-    document.getElementById("summary").textContent =
+    const shownEnv = envs.environments.length
+      ? `${envs.active || "no environment"}: ${envs.current.text} · total ${envs.total.text} · `
+      : "";
+    document.getElementById("summary").textContent = shownEnv +
       `${f.flows} flows · ${f.steps} steps · ${f.unverified} unverified links · ` +
       `${s.files} files · ${s.modules} modules · ${nodes} nodes · edges: ${edges} · ` +
       `${s.unknowns} unknowns · ${s.parse_errors} parse errors`;
@@ -889,6 +946,18 @@
         await loadAll();
       } finally {
         regen.disabled = false;
+      }
+    });
+    const envSelect = document.getElementById("env");
+    envSelect.addEventListener("change", async () => {
+      envSelect.disabled = true;
+      try {
+        await api(`api/env?name=${encodeURIComponent(envSelect.value)}`,
+          { method: "POST", headers: { "X-TFLens": "1" } });
+        await loadAll();
+      } catch (err) {
+        document.getElementById("detail").replaceChildren(el("p", {}, `Environment not applied: ${err.message}`));
+        envSelect.disabled = false;
       }
     });
     loadAll().catch((err) => {

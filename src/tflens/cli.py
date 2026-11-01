@@ -50,6 +50,11 @@ def _add_var_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--var", action="append", default=[], type=_parse_var, help="NAME=VALUE; repeatable"
     )
+    parser.add_argument(
+        "--env",
+        default=None,
+        help="apply a detected environment (its tfvars files and directory), e.g. dev",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -92,7 +97,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"tflens: error: --dir {root} is not a directory", file=sys.stderr)
         return 2
 
-    analysis = run_analysis(root, args.var_file, dict(args.var), git=not args.no_git)
+    try:
+        analysis = run_analysis(
+            root, args.var_file, dict(args.var), git=not args.no_git, env=args.env
+        )
+    except ValueError as exc:
+        print(f"tflens: error: {exc}", file=sys.stderr)
+        return 2
     text = dumps(analysis.model)
     title = root.resolve().name
     listing = listing_text(analysis.model["discovery"]["inventory"])
@@ -239,8 +250,8 @@ def serve_main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     standalone = args.dir is not None
-    if not standalone and (args.model or args.regenerate or args.var_file or args.var):
-        parser.error("--model, --regenerate, --var-file and --var need --dir")
+    if not standalone and (args.model or args.regenerate or args.var_file or args.var or args.env):
+        parser.error("--model, --regenerate, --var-file, --var and --env need --dir")
     if standalone and args.home:
         parser.error("--home has no effect with --dir (standalone mode uses no data directory)")
 
@@ -274,12 +285,20 @@ def serve_main(argv: list[str]) -> int:
 
         root = args.dir.resolve()
         store = ModelStore(
-            root, args.model or default_model_path(root), args.var_file, dict(args.var)
+            root,
+            args.model or default_model_path(root),
+            args.var_file,
+            dict(args.var),
+            env=args.env,
         )
-        if args.regenerate:
-            store.regenerate()
-        else:
-            store.model()
+        try:
+            if args.regenerate or args.env:
+                store.regenerate()
+            else:
+                store.model()
+        except ValueError as exc:
+            print(f"tflens serve: error: {exc}", file=sys.stderr)
+            return 2
         print(
             f"tflens serve: model {store.model_path}"
             + (f" ({store.note})" if store.note else " (loaded)"),

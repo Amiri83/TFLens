@@ -762,10 +762,12 @@ def _line(text: str, loc: dict[str, Any] | None, level: int = 0, node: str = "")
 def start_here(
     model: dict[str, Any], f: _Flows, chains: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Where to start reading: the root(s), the entry files, then modules and files in
-    the order the flows go through them."""
-    roots = (model.get("structure") or {}).get("roots", [])
-    lines = []
+    """Where to start reading: the environments and their files (backend configuration,
+    tfvars, the CI lines passing them), the root(s), the entry files, then modules and
+    files in the order the flows go through them."""
+    structure = model.get("structure") or {}
+    roots = structure.get("roots", [])
+    lines = env_lines(structure.get("environments", []), model.get("environment"))
     for r in roots:
         loc = next((s["location"] for s in r["signals"] if s["location"]), None)
         kind = "Terragrunt unit" if r["kind"] == "terragrunt" else f"{r['kind']} root"
@@ -820,6 +822,35 @@ def start_here(
                 1,
             )
         )
+    return lines
+
+
+def env_lines(
+    environments: list[dict[str, Any]], active: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """The environments and the files that define each one (the first thing to read: they
+    decide what the code creates)."""
+    if not environments:
+        return []
+    names = ", ".join(e["name"] for e in environments)
+    head = f"Environments ({len(environments)}: {names}): start with their files"
+    if active:
+        head += f"; analyzed as {active['name']}"
+    lines = [_line(head, environments[0]["evidence"][0] if environments[0]["evidence"] else None)]
+    for e in environments:
+        where = f" ({e['root']}/)" if e["root"] != "." else ""
+        lines.append(_line(f"{e['name']}{where}", e["evidence"][0] if e["evidence"] else None, 1))
+        for label, files in (
+            ("backend config", e.get("backend_hcl", [])),
+            ("tfvars", e["var_files"]),
+        ):
+            for path in files:
+                lines.append(
+                    _line(f"{label}: {path}", {"file": path, "start_line": 1, "end_line": 1}, 2)
+                )
+        for use in e.get("var_file_cli", []):
+            loc = use["location"]
+            lines.append(_line(f"CI: {use['flag']}={use['value']} ({loc['file']})", loc, 2))
     return lines
 
 

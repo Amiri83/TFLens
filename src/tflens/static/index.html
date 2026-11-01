@@ -20,6 +20,9 @@
       <button type="button" class="tab" data-view="repo">Repository</button>
     </nav>
     <a id="changes" class="home hidden" href="changes">Changes</a>
+    <label id="env-switch" class="env-switch hidden" title="Re-analyze with an environment's tfvars applied">Environment
+      <select id="env"></select>
+    </label>
     <div id="summary"></div>
     <button type="button" id="regenerate" title="Re-analyze the repository and rewrite model.json">Regenerate</button>
   </header>

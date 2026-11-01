@@ -15,7 +15,7 @@ from typing import Any
 
 from .evaluate import Ops, apply_ops, evaluate
 from .loader import Attr, Block, ModuleSource, RemoteModule, RepoSource
-from .values import JsonEncoded, Location, Ref, Unknown, is_known, render
+from .values import JsonEncoded, Location, Ref, Unknown, display, is_known, render, unwrap
 
 # Provider-documented identities: these computed attributes equal a configured argument.
 ATTR_ALIASES: dict[tuple[str, str], str] = {
@@ -125,8 +125,14 @@ class ModuleInstance:
         if name == "terraform":
             return Unknown("terraform.workspace is selected at runtime"), []
         if name == "count":
+            only = self.only_instance(scope.self_id)
+            if only is not None and first == "index":
+                return only[0], ops[1:]
             return Unknown("count.index differs per resource instance"), []
         if name == "each":
+            only = self.only_instance(scope.self_id)
+            if only is not None and first in ("key", "value"):
+                return only[0 if first == "key" else 1], ops[1:]
             return Unknown("each.key/each.value differ per resource instance"), []
         if name == "self":
             return Unknown("self.* is only known after apply"), []
@@ -293,10 +299,83 @@ class ModuleInstance:
         doc = {"Version": "2012-10-17", "Statement": statements}
         return JsonEncoded(doc, block.loc, tuple(locs))
 
+    # ---------------------------------------------------------------- instances
+    def instances_of(self, block: Block) -> tuple[int | None, str]:
+        """How many instances a resource, data source or module call creates in this
+        module: ``(n, "")``, or ``(None, reason)`` when its count / for_each is unknown."""
+        out = self.memo(("instances", block.loc), lambda: self._instances_of(block))
+        return out if isinstance(out, tuple) else (None, f"count is not known: {out.reason}")
+
+    def _instances_of(self, block: Block) -> tuple[int | None, str]:
+        for meta in ("count", "for_each"):
+            attr = block.attrs.get(meta)
+            if attr is not None:
+                return _instance_count(meta, self.eval_attr(attr))
+        return 1, ""
+
+    def multiplicity(self) -> tuple[int | None, str]:
+        """How many times this module instance is created (the product of the counts of
+        the module calls leading to it): 0 means none of its blocks is created."""
+        if self.call is None or self.parent is None:
+            return 1, ""
+        return self.memo(("multiplicity",), self._multiplicity)
+
+    def _multiplicity(self) -> tuple[int | None, str]:
+        assert self.call is not None and self.parent is not None
+        outer, outer_reason = self.parent.multiplicity()
+        n, reason = self.parent.instances_of(self.call)
+        if outer == 0 or n == 0:
+            return 0, ""
+        if outer is None or n is None:
+            return None, outer_reason if outer is None else f"module.{self.call.labels[0]} {reason}"
+        return outer * n, ""
+
+    def blocks_by_id(self) -> dict[str, Block]:
+        if "_blocks" not in self._memo:
+            blocks = {self.node_id(t, n): b for (t, n), b in self.src.resources.items()}
+            blocks.update({self.node_id(t, n, True): b for (t, n), b in self.src.data.items()})
+            self._memo["_blocks"] = blocks
+        return self._memo["_blocks"]
+
+    def only_instance(self, self_id: str | None) -> tuple[Any, Any] | None:
+        """``(count.index | each.key, each.value)`` of a block that creates exactly one
+        instance (None otherwise): those values are then known."""
+        block = self.blocks_by_id().get(self_id) if self_id else None
+        if block is None:
+            return None
+        if "count" in block.attrs:
+            return (0, None) if self.instances_of(block)[0] == 1 else None
+        attr = block.attrs.get("for_each")
+        value = unwrap(self.eval_attr(attr)) if attr is not None else None
+        if isinstance(value, dict) and len(value) == 1:
+            ((key, item),) = value.items()
+            return key, item
+        if isinstance(value, list) and len(value) == 1 and isinstance(unwrap(value[0]), str):
+            return unwrap(value[0]), unwrap(value[0])
+        return None
+
     def all_vars(self) -> list[VarInfo]:
         for name in sorted(self.src.variables):
             self.var(name)
         return [self.var_info[n] for n in sorted(self.var_info)]
+
+
+def _instance_count(meta: str, value: Any) -> tuple[int | None, str]:
+    """``count`` / ``for_each`` value -> number of instances, or (None, why not known)."""
+    v = unwrap(value)
+    if isinstance(v, Unknown):
+        return None, f"{meta} is not known: {v.reason}"
+    if meta == "count":
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return max(int(v), 0), ""
+        if isinstance(v, Ref):
+            return None, f"count = ${{{v.expr()}}} is only known after apply"
+        return None, f"count = {display(v)} is not a number"
+    if isinstance(v, (dict, list)):
+        return len(v), ""
+    if isinstance(v, Ref):
+        return None, f"for_each = ${{{v.expr()}}} is only known after apply"
+    return None, f"for_each = {display(v)} is not a map or set"
 
 
 def _iam_statement(st: dict[str, Any]) -> dict[str, Any]:

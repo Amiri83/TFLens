@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .envs import env_counts_text, summarize
 from .flow import build_flows, chain_svg
 from .model import EDGE_KINDS, SCHEMA_VERSION
 from .output import dumps, run_analysis
@@ -88,6 +89,7 @@ class ModelStore:
         *,
         readonly: bool = False,
         title: str = "",
+        env: str | None = None,
     ) -> None:
         self.root = root.resolve()
         self.readonly = readonly
@@ -95,6 +97,7 @@ class ModelStore:
         self.model_path = model_path or default_model_path(self.root)
         self.var_files = var_files or []
         self.cli_vars = cli_vars or {}
+        self.env = env or None  # a detected environment applied to the analysis
         self.generated = False  # whether the current model was produced by this process
         self.note = ""
         self._model: dict[str, Any] | None = None
@@ -119,7 +122,7 @@ class ModelStore:
         if self.readonly:
             raise ModelUnavailable("a recorded run cannot be regenerated")
         with self._lock:
-            model = run_analysis(self.root, self.var_files, self.cli_vars).model
+            model = run_analysis(self.root, self.var_files, self.cli_vars, env=self.env).model
             try:
                 self.model_path.parent.mkdir(parents=True, exist_ok=True)
                 self.model_path.write_text(dumps(model), encoding="utf-8")
@@ -128,6 +131,19 @@ class ModelStore:
                 self.note = f"regenerated in memory only (cannot write {self.model_path}: {exc})"
             self._set(model, self._stat(), generated=True)
             return model
+
+    def select_env(self, env: str | None) -> dict[str, Any]:
+        """Re-analyze with a detected environment's tfvars (None / '': no environment);
+        ``ValueError`` for an environment that is not detected (the selection is kept)."""
+        if self.readonly:
+            raise ModelUnavailable("a recorded run cannot switch environments")
+        with self._lock:
+            previous, self.env = self.env, env or None
+            try:
+                return self.regenerate()
+            except ValueError:
+                self.env = previous
+                raise
 
     def lines(self, file: str) -> list[str] | None:
         """Lines of a repository file listed in the model (never anything else)."""
@@ -602,8 +618,32 @@ def source_view(
     return {**loc, "lines": snippet_lines(loc, source, context=3)}
 
 
+def environments_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
+    """The environment switcher and the per-environment counts: one row per detected
+    environment (its tfvars applied), a total row, and the counts of the model shown."""
+    analysis = model.get("environment_analysis") or {}
+    active = model.get("environment")
+    rows = [{**r, "text": env_counts_text(r)} for r in analysis.get("environments", [])]
+    current = summarize(None, model["nodes"], model["unknowns"])
+    out: dict[str, Any] = {
+        "active": active["id"] if active else None,
+        "active_name": active["name"] if active else None,
+        "switchable": store is not None and not store.readonly,
+        "types": analysis.get("types", []),
+        "environments": rows,
+        "total": None,
+        "skipped": analysis.get("skipped", []),
+        "current": {**current, "text": env_counts_text(current)},
+    }
+    if rows:
+        total = analysis["total"]
+        out["total"] = {**total, "text": env_counts_text(total)}
+    return out
+
+
 def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
     disc = model.get("discovery") or {}
+    active = model.get("environment")
     out = {
         "title": store.title if store else "",
         "summary": model["summary"],
@@ -615,6 +655,7 @@ def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict
         "reason": disc.get("reason", ""),
         "skipped": disc.get("skipped", []),
         "flow": build_flows(model)["metrics"],
+        "environment": active["id"] if active else None,
         "shapes": [
             {"dir": r["dir"], "shape": r["shape"], "view": r["view"]}
             for r in build_shapes(model)["roots"]
@@ -661,6 +702,14 @@ class Api:
                 if self.store.readonly:
                     return json_response({"error": "a recorded run is read-only"}, 405)
                 return json_response(summary_view(self.store.regenerate(), self.store))
+            if path == "/api/env":
+                if self.store.readonly:
+                    return json_response({"error": "a recorded run is read-only"}, 405)
+                try:
+                    model = self.store.select_env(query.get("name", ""))
+                except ValueError as exc:
+                    return json_response({"error": "unknown environment", "detail": str(exc)}, 404)
+                return json_response(environments_view(model, self.store))
             return _not_found(path) if path.startswith("/api/") else _method_not_allowed()
         if method not in ("GET", "HEAD"):
             return _method_not_allowed()
@@ -681,6 +730,8 @@ class Api:
             return json_response(summary_view(model, self.store))
         if path == "/api/model":
             return json_response(model)
+        if path == "/api/environments":
+            return json_response(environments_view(model, self.store))
         if path == "/api/graph":
             return json_response(graph_view(model))
         if path == "/api/nodes":

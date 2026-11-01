@@ -11,8 +11,9 @@ from typing import Any
 from . import __version__
 from .analyze import analyze
 from .crawl import crawl
-from .detect import detect_structure
+from .detect import detect_environments, detect_structure
 from .engine import Engine, ModuleInstance, in_scope
+from .envs import analyze_environments, env_id, find_env
 from .loader import RepoSource, load_repo
 from .model import SCHEMA_VERSION, Graph
 from .values import to_json
@@ -44,15 +45,55 @@ def run_analysis(
     scope: str | None = None,
     git_root: Path | None = None,
     git: bool = True,
+    env: str | None = None,
 ) -> Analysis:
     """Analyze ``root``. ``scope`` limits the roots to one directory (an environment).
-    The git history is read when ``git_root`` (default ``root``) is a git checkout."""
+    The git history is read when ``git_root`` (default ``root``) is a git checkout.
+
+    ``env`` applies a detected environment (its tfvars files, and its directory as the
+    scope); ``ValueError`` if there is no such environment. Without explicit var files,
+    variables or scope, every detected environment is also analyzed on its own
+    (``environment_analysis``: counts per environment and a total)."""
     repo = load_repo(root)
+    # a managed run of one environment passes its var files / scope: no per-env section
+    explicit = bool(var_files or cli_vars or scope)
+    selected = None
+    if env:
+        probe = Engine(repo)
+        probe.discover_roots()
+        environments = detect_environments(repo, probe)
+        selected = find_env(environments, env)
+        if selected is None:
+            known = ", ".join(env_id(e, environments) for e in environments) or "none"
+            raise ValueError(f"unknown environment {env!r} (detected: {known})")
+        var_files = list(selected["var_files"]) + list(var_files or [])
+        if scope is None and selected["root"] != ".":
+            scope = selected["root"]
     engine = Engine(repo, var_files, cli_vars, scope)
     engine.run()
     graph = analyze(repo, engine)
     crawled = crawl(repo, git_root, git)
-    return Analysis(repo, engine, graph, build_model(repo, engine, graph, crawled))
+    model = build_model(repo, engine, graph, crawled)
+    environments = model["structure"]["environments"]
+    model["environment"] = (
+        {
+            "id": env_id(selected, environments),
+            "name": selected["name"],
+            "root": selected["root"],
+            "var_files": list(engine.var_files),
+            "backend_hcl": list(selected.get("backend_hcl", [])),
+        }
+        if selected is not None
+        else None
+    )
+    model["environment_analysis"] = (
+        None
+        if explicit
+        else analyze_environments(
+            repo, environments, model["environment"]["id"] if model["environment"] else None
+        )
+    )
+    return Analysis(repo, engine, graph, model)
 
 
 def failure_reason(repo: RepoSource, engine: Engine) -> str:
@@ -243,6 +284,7 @@ def build_model(
         "nodes": nodes,
         "edges": edges,
         "unknowns": [u.to_dict() for u in graph.unknowns],
+        "not_created": list(graph.not_created),
         "discovery": discovery,
         "structure": structure,
         "crawl": crawled if crawled is not None else crawl(repo, git=False),

@@ -134,6 +134,7 @@ def build_overview(
         "roots": [],
         "resources": [],
         "environments": [],
+        "environment_counts": [],
         "docs": _doc_lines(crawled),
         "ci": _ci_lines(crawled),
         "history": _history_lines(crawled),
@@ -159,6 +160,9 @@ def build_overview(
         )
         for e in structure["environments"]
     ]
+    from .envs import env_count_lines  # envs builds on this module
+
+    out["environment_counts"] = env_count_lines(model)
     return out
 
 
@@ -847,6 +851,8 @@ def render_overview_markdown(ov: dict[str, Any], inventory_text: str = "", level
                 out += ["```hcl", format_snippet(d["snippet"]), "```", ""]
     if ov["environments"]:
         out += [f"{h}# Environments", "", *_md_lines(ov["environments"]), ""]
+    if ov.get("environment_counts"):
+        out += [f"{h}# Counts per environment", "", *_md_lines(ov["environment_counts"]), ""]
     if ov.get("docs"):
         out += [f"{h}# Documentation", "", *_md_lines(ov["docs"]), ""]
     if ov.get("ci"):

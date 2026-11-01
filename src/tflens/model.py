@@ -136,6 +136,8 @@ class Graph:
     nodes: dict[str, Node] = field(default_factory=dict)
     edges: list[Edge] = field(default_factory=list)
     unknowns: list[UnknownEntry] = field(default_factory=list)
+    # blocks (and module calls) whose count / for_each is known to be 0: no node
+    not_created: list[dict[str, Any]] = field(default_factory=list)
     _edge_keys: set[tuple[Any, ...]] = field(default_factory=set, repr=False)
     _unknown_keys: set[UnknownEntry] = field(default_factory=set, repr=False)
 
@@ -173,7 +175,17 @@ class Graph:
             self._unknown_keys.add(entry)
             self.unknowns.append(entry)
 
+    def omit(self, subject: str, reason: str, location: Location | None) -> None:
+        self.not_created.append(
+            {
+                "subject": subject,
+                "reason": reason,
+                "location": location.to_dict() if location else None,
+            }
+        )
+
     def finalize(self) -> None:
+        self.not_created.sort(key=lambda d: d["subject"])
         self.edges.sort(key=Edge.sort_key)
         counts: dict[tuple[str, str, str], int] = {}
         for e in self.edges:
