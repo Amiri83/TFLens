@@ -87,7 +87,7 @@ table.inventory { margin: 4px 0 12px; max-width: 720px; }
 #diagrams .diagram-toolbar button { min-width: 28px; padding: 1px 8px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; color: #1f2328; }
 #diagrams .diagram-toolbar button:hover { background: #eaeef2; }
 #diagrams .diagram-scale { min-width: 4em; font-size: 12px; }
-#diagrams .diagram { overflow: auto; max-height: 80vh; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; }
+#diagrams .diagram { overflow: auto; height: 70vh; min-height: 360px; scrollbar-gutter: stable;border: 1px solid #d0d7de; border-radius: 6px; background: #fff; }
 #diagrams .diagram-sizer { overflow: hidden; }
 #diagrams .diagram-zoom { width: max-content; transform-origin: 0 0; }
 /* natural size: never shrink the SVG to the panel; the viewport scrolls instead */
@@ -112,7 +112,7 @@ details.drilldown { border: 1px solid #d0d7de; border-radius: 6px; padding: 4px 
 #flow .diagram-toolbar { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
 #flow .diagram-toolbar button { min-width: 28px; padding: 1px 8px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; color: #1f2328; }
 #flow .diagram-scale { min-width: 4em; font-size: 12px; }
-#flow .diagram { overflow: auto; max-height: 70vh; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; }
+#flow .diagram { overflow: auto; height: 70vh; min-height: 360px; scrollbar-gutter: stable;border: 1px solid #d0d7de; border-radius: 6px; background: #fff; }
 #flow .diagram-sizer { overflow: hidden; }
 #flow .diagram-zoom { width: max-content; transform-origin: 0 0; }
 /* natural size (fonts >= 14px): the viewport scrolls left to right instead of shrinking */
@@ -143,7 +143,7 @@ details.drilldown > summary { cursor: pointer; font-weight: 600; }
 #roots .diagram-toolbar { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
 #roots .diagram-toolbar button { min-width: 28px; padding: 1px 8px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; color: #1f2328; }
 #roots .diagram-scale { min-width: 4em; font-size: 12px; }
-#roots .diagram { overflow: auto; max-height: 70vh; border: 1px solid #d0d7de; border-radius: 6px; background: #fff; }
+#roots .diagram { overflow: auto; height: 70vh; min-height: 360px; scrollbar-gutter: stable;border: 1px solid #d0d7de; border-radius: 6px; background: #fff; }
 #roots .diagram-sizer { overflow: hidden; }
 #roots .diagram-zoom { width: max-content; transform-origin: 0 0; }
 #roots .diagram img { display: block; max-width: none; height: auto; cursor: zoom-in; }

@@ -770,7 +770,7 @@
     const sizer = el("div", { class: "diagram-sizer" }, zoom);
     const view = el("div", { class: "diagram", "data-diagram": name }, sizer);
     const label = el("span", { class: "diagram-scale muted" }, "100%");
-    let scale = 1, fitted = true;
+    let scale = 1, pendingFit = false;
 
     function apply(s) {
       const w = img.naturalWidth, h = img.naturalHeight;
@@ -781,16 +781,23 @@
       sizer.style.height = `${h * scale}px`;
       label.textContent = `${Math.round(scale * 100)}%`;
     }
+    // Never refit on resize: a fit changes the content size, which can toggle the
+    // viewport's scrollbars and resize it again (jitter/ghosting). The viewport has
+    // a fixed CSS height; fit once on load, and if the tab was hidden (zero width)
+    // then, fit exactly once when it first becomes visible and stop observing.
+    const shown = new ResizeObserver(() => {
+      if (pendingFit && view.clientWidth) fit();
+    });
     function fit() {
-      fitted = true;
       const w = img.naturalWidth, room = view.clientWidth;
       apply(w && room && w <= room ? room / w : 1);
+      pendingFit = !room;
+      if (room && w) shown.disconnect();
     }
-    function zoomBy(f) { fitted = false; apply(scale * f); }
+    function zoomBy(f) { pendingFit = false; apply(scale * f); }
 
     img.addEventListener("load", fit);
-    // the Diagrams tab may be hidden (zero width) when the image loads; refit on show/resize
-    new ResizeObserver(() => { if (fitted) fit(); }).observe(view);
+    shown.observe(view);
 
     const bar = el("div", { class: "diagram-toolbar" },
       el("button", { type: "button", "data-zoom": "in", title: "Zoom in", onclick: () => zoomBy(ZOOM_STEP) }, "+"),
