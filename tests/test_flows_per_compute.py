@@ -67,13 +67,19 @@ def test_every_compute_has_a_flow_deduped():
 def test_order_is_longest_first_then_name():
     assert [c["title"] for c in _flows()["chains"]] == [
         "lb-a → tg-a → asg-a → queue-a → lambda-classifier → table-a",
-        "instance-a → queue-a → lambda-classifier → table-a (no trigger)",
+        # lambda-classifier is expanded in flow 1: here a link to it
+        "instance-a → queue-a → lambda-classifier (no trigger)",
         "rule-a → lambda-scheduled",
         "ecs-service-a (no trigger)",
         "lambda-orphan → queue-b (no trigger)",
         "lb-c → tg-c",
         "lambda-idle (no trigger)",
     ]
+    ec2 = _chain("aws_instance.instance-a")
+    link = next(n for n in ec2["nodes"] if n["id"] == "aws_lambda_function.lambda-classifier")
+    assert (link["role"], link["label"]) == ("link", "continues in Flow 1")
+    assert link["code_ref"] == {"file": "main.tf", "start_line": 173, "end_line": 191}
+    assert not [s for s in ec2["steps"] if s["source"] == link["id"]]
 
 
 def test_no_trigger_flow_is_marked_and_still_drawn():
@@ -222,11 +228,13 @@ def test_deterministic():
 def test_network_diagram_vpc_subnets_groups_resources():
     dg = network_diagram(_model(FIXTURE))
     depth = {n["label"]: n["depth"] for n in dg["nodes"]}
-    assert depth["vpc-a"] == 0
-    assert depth["subnet-a"] == depth["subnet-b"] == 1
-    assert depth["sg-app"] == depth["sg-lb"] == 2
+    # the CIDRs (ingress and egress peers) in a column of their own, left of the VPC
+    assert depth["0.0.0.0/0 (internet)"] == depth["10.9.0.0/16"] == 0
+    assert depth["vpc-a"] == 1
+    assert depth["subnet-a"] == depth["subnet-b"] == 2
+    assert depth["sg-app"] == depth["sg-lb"] == 3
     for r in ("instance-a", "lambda-classifier", "ecs-service-a", "lb-a", "asg-a"):
-        assert depth[r] == 3, r
+        assert depth[r] == 4, r
     quiet = {(s["source"], s["verb"], s["target"]) for s in dg["steps"] if s["quiet"]}
     assert {
         ("aws_vpc.vpc-a", "contains", "aws_subnet.subnet-a"),
