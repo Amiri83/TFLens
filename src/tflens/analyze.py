@@ -181,6 +181,10 @@ class Item:
     name: str
     id: str
     data: bool = False
+    # instances terraform creates (count / for_each x the module's multiplicity); None:
+    # not known statically, for ``created_reason``
+    created: int | None = 1
+    created_reason: str = ""
 
     @property
     def loc(self) -> Location:
@@ -217,6 +221,16 @@ class Analyzer:
         return self.graph
 
     def _collect(self, inst: ModuleInstance) -> None:
+        """Nodes of one module instance: only the blocks terraform would create (a module
+        or block whose count / for_each is known to be 0 is recorded as not created)."""
+        mult, mult_reason = inst.multiplicity()
+        if mult == 0:
+            assert inst.call is not None and inst.parent is not None
+            if inst.parent.multiplicity()[0] != 0:  # the outermost module not created
+                self.graph.omit(
+                    inst.module_id or "", self._zero(inst.parent, inst.call), inst.call.loc
+                )
+            return
         if inst.module_id is not None:
             call = inst.call
             assert call is not None and inst.parent is not None
@@ -224,6 +238,23 @@ class Analyzer:
                 "source": inst.parent.child_source.get(call.labels[0]),
                 "dir": inst.src.dir,
             }
+            if mult != 1:
+                props["created"] = mult
+            for meta in ("count", "for_each"):
+                attr = call.attrs.get(meta)
+                if attr is None:
+                    continue
+                n, reason = inst.parent.instances_of(call)
+                value = inst.parent.eval_attr(attr)
+                props["instances"] = f"{meta} = {display(value)}"
+                if n is None:
+                    v = unwrap(value)
+                    self.unknown(
+                        inst.module_id,
+                        meta,
+                        v.reason if isinstance(v, Unknown) else reason,
+                        attr.loc,
+                    )
             remote = inst.parent.child_remote.get(call.labels[0])
             if remote is not None:
                 props["remote_source"] = remote.source
@@ -248,11 +279,24 @@ class Analyzer:
             self.unknown(child_id, "source", inst.child_status[name], call.loc)
         for data, table in ((False, inst.src.resources), (True, inst.src.data)):
             for rtype, name in sorted(table):
-                item = Item(
-                    inst, table[(rtype, name)], rtype, name, inst.node_id(rtype, name, data), data
-                )
+                block = table[(rtype, name)]
+                node_id = inst.node_id(rtype, name, data)
+                n, reason = inst.instances_of(block)
+                if n == 0:
+                    self.graph.omit(node_id, self._zero(inst, block), block.loc)
+                    continue
+                item = Item(inst, block, rtype, name, node_id, data)
+                if n is None or mult is None:
+                    item.created, item.created_reason = None, reason or mult_reason
+                else:
+                    item.created = n * mult
                 self.items.append(item)
                 self.by_id[item.id] = item
+
+    @staticmethod
+    def _zero(inst: ModuleInstance, block: Block) -> str:
+        meta = "count" if "count" in block.attrs else "for_each"
+        return f"{meta} = {display(inst.eval_attr(block.attrs[meta]))}: not created"
 
     def _node(self, item: Item) -> Node:
         attrs: dict[str, Any] = {}
@@ -278,6 +322,10 @@ class Analyzer:
                 props["instances"] = (
                     f"{meta} = {display(item.inst.eval_attr(item.block.attrs[meta]))}"
                 )
+        if "instances" in props or item.created != 1:
+            props["created"] = item.created
+            if item.created is None:
+                props["created_unknown"] = item.created_reason
         return Node(
             id=item.id,
             kind="data" if item.data else "resource",

@@ -1,0 +1,17 @@
+name: deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, uat, prod]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform init -input=false -backend-config=backend.${{ matrix.env }}.hcl
+      - run: terraform plan -input=false -var-file=environments/${{ matrix.env }}.tfvars -out=plan.bin
+      - run: terraform apply -auto-approve plan.bin
