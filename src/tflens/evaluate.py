@@ -383,14 +383,18 @@ def _join(sep: Any, *lists: Any) -> Any:
     s = _str(sep)
     items: list[Any] = []
     for lst in lists:
-        items.extend(_list(lst))
+        # aws_subnet.x[*].id: the instances of one resource, joined
+        items.extend([lst] if isinstance(unwrap(lst), Ref) else _list(lst))
     parts: list[Any] = []
     for i, item in enumerate(items):
         if i:
             parts.append(s)
         item = unwrap(item)
         sv = scalar_str(item)
-        parts.append(sv if sv is not None else item)
+        if isinstance(item, Interp):
+            parts.extend(item.parts)
+        else:
+            parts.append(sv if sv is not None else item)
     if all(isinstance(p, str) for p in parts):
         return "".join(parts)
     if any(not isinstance(p, (str, Ref, Unknown)) for p in parts):
@@ -492,6 +496,11 @@ def _lookup(m: Any, key: Any, *default: Any) -> Any:
 
 
 def _element(lst: Any, idx: Any) -> Any:
+    base = unwrap(lst)
+    if isinstance(base, Ref):
+        # element(aws_subnet.x[*].id, count.index): one instance of the same resource
+        i = unwrap(idx)
+        return _narrow_ref(base, "index", i) if is_known(i) else base
     items = _list(lst)
     i = int(_known(idx))
     if not items:

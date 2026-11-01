@@ -19,6 +19,7 @@ from .engine import Engine, ModuleInstance
 from .loader import Block, RepoSource
 from .model import Edge, Evidence, Graph, Node
 from .policy import Statement, as_list, parse_policy, statement_spans
+from .tags import resource_tags
 from .values import (
     Interp,
     JsonEncoded,
@@ -39,6 +40,10 @@ _SKIP_ATTRS = {"provider", "lifecycle"}
 LAMBDA_ALIAS = "aws_lambda_alias"
 # the variable / local an attribute's raw expression reads (var.topic_arn, local.x)
 _VAR_REF = re.compile(r"\b(var|local)\.([A-Za-z_][\w-]*)")
+# data.terraform_remote_state.<name>.outputs.<output> as written in an argument
+_REMOTE_OUTPUT = re.compile(
+    r"\bdata\.terraform_remote_state\.([A-Za-z_][\w-]*)\.outputs\.([A-Za-z_][\w-]*)"
+)
 
 
 @dataclass(frozen=True)
@@ -218,6 +223,9 @@ class Analyzer:
         for item in self.items:
             self._walk(item, item.block, "")
         for item in self.items:
+            if item.data and item.type == "terraform_remote_state":
+                self._remote_state_link(item)
+        for item in self.items:
             handler = EXTRACTORS.get((item.data, item.type))
             if handler is not None:
                 handler(self, item)
@@ -337,6 +345,22 @@ class Analyzer:
         why = count_why(item.inst, item.block, item.id)
         if why is not None:
             props["count_why"] = why
+        shown = item.inst.instance_shown(item.block, item.id)
+        if shown is not None and item.created != 1:
+            props["instance_shown"] = f"values shown for {shown}"
+        tags = resource_tags(
+            item.inst, item.block, item.type, item.id, inherits=category == "resource"
+        )
+        if tags is not None:
+            props["tags"] = tags["tags"]
+            props["tag_sources"] = tags["sources"]
+            props["tag_locations"] = tags["locations"]
+            if tags["unknown"]:
+                props["tags_unknown"] = tags["unknown"]
+            if "provider" in tags:
+                props["tag_provider"] = tags["provider"]
+        if item.data and item.type == "terraform_remote_state":
+            props["remote_state"] = item.inst.remote_state(item.name)
         return Node(
             id=item.id,
             kind="data" if item.data else "resource",
@@ -362,6 +386,7 @@ class Analyzer:
             for upath, unk in collect_unknowns(value, path):
                 self.unknown(item.id, upath, unk.reason, attr.loc)
             self._config_refs(item, path, value, attr.loc)
+            self._remote_state_refs(item, path, attr)
         for name in sorted(block.dynamic):
             self.unknown(
                 item.id, f"{prefix}{name}", "dynamic block is not expanded statically", block.loc
@@ -395,6 +420,25 @@ class Analyzer:
                 label = f"env {env}"
                 ev_loc = self.narrow(loc, env)
             self.edge("CONFIG", item.id, target, label, [self.ev(ev_loc)], attrs)
+
+    def _remote_state_refs(self, item: Item, path: str, attr: Any) -> None:
+        """A CONFIG edge to each ``terraform_remote_state`` an argument reads outputs of,
+        also when the output resolved to the other stack's resources (then both edges)."""
+        outputs: dict[str, list[str]] = {}
+        for name, output in _REMOTE_OUTPUT.findall(str(attr.raw)):
+            data_id = item.inst.node_id("terraform_remote_state", name, data=True)
+            if data_id in self.graph.nodes:
+                outputs.setdefault(data_id, []).append(f"{data_id}.outputs.{output}")
+        for data_id, refs in sorted(outputs.items()):
+            if any(
+                e.source == item.id
+                and e.target == data_id
+                and e.attributes.get("attribute") == path
+                for e in self.graph.edges
+            ):
+                continue
+            attrs = {"attribute": path, "refs": sorted(set(refs))}
+            self.edge("CONFIG", item.id, data_id, path, [self.ev(attr.loc)], attrs)
 
     def _container_env_refs(self, item: Item, value: Any, loc: Location) -> Any:
         """ECS ``container_definitions``: one CONFIG edge per environment variable / secret
@@ -566,7 +610,7 @@ class Analyzer:
         """
         out: list[str] = []
         for el in as_list(value):
-            ids = self._ref_targets(item, el, types, data_ok)
+            ids = self._ref_targets(item, el, types, data_ok) or self._remote_outputs(el)
             if ids:
                 out.extend(ids)
                 continue
@@ -586,6 +630,61 @@ class Analyzer:
             matches = self.match(item.inst.prefix, pattern, types)
             out.extend(matches or [self.external(external, pattern)])
         return _dedupe(out)
+
+    # ------------------------------------------------------------ remote state
+    def remote_state_target(self, data_id: str) -> str:
+        """The external node a ``terraform_remote_state`` reads from: the stack of this
+        repository that writes that state, else the state itself (outside the repository)."""
+        item = self.by_id[data_id]
+        link = item.inst.remote_state(item.name)
+        env = link.get("env")
+        if link["stack"]:
+            key = link["stack"] + (f":{env}" if env else "")
+            label = f"stack {link['stack']}" + (f" ({env})" if env else "")
+            return self.graph.external("terraform_stack", key, label)
+        cfg = link["config"]
+        where = "/".join(
+            str(cfg[k])
+            for k in ("bucket", "storage_account_name", "container_name", "organization")
+            + ("prefix", "key", "path", "address")
+            if cfg.get(k)
+        )
+        where = where or "(config not known)"
+        return self.graph.external(
+            "terraform_state",
+            f"{link['backend']}:{where}",
+            f"{link['backend']} state {where} (not written by a stack of this repository)",
+        )
+
+    def _remote_state_link(self, item: Item) -> None:
+        link = item.inst.remote_state(item.name)
+        attrs = {
+            "remote_state": True,
+            "backend": link["backend"],
+            "stack": link["stack"],
+            "env": link["env"],
+            "status": link["status"],
+            "reason": link["reason"],
+        }
+        target = self.remote_state_target(item.id)
+        self.edge("CONFIG", item.id, target, "remote state", [self.ev(item.loc)], attrs)
+
+    def _remote_outputs(self, value: Any) -> list[str]:
+        """External nodes for the remote-state outputs a value reads (an output of another
+        stack, not resolved here): ``stack platform/network (dev): vpc_id``."""
+        ids = []
+        for ref in collect_refs(value):
+            node = self.graph.nodes.get(ref.target)
+            if node is None or node.type != "terraform_remote_state" or node.kind != "data":
+                continue
+            output = re.sub(r"\[[^\]]*\]", "", ref.attr).removeprefix("outputs.")
+            stack = self.graph.nodes[self.remote_state_target(ref.target)]
+            ids.append(
+                self.graph.external(
+                    "remote_output", f"{stack.id}#{output}", f"{stack.name}: {output}"
+                )
+            )
+        return _dedupe(ids)
 
     def _ref_targets(
         self, item: Item, value: Any, types: set[str] | None, data_ok: bool

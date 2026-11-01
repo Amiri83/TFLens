@@ -11,9 +11,18 @@ from typing import Any
 from . import __version__
 from .analyze import analyze
 from .crawl import crawl
-from .detect import detect_environments, detect_structure
+from .detect import detect_environments, detect_structure, state_index
+from .docsdiff import docs_diff
 from .engine import Engine, ModuleInstance, in_scope
-from .envs import analyze_environments, default_env, env_id, find_env
+from .envs import (
+    analyze_environments,
+    default_env,
+    env_id,
+    env_roots,
+    find_env,
+    select_stacks,
+    stacks,
+)
 from .loader import RepoSource, load_repo
 from .model import SCHEMA_VERSION, Graph
 from .values import to_json
@@ -47,6 +56,7 @@ def run_analysis(
     git: bool = True,
     env: str | None = None,
     auto_env: bool = False,
+    stack_envs: dict[str, str] | None = None,
 ) -> Analysis:
     """Analyze ``root``. ``scope`` limits the roots to one directory (an environment).
     The git history is read when ``git_root`` (default ``root``) is a git checkout.
@@ -57,49 +67,117 @@ def run_analysis(
     applied when environments are detected (:func:`envs.default_env`: dev, else the
     first). Without explicit var files, variables or scope, every detected environment
     is also analyzed on its own (``environment_analysis``: counts per environment and a
-    total)."""
+    total).
+
+    Every stack (root) is analyzed: with ``auto_env`` or ``stack_envs`` (stack id ->
+    environment id, '' for none) each stack gets its own environment (the one chosen,
+    else its default), so the stacks all show up side by side (``model["stacks"]``).
+    ``env`` applies one environment and limits the analysis to its directory."""
     repo = load_repo(root)
     # a managed run of one environment passes its var files / scope: no per-env section
     explicit = bool(var_files or cli_vars or scope)
+    probe = Engine(repo)
+    probe.discover_roots()
+    environments = detect_environments(repo, probe)
+    all_roots = sorted(set(probe.root_modules) | set(probe.units))
+    stack_list = stacks(environments, all_roots)
     selected = None
-    if env or (auto_env and not explicit):
-        probe = Engine(repo)
-        probe.discover_roots()
-        environments = detect_environments(repo, probe)
-        selected = find_env(environments, env) if env else default_env(environments)
-        if env and selected is None:
+    per_stack: dict[str, Any] | None = None
+    if env:
+        selected = find_env(environments, env)
+        if selected is None:
             known = ", ".join(env_id(e, environments) for e in environments) or "none"
             raise ValueError(f"unknown environment {env!r} (detected: {known})")
-    if selected is not None:
         var_files = list(selected["var_files"]) + list(var_files or [])
         if scope is None and selected["root"] != ".":
             scope = selected["root"]
-    engine = Engine(repo, var_files, cli_vars, scope)
+    elif (auto_env or stack_envs) and not explicit:
+        per_stack = select_stacks(stack_list, environments, stack_envs or {})
+        chosen = {s["selected"] for s in per_stack["stacks"] if s["selected"]}
+        primary = default_env([e for e in environments if env_id(e, environments) in chosen])
+        selected = primary
+    engine = Engine(
+        repo,
+        var_files,
+        cli_vars,
+        scope,
+        root_var_files=per_stack["root_var_files"] if per_stack else None,
+        exclude_roots=per_stack["exclude_roots"] if per_stack else None,
+    )
+    engine.state_index = state_index(repo, probe, environments)
+    if per_stack:
+        engine.root_envs = dict(per_stack["root_envs"])
+    elif selected is not None:
+        engine.root_envs = {r: selected["name"] for r in env_roots(selected, all_roots)}
     engine.run()
     graph = analyze(repo, engine)
     crawled = crawl(repo, git_root, git)
     model = build_model(repo, engine, graph, crawled)
     environments = model["structure"]["environments"]
+    sel_id = env_id(selected, environments) if selected is not None else ""
     model["environment"] = (
         {
-            "id": env_id(selected, environments),
+            "id": sel_id,
             "name": selected["name"],
             "root": selected["root"],
-            "var_files": list(engine.var_files),
+            "var_files": list(engine.var_files)
+            if per_stack is None
+            else list(selected["var_files"]),
             "backend_hcl": list(selected.get("backend_hcl", [])),
-            "default": not env,  # applied because none was asked for
+            # applied because none was asked for
+            "default": not env and not (stack_envs or {}).get(_stack_of(stack_list, sel_id)),
         }
         if selected is not None
         else None
+    )
+    model["stacks"] = _stacks_section(
+        per_stack["stacks"] if per_stack else stack_list, engine, selected, environments
     )
     model["environment_analysis"] = (
         None
         if explicit
         else analyze_environments(
-            repo, environments, model["environment"]["id"] if model["environment"] else None
+            repo,
+            environments,
+            model["environment"]["id"] if model["environment"] else None,
+            model["stacks"],
         )
     )
     return Analysis(repo, engine, graph, model)
+
+
+def _stack_of(stack_list: list[dict[str, Any]], eid: str) -> str:
+    """The stack an environment (id) belongs to ('' if none)."""
+    return next((s["id"] for s in stack_list if eid in s["environments"]), "")
+
+
+def _stacks_section(
+    stack_list: list[dict[str, Any]],
+    engine: Engine,
+    selected: dict[str, Any] | None,
+    environments: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """``model["stacks"]``: each stack with its roots (those analyzed in this model), its
+    environments and the one applied (the environment selector is per stack)."""
+    sel_id = env_id(selected, environments) if selected is not None else None
+    out = []
+    for s in stack_list:
+        chosen = s.get("selected")
+        if "selected" not in s:  # one environment applied to its directory (--env)
+            chosen = sel_id if sel_id in s["environments"] else None
+        out.append(
+            {
+                "id": s["id"],
+                "layout": s["layout"],
+                "roots": list(s["roots"]),
+                "analyzed": [r for r in s["roots"] if r in engine.roots],
+                "environments": list(s["environments"]),
+                "env_roots": {k: list(v) for k, v in s["env_roots"].items()},
+                "selected": chosen,
+                "default": bool(s.get("default")),
+            }
+        )
+    return out
 
 
 def failure_reason(repo: RepoSource, engine: Engine) -> str:
@@ -294,7 +372,37 @@ def build_model(
         "discovery": discovery,
         "structure": structure,
         "crawl": crawled if crawled is not None else crawl(repo, git=False),
+        "stack_links": stack_links(nodes, [i.root_dir for i in roots]),
+        "docs_diff": docs_diff(repo),
     }
+
+
+def stack_links(nodes: list[dict[str, Any]], root_dirs: list[str]) -> list[dict[str, Any]]:
+    """The ``terraform_remote_state`` data sources: which stack reads which stack's state
+    (or a state no stack of the repository writes), with where it is declared."""
+    out = []
+    for n in nodes:
+        rs = (n.get("properties") or {}).get("remote_state")
+        if n["kind"] != "data" or rs is None:
+            continue
+        if "::" in n["id"]:
+            owner: str | None = n["id"].split("::", 1)[0]
+        else:  # one root analyzed: ids carry no "<root>::" prefix
+            owner = root_dirs[0] if len(root_dirs) == 1 else None
+        out.append(
+            {
+                "data_source": n["id"],
+                "from_stack": owner,
+                "to_stack": rs["stack"],
+                "env": rs["env"],
+                "backend": rs["backend"],
+                "config": rs["config"],
+                "status": rs["status"],
+                "reason": rs["reason"],
+                "location": n["location"],
+            }
+        )
+    return out
 
 
 def dumps(model: dict[str, Any]) -> str:

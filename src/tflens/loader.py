@@ -24,9 +24,51 @@ from .jsonloc import JsonLocError, tf_json, tfvars_json
 from .locate import LocBlock, object_keys, scan
 from .values import Location
 
-_SKIP_DIRS = {".terraform", ".git", ".venv", "venv", "node_modules", "__pycache__"}
+_SKIP_DIRS = {".terraform", ".git", ".venv", "venv", "node_modules", "__pycache__", "dist"}
 # Hidden directories that are walked anyway: CI configuration (read by crawl.py).
 CI_DIRS = frozenset({".github", ".gitlab", ".circleci", ".buildkite"})
+# Code that exercises a module rather than deploying it: example, test and fixture
+# directories are left out of the inventory and the graph (a module is mapped from its own
+# directory only). An environment called "test" (envs/test, or test/ next to dev/ and
+# prod/) is not one of them.
+EXCLUDED_DIRS = frozenset({"examples", "example", "test", "tests", "fixtures"})
+# Environment names (dev, prod, ...) and the directories whose sub-directories are
+# environments (envs/<env>, live/<env>, ...): used by detect.py too.
+ENV_WORDS = frozenset(
+    {
+        "dev",
+        "develop",
+        "development",
+        "test",
+        "testing",
+        "qa",
+        "uat",
+        "sit",
+        "int",
+        "intg",
+        "integ",
+        "integration",
+        "e2e",
+        "stage",
+        "staging",
+        "stg",
+        "preprod",
+        "pre-prod",
+        "prod",
+        "production",
+        "prd",
+        "sandbox",
+        "sbx",
+        "nonprod",
+        "non-prod",
+        "perf",
+        "demo",
+        "dr",
+    }
+)
+ENV_CONTAINERS = frozenset(
+    {"envs", "env", "environments", "environment", "live", "deployments", "accounts", "stages"}
+)
 OUTPUT_DIR = "tflens-out"  # written by `tflens serve --dir` inside the repository
 TERRAGRUNT_FILE = "terragrunt.hcl"
 LOCK_FILE = ".terraform.lock.hcl"
@@ -218,6 +260,19 @@ class RepoSource:
         return "\n".join(lines)
 
 
+def excluded_dir(name: str, parent: str, siblings: list[str]) -> bool:
+    """Whether a directory holds example / test / fixture code (:data:`EXCLUDED_DIRS`)
+    rather than being an environment: ``envs/test`` and ``test/`` next to ``dev/`` stay."""
+    low = name.lower()
+    if low not in EXCLUDED_DIRS:
+        return False
+    if low in ENV_WORDS:
+        env_parent = posixpath.basename(parent).lower() in ENV_CONTAINERS
+        env_sibling = any(s.lower() in ENV_WORDS and s.lower() != low for s in siblings)
+        return not (env_parent or env_sibling)
+    return True
+
+
 def _rel(root: Path, path: str) -> str:
     rel = Path(path).relative_to(root).as_posix()
     return rel or "."
@@ -233,6 +288,8 @@ def load_repo(root: Path) -> RepoSource:
         path = _rel(root, exc.filename) if exc.filename else "?"
         repo.skipped.append(SkippedDir(path, "unreadable", f"cannot list: {exc.strerror or exc}"))
 
+    # 1. the whole tree first (every depth), then 2. each file classified by what it is
+    walked: list[tuple[str, list[str]]] = []
     for dirpath, dirnames, filenames in os.walk(root, onerror=onerror):
         rel_dir = _rel(root, dirpath)
         keep = []
@@ -246,11 +303,21 @@ def load_repo(root: Path) -> RepoSource:
                 continue
             elif d in _SKIP_DIRS or (d.startswith(".") and d not in CI_DIRS):
                 repo.skipped.append(SkippedDir(sub, "ignored", "tool, VCS or hidden directory"))
+            elif excluded_dir(d, rel_dir, dirnames):
+                repo.skipped.append(
+                    SkippedDir(
+                        sub,
+                        "excluded",
+                        "example / test / fixture code: not part of the inventory or the graph",
+                    )
+                )
             else:
                 keep.append(d)
         dirnames[:] = keep
+        walked.append((rel_dir, sorted(filenames)))
+    for rel_dir, filenames in walked:
         counts = repo.dir_ext.setdefault(rel_dir, Counter())
-        for fname in sorted(filenames):
+        for fname in filenames:
             rel = f"{rel_dir}/{fname}" if rel_dir != "." else fname
             counts[extension(fname)] += 1
             if len(repo.all_files) < MAX_LISTED_FILES:

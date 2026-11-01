@@ -94,6 +94,9 @@ table.env-counts tr.env-total td { border-top: 2px solid #d0d7de; }
 #environments td.num, #environments th.num { text-align: right; }
 table.env-inventory tr.differs td:first-child { border-left: 3px solid #bf8700; }
 table.env-inventory td.diff { background: #fff8c5; font-weight: 600; }
+table.env-stacks select { max-width: 320px; }
+#detail table.tags { border-collapse: collapse; margin: 4px 0 8px; }
+#detail table.tags td { padding: 1px 8px 1px 0; vertical-align: top; }
 button.env-apply { padding: 0 6px; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 4px; color: #0969da; }
 .inv-item { margin: 6px 0; padding: 4px 6px; border-left: 3px solid #d0d7de; }
 .inv-item.uncertain { border-left-color: #bc4c00; background: #fff1e5; }
