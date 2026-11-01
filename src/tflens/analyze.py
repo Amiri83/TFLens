@@ -726,8 +726,8 @@ class Analyzer:
             by_source.setdefault(e.source, []).append(e)
         for compute in sorted(self.runs_as):
             node = self.graph.nodes.get(compute)
-            if node is None or node.type == "aws_iam_instance_profile":
-                continue
+            if node is None or node.type in ("aws_iam_instance_profile", "aws_launch_template"):
+                continue  # links to a role, not code: what runs through them gets the access
             for role, ev, via in self._roles_of(compute, {compute}):
                 for e in by_source.get(role, []):
                     if e.target == compute:

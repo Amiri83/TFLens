@@ -12,9 +12,15 @@ already records with evidence:
   **can write**. **Reads from** is the same with read actions;
 * a **chain** follows entry -> compute -> what it sends to -> what that triggers -> ...,
   numbered in breadth-first order. Dead-letter queues, alarms and log groups are side
-  branches, never chain steps.
+  branches, never chain steps;
+* **every compute gets a flow**: one that no chain from an entry point reaches starts its
+  own chain (marked *no trigger*), so the flows cover all the code, each compute once;
+* what a compute runs in and as (ECS cluster, task definition, containers, task /
+  execution role, instance profile, launch template) is its **context**: boxes hung
+  under it, never chain steps.
 
-Every step carries the ``file:line`` of each piece of evidence it rests on.
+Every step carries the ``file:line`` of each piece of evidence it rests on, and every node
+a ``code_ref`` (its own block, else the first evidence that names it).
 """
 
 from __future__ import annotations
@@ -104,9 +110,17 @@ KIND_LABELS = {
     "aws_ssm_parameter": "SSM parameter",
     "aws_batch_job_definition": "Batch job",
     "aws_glue_job": "Glue job",
+    "aws_launch_template": "launch template",
+    "aws_iam_instance_profile": "instance profile",
+    "aws_iam_group": "IAM group",
+    "aws_iam_policy": "IAM policy",
+    "aws_iam_role_policy": "inline role policy",
+    "aws_iam_user_policy": "inline user policy",
+    "aws_iam_group_policy": "inline group policy",
     # external nodes (by external kind)
     "kafka_topic": "Kafka topic",
     "aws_service": "AWS service",
+    "aws_managed_policy": "AWS managed policy",
 }
 # verb of a link: (kind, status) -> text
 VERBS = {
@@ -116,6 +130,33 @@ VERBS = {
     ("read", "verified"): "reads from",
     ("read", "unverified"): "reads from (unverified)",
     ("read", "iam_only"): "can read",
+}
+# Flow groups of the Flow tab, by the type of the first compute a chain reaches.
+GROUP_ORDER = ("Lambda", "ECS", "EC2", "Network", "Other")
+GROUP_OF_TYPE = {
+    "aws_lambda_function": "Lambda",
+    "aws_ecs_service": "ECS",
+    "aws_instance": "EC2",
+    "aws_autoscaling_group": "EC2",
+}
+# What a compute runs in / as: holder type -> ((CONFIG attribute, relation), ...).
+CONTEXT_ATTRS: dict[str, tuple[tuple[str, str], ...]] = {
+    "aws_lambda_function": (("role", "execution role"),),
+    "aws_ecs_service": (("cluster", "cluster"),),
+    "aws_ecs_task_definition": (
+        ("task_role_arn", "task role"),
+        ("execution_role_arn", "execution role"),
+    ),
+    "aws_instance": (("iam_instance_profile", "instance profile"),),
+    "aws_autoscaling_group": (
+        ("launch_template.id", "launch template"),
+        ("launch_template.name", "launch template"),
+    ),
+    "aws_launch_template": (
+        ("iam_instance_profile.name", "instance profile"),
+        ("iam_instance_profile.arn", "instance profile"),
+    ),
+    "aws_iam_instance_profile": (("role", "IAM role"),),
 }
 _KIND_ORDER = {"trigger": 0, "send": 1, "read": 2}
 _STATUS_ORDER = {"": 0, "verified": 0, "unverified": 1, "iam_only": 2}
@@ -331,7 +372,13 @@ class _Flows:
                 if kind != "read":  # what it reads is a sink of this chain
                     queue.append(target)
         main = list(depth)
-        return {"entry": entry, "steps": steps, "depth": depth, "side": self.side(main)}
+        return {
+            "entry": entry,
+            "steps": steps,
+            "depth": depth,
+            "side": self.side(main),
+            "context": self.context(main),
+        }
 
     def _step(
         self,
@@ -446,6 +493,88 @@ class _Flows:
                         add("logs", nid, lg["id"], f"{fn} logs to {label_of(lg)}", lg["location"])
         return out
 
+    # ------------------------------------------------------------- context
+    def context(self, main: list[str]) -> list[dict[str, Any]]:
+        """What the chain's computes run in and as: ECS cluster, task definitions and
+        their containers, task / execution roles, instance profiles, launch templates."""
+        out: list[dict[str, Any]] = []
+        seen = set(main)
+
+        def add(parent: str, node: str, relation: str, loc: dict[str, Any] | None, **extra: Any):
+            if node in seen:
+                return False
+            seen.add(node)
+            out.append(
+                {"parent": parent, "node": node, "relation": relation, "location": loc, **extra}
+            )
+            return True
+
+        def by_attribute(holder: str) -> None:
+            attrs = dict(CONTEXT_ATTRS.get(self.type_of(holder), ()))
+            for e in sorted(self.edges(holder, "CONFIG"), key=lambda e: (e["target"], e["id"])):
+                relation = attrs.get(e["attributes"].get("attribute", ""))
+                if relation and e["target"] in self.nodes:
+                    loc = _loc(e["evidence"][0] if e["evidence"] else None)
+                    if add(holder, e["target"], relation, loc):
+                        walk(e["target"])
+
+        def walk(holder: str) -> None:
+            """cluster -> task definition -> containers -> task / execution role;
+            instance (or ASG -> launch template) -> instance profile -> role."""
+            if self.type_of(holder) == "aws_ecs_task_definition":
+                for name, image in self.containers(holder):
+                    add(
+                        holder,
+                        f"{holder}#container/{name}",
+                        "container",
+                        self.nodes[holder]["location"],
+                        label=name,
+                        image=image,
+                    )
+            by_attribute(holder)
+            if self.type_of(holder) == "aws_ecs_service":
+                for e in self.edges(holder, "CONFIG"):
+                    if self.type_of(e["target"]) == "aws_ecs_task_definition":
+                        loc = _loc(e["evidence"][0] if e["evidence"] else None)
+                        if add(holder, e["target"], "task definition", loc):
+                            walk(e["target"])
+
+        for nid in main:
+            if self.is_compute(nid):
+                walk(nid)
+        return out
+
+    def containers(self, task_def: str) -> list[tuple[str, str]]:
+        """(name, image) of each container of a task definition's container_definitions."""
+        value = self.nodes[task_def]["attributes"].get("container_definitions")
+        if isinstance(value, dict) and "$json" in value:
+            value = value["$json"]
+        out = []
+        for c in value if isinstance(value, list) else []:
+            if isinstance(c, dict) and isinstance(c.get("name"), str):
+                image = c.get("image")
+                out.append((c["name"], image if isinstance(image, str) else ""))
+        return out
+
+    def code_ref(self, nid: str, steps: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """A node's own block, else the first evidence of a step that names it."""
+        n = self.nodes.get(nid)
+        if n is not None and n["location"]:
+            return n["location"]
+        for s in steps:
+            if nid in (s["source"], s["target"]):
+                for e in s["evidence"]:
+                    if e["location"]:
+                        return e["location"]
+        return None
+
+    def group(self, depth: dict[str, int]) -> str:
+        """The Flow tab group of a chain: the type of the first compute it reaches."""
+        first = next((nid for nid in depth if self.is_compute(nid)), None)
+        if first is None:
+            return "Network"
+        return GROUP_OF_TYPE.get(self.type_of(first), "Other")
+
 
 def _chain_title(f: _Flows, chain: dict[str, Any]) -> str:
     """entry -> ... along the first path to a sink (the main line of the diagram)."""
@@ -475,10 +604,11 @@ def build_flows(model: dict[str, Any]) -> dict[str, Any]:
         reached |= set(c["depth"])
         chains.append(c)
     # a trigger source only reachable through a loop (something in the repository can
-    # write to it, but nothing reached does), then code that sends somewhere but that
-    # nothing declared starts: each its own chain
+    # write to it, but nothing reached does), then every compute no chain reaches (code
+    # that nothing declared starts, whether it sends somewhere or not): each its own
+    # chain, so every compute is in exactly one chain as a start or a later step
     late = [s for s in f.trigger_sources() if not f.is_compute(s)]
-    late += [c for c in f.computes() if f.links(c)]
+    late += f.computes()
     for start in late:
         if start not in reached:
             c = f.chain(start)
@@ -489,6 +619,7 @@ def build_flows(model: dict[str, Any]) -> dict[str, Any]:
     out_chains = []
     for i, c in enumerate(chains, 1):
         entry = f.nodes[c["entry"]]
+        no_trigger = f.is_compute(c["entry"])
         nodes = [
             {
                 "id": nid,
@@ -496,7 +627,11 @@ def build_flows(model: dict[str, Any]) -> dict[str, Any]:
                 "kind_label": kind_of(f.nodes[nid]),
                 "depth": d,
                 "location": f.nodes[nid]["location"],
-                "role": "entry" if d == 0 else ("compute" if f.is_compute(nid) else "target"),
+                "role": (
+                    ("no_trigger" if no_trigger else "entry")
+                    if d == 0
+                    else ("compute" if f.is_compute(nid) else "target")
+                ),
             }
             for nid, d in c["depth"].items()
         ]
@@ -514,23 +649,49 @@ def build_flows(model: dict[str, Any]) -> dict[str, Any]:
                     "side_kind": s["kind"],
                 }
             )
-        no_trigger = f.is_compute(c["entry"])
+        for x in c["context"]:
+            n = f.nodes.get(x["node"])
+            if n is None:  # a container: part of its task definition's block
+                label, kind = x["label"], "container" + (f", {x['image']}" if x["image"] else "")
+            else:
+                label, kind = label_of(n), kind_of(n)
+                if x["relation"].lower() != kind.lower():
+                    kind = f"{x['relation']}: {kind}"
+            nodes.append(
+                {
+                    "id": x["node"],
+                    "label": label,
+                    "kind_label": kind,
+                    "depth": None,
+                    "location": n["location"] if n else x["location"],
+                    "role": "context",
+                    "parent": x["parent"],
+                    "relation": x["relation"],
+                }
+            )
+        for n in nodes:
+            n["code_ref"] = n["location"] or f.code_ref(n["id"], c["steps"])
+        title = _chain_title(f, c)
         out_chains.append(
             {
                 "id": f"flow-{i}",
                 "n": i,
-                "title": _chain_title(f, c),
+                "title": f"{title} (no trigger)" if no_trigger else title,
                 "entry": c["entry"],
                 "entry_label": f.name(c["entry"]),
                 "entry_kind": "compute without a declared trigger"
                 if no_trigger
                 else kind_of(entry),
+                "no_trigger": no_trigger,
+                "group": f.group(c["depth"]),
                 "steps": c["steps"],
                 "side": c["side"],
+                "context": c["context"],
                 "nodes": nodes,
             }
         )
     steps = [s for c in out_chains for s in c["steps"]]
+    covered = {nid for c in chains for nid in c["depth"] if f.is_compute(nid)}
     metrics = {
         "flows": len(out_chains),
         "entry_points": len(out_chains),
@@ -538,12 +699,26 @@ def build_flows(model: dict[str, Any]) -> dict[str, Any]:
         "unverified": sum(1 for s in steps if s["status"] == "unverified"),
         "iam_only": sum(1 for s in steps if s["status"] == "iam_only"),
         "side_branches": sum(len(c["side"]) for c in out_chains),
+        "compute_covered": len(covered),
+        "compute_total": len(f.computes()),
+        "no_trigger": sum(1 for c in out_chains if c["no_trigger"]),
     }
     return {
         "chains": out_chains,
+        "groups": flow_groups(out_chains),
         "metrics": metrics,
         "start_here": start_here(model, f, out_chains),
     }
+
+
+def flow_groups(chains: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The chains under the Flow tab's headings (Lambda, ECS, EC2, Network, Other), in
+    that order, empty groups left out; each keeps the chains' own order."""
+    return [
+        {"group": g, "flows": [c["id"] for c in chains if c["group"] == g]}
+        for g in GROUP_ORDER
+        if any(c["group"] == g for c in chains)
+    ]
 
 
 def _line(text: str, loc: dict[str, Any] | None, level: int = 0, node: str = "") -> dict[str, Any]:
@@ -577,6 +752,8 @@ def start_here(
     for c in chains:
         first = c["steps"][0] if c["steps"] else None
         loc = first["evidence"][0]["location"] if first and first["evidence"] else None
+        if c["no_trigger"]:  # nothing starts it: the compute's own block is the entry
+            loc = f.code_ref(c["entry"], c["steps"])
         lines.append(
             _line(
                 f"{loc['file'] if loc else '?'} — flow {c['n']}: {c['entry_label']} ({c['entry_kind']})",
@@ -625,12 +802,33 @@ def metrics_text(m: dict[str, Any]) -> str:
     )
 
 
+def coverage_text(m: dict[str, Any]) -> str:
+    text = f"{m['compute_covered']} of {m['compute_total']} compute resources covered"
+    if m["no_trigger"]:
+        text += f" ({m['no_trigger']} without a declared trigger)"
+    return text
+
+
 # ------------------------------------------------------------------ markdown
 
 
 def render_flows_markdown(flows: dict[str, Any], level: int = 1) -> str:
     h = "#" * level
-    out = [f"{h} Flows", "", metrics_text(flows["metrics"]) + ".", "", f"{h}# Start here", ""]
+    out = [f"{h} Flows", "", metrics_text(flows["metrics"]) + ".", ""]
+    if flows["metrics"]["compute_total"]:
+        out += [coverage_text(flows["metrics"]) + ".", ""]
+    if flows["groups"]:
+        n_of = {c["id"]: c["n"] for c in flows["chains"]}
+        out += [
+            "By type: "
+            + "; ".join(
+                f"{g['group']}: " + ", ".join(str(n_of[i]) for i in g["flows"])
+                for g in flows["groups"]
+            )
+            + ".",
+            "",
+        ]
+    out += [f"{h}# Start here", ""]
     for ln in flows["start_here"]:
         loc = f" (`{location_label(ln['location'])}`)" if ln["location"] else ""
         out.append(f"{'  ' * ln['level']}- {ln['text']}{loc}")
@@ -639,6 +837,16 @@ def render_flows_markdown(flows: dict[str, Any], level: int = 1) -> str:
         out += [f"{h}# Flow {c['n']}: {c['title']}", ""]
         out += [s["text"] for s in c["steps"]] or ["(no steps)"]
         out.append("")
+        context = [n for n in c["nodes"] if n["role"] == "context"]
+        if context:
+            labels = {n["id"]: n["label"] for n in c["nodes"]}
+            out += ["Runs in / as:", ""]
+            out += [
+                f"- {labels.get(n['parent'], n['parent'])} {n['relation']}: {n['label']}"
+                + (f" (`{location_label(n['code_ref'])}`)" if n["code_ref"] else "")
+                for n in context
+            ]
+            out.append("")
         if c["side"]:
             out += ["Side branches:", ""]
             out += [
@@ -653,7 +861,7 @@ def render_flows_markdown(flows: dict[str, Any], level: int = 1) -> str:
 # ------------------------------------------------------------------ diagram
 
 FONT = "Helvetica, Arial, sans-serif"
-NODE_W, NODE_H, SIDE_H = 240, 62, 54
+NODE_W, NODE_H, SIDE_H = 240, 80, 72
 COL_GAP, ROW_GAP, PAD = 210, 26, 24
 STYLE = {  # (kind, status) -> colour, dash
     ("trigger", ""): ("#bc4c00", ""),
@@ -663,8 +871,33 @@ STYLE = {  # (kind, status) -> colour, dash
     ("read", "verified"): ("#0969da", ""),
     ("read", "unverified"): ("#9a6700", "8 5"),
     ("read", "iam_only"): ("#57606a", "2 4"),
+    # the Network and IAM tab diagrams (tflens.tabdiagrams)
+    ("contains", ""): ("#8c959f", "4 3"),
+    ("rule", ""): ("#bc4c00", ""),
+    ("rule", "public"): ("#cf222e", ""),
+    ("access", "iam_only"): ("#57606a", "2 4"),
+    ("deny", ""): ("#cf222e", "6 3"),
 }
-ROLE_STROKE = {"entry": "#bc4c00", "compute": "#8250df", "target": "#1a7f37", "side": "#8c959f"}
+ROLE_STROKE = {
+    "entry": "#bc4c00",
+    "no_trigger": "#8250df",
+    "compute": "#8250df",
+    "target": "#1a7f37",
+    "side": "#8c959f",
+    "context": "#8250df",
+    # the Network and IAM tab diagrams
+    "network": "#0969da",
+    "guard": "#bc4c00",
+    "principal": "#8250df",
+    "policy": "#9a6700",
+}
+FLOW_LEGEND = (
+    ("triggers / routes to", "trigger", ""),
+    ("sends to", "send", "verified"),
+    ("reads from", "read", "verified"),
+    ("unverified", "send", "unverified"),
+    ("IAM only", "send", "iam_only"),
+)
 
 
 def _w(text: str, size: int) -> float:
@@ -682,13 +915,20 @@ def _t(
     return f'<text x="{x:.0f}" y="{y:.0f}" font-size="{size}" fill="{fill}"{extra}>{escape(text)}</text>'
 
 
-def flow_svg(chain: dict[str, Any], title: str = "") -> str:
+def flow_svg(
+    chain: dict[str, Any],
+    title: str = "",
+    legend: tuple[tuple[str, str, str], ...] = FLOW_LEGEND,
+) -> str:
     """One chain, left to right by step depth, at natural size (every font >= 14px).
-    Side branches hang below the node they belong to."""
-    main = [n for n in chain["nodes"] if n["role"] != "side"]
+    Side branches and context (what a compute runs in / as) hang below the node they
+    belong to. Every box shows its code reference (``file:line``). Also draws the
+    Network and IAM tab diagrams (same shape: nodes with a depth, numbered steps)."""
+    hung = ("side", "context")
+    main = [n for n in chain["nodes"] if n["role"] not in hung]
     side: dict[str, list[dict[str, Any]]] = {}
     for n in chain["nodes"]:
-        if n["role"] == "side":
+        if n["role"] in hung:
             side.setdefault(n["parent"], []).append(n)
     cols: dict[int, list[dict[str, Any]]] = {}
     for n in main:
@@ -728,10 +968,13 @@ def flow_svg(chain: dict[str, Any], title: str = "") -> str:
             continue
         x, y, w, h = pos[n["id"]]
         stroke = ROLE_STROKE[n["role"]]
-        dash = ' stroke-dasharray="5 3"' if n["role"] == "side" else ""
-        name_size = 14 if n["role"] == "side" else 16
+        dash = ' stroke-dasharray="5 3"' if n["role"] in hung else ""
+        name_size = 14 if n["role"] in hung else 16
+        ref = n.get("code_ref", n.get("location"))
+        ref_text = location_label(ref) if ref else "no code reference"
         nodes_svg.append(
-            f'<g><title>{escape(n["id"])}</title><rect x="{x:.0f}" y="{y:.0f}" width="{w:.0f}" '
+            f"<g><title>{escape(n['id'])} ({escape(ref_text)})</title>"
+            f'<rect x="{x:.0f}" y="{y:.0f}" width="{w:.0f}" '
             f'height="{h:.0f}" rx="8" fill="#ffffff" stroke="{stroke}" stroke-width="2"{dash}/>'
             + _t(
                 x + 12,
@@ -746,6 +989,14 @@ def flow_svg(chain: dict[str, Any], title: str = "") -> str:
                 _cut(n["kind_label"], w - 24, 14),
                 14,
                 "#57606a",
+            )
+            + _t(
+                x + 12,
+                y + (62 if h == SIDE_H else 70),
+                _cut(ref_text, w - 24, 14),
+                14,
+                "#0969da",
+                ' class="code-ref"',
             )
             + "</g>"
         )
@@ -775,9 +1026,13 @@ def flow_svg(chain: dict[str, Any], title: str = "") -> str:
             f'markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="{colour}"/></marker>'
             f'<path d="{d}" fill="none" stroke="{colour}" stroke-width="2.2"{dash_attr}{marker}/>'
         )
+        if s.get("quiet"):  # structure (contains / attached): the boxes say enough
+            continue
         # the label sits in the gap just before the target: one per incoming step, stacked
         line1 = f"{s['n']}. {s['verb'].split(' (')[0]}"
-        line2 = {"unverified": "(unverified)", "iam_only": "(IAM only)"}.get(s["status"], "")
+        line2 = {"unverified": "(unverified)", "iam_only": "(IAM only)", "public": "(public)"}.get(
+            s["status"], ""
+        )
         lw = max(_w(line1, 14), _w(line2, 14)) + 10
         lh = 40 if line2 else 22
         lx = (x2 - 10 - lw) if tx > sx else x1 + 20
@@ -794,13 +1049,6 @@ def flow_svg(chain: dict[str, Any], title: str = "") -> str:
             + "</g>"
         )
     legend_y = bottom + 10
-    legend = [
-        ("triggers / routes to", "trigger", ""),
-        ("sends to", "send", "verified"),
-        ("reads from", "read", "verified"),
-        ("unverified", "send", "unverified"),
-        ("IAM only", "send", "iam_only"),
-    ]
     lx = PAD
     for text, kind, status in legend:
         colour, dash = STYLE[(kind, status)]

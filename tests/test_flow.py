@@ -140,6 +140,10 @@ def test_metrics():
         "unverified": 1,
         "iam_only": 1,
         "side_branches": 4,
+        # every compute (fn-a, fn-b, svc-a) is in a chain; none needs a flow of its own
+        "compute_covered": 3,
+        "compute_total": 3,
+        "no_trigger": 0,
     }
 
 

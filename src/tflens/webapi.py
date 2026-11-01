@@ -23,6 +23,8 @@ from .overview import build_overview
 from .report import describe_node
 from .shapes import build_root_view, build_shapes, root_entries, root_model
 from .snippets import SourceLines, snippet_lines
+from .tabdiagrams import DIAGRAMS as TAB_DIAGRAMS
+from .tabdiagrams import tab_svg
 from .visuals import DIAGRAMS, mermaid, svg
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -717,6 +719,18 @@ class Api:
                 body = chain_svg(source, name, self.store.title)
                 if body is None:
                     return _not_found(f"flow diagram {name!r}")
+                return _download(body, "image/svg+xml; charset=utf-8", f"{name}.svg", query)
+            if name in TAB_DIAGRAMS and fmt == "svg":
+                # the Root view's Network / IAM diagram: the repository's, or with
+                # root=<dir> that root's
+                source = model
+                if "root" in query:
+                    if query["root"] not in {r["dir"] for r in root_entries(model)}:
+                        return _not_found(f"root {query['root']!r}")
+                    source = root_model(model, query["root"])
+                body = tab_svg(source, name, self.store.title)
+                if body is None:
+                    return _not_found(f"{name} diagram: nothing to draw")
                 return _download(body, "image/svg+xml; charset=utf-8", f"{name}.svg", query)
             if name not in DIAGRAMS or fmt not in ("svg", "mmd"):
                 return _not_found(f"diagram {name!r} ({fmt})")

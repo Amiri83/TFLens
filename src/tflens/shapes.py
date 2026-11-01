@@ -10,11 +10,15 @@ stated in words:
   KMS, IAM, log buckets, SSM parameters), little to no compute -> the **Provides** view
   (what it creates, the outputs it exposes, who reads them, per environment);
 * **network**: VPCs, subnets, security groups, endpoints, transit gateways -> the
-  **Network** view (VPC -> subnets -> endpoints / security groups, what can reach what);
+  **Network** view (VPC -> subnets -> endpoints / security groups, what can reach what,
+  and a diagram: VPC -> subnets -> security groups -> resources, the rules labelled);
 * **module library**: no backend, no provider configuration, nothing calls it -> the
   **Module catalog** (inputs, outputs, resources, example usage, who calls it);
 * **other**: none of the above (a composition of remote modules, a data store, ...) ->
   the Provides view.
+
+Every root also has an **IAM** view (role -> policies -> what they can access, with a
+diagram); it is never a primary view.
 
 A repository with roots of several shapes is *mixed*: each root keeps its own view and
 the summary lists the roots grouped by shape, each with a one-line description.
@@ -30,6 +34,8 @@ from .flow import COMPUTE_TYPES, build_flows, kind_of
 from .flow import label_of as _flow_label
 from .overview import FRIENDLY, _line, _plural
 from .snippets import location_label
+from .tabdiagrams import DIAGRAMS as TAB_DIAGRAMS
+from .tabdiagrams import iam_sections
 from .visuals import backend_text
 
 SHAPE_ORDER = ("app", "platform", "network", "library", "other")
@@ -40,7 +46,15 @@ SHAPES: dict[str, dict[str, str]] = {
     "library": {"label": "module library", "view": "catalog"},
     "other": {"label": "other", "view": "provides"},
 }
-VIEWS = {"flow": "Flow", "provides": "Provides", "network": "Network", "catalog": "Module catalog"}
+VIEWS = {
+    "flow": "Flow",
+    "provides": "Provides",
+    "network": "Network",
+    "iam": "IAM",
+    "catalog": "Module catalog",
+}
+# Views with one diagram of the root under their sections (tflens.tabdiagrams).
+DIAGRAM_VIEWS = ("network", "iam")
 
 # What feeds code: queues, topics, streams, schedules, APIs, load balancers and the
 # resources that wire them to it.
@@ -510,8 +524,12 @@ def build_root_view(model: dict[str, Any], root: str, view: str = "") -> dict[st
         out["sections"] = provides_sections(model, entry, sub)
     elif view == "network":
         out["sections"] = network_sections(sub)
+    elif view == "iam":
+        out["sections"] = iam_sections(sub)
     else:
         out["sections"] = catalog_sections(model, entry, sub)
+    if view in DIAGRAM_VIEWS and TAB_DIAGRAMS[view][0](sub)["nodes"]:
+        out["diagram"] = view  # api/diagram?name=<view>&root=<dir>
     return out
 
 
