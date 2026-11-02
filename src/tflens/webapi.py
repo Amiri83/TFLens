@@ -17,11 +17,15 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .cards import stack_cards
 from .drawio import MIME as DRAWIO_MIME
 from .drawio import chain_drawio, tab_drawio
 from .envs import difference_lines, env_counts_text, inventory_rows, node_root, summarize
 from .flow import build_flows, chain_svg
+from .graphlayout import layout as graph_layout
+from .icons import service_colour
 from .jobs import JobBusy, JobContext, JobManager
+from .labels import call_name, node_label
 from .model import EDGE_KINDS, SCHEMA_VERSION
 from .output import dumps, library_roots
 from .overview import build_overview
@@ -31,27 +35,21 @@ from .shapes import build_root_view, build_shapes, root_entries, root_model
 from .snippets import SourceLines, snippet_lines
 from .tabdiagrams import DIAGRAMS as TAB_DIAGRAMS
 from .tabdiagrams import tab_svg
-from .visuals import DIAGRAMS, mermaid, svg
+from .visuals import (
+    DIAGRAMS,
+    ROOT_PREFIX,
+    backend_text,
+    env_matrix_table,
+    mermaid,
+    root_node_id,
+    svg,
+)
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-# Categorical palette for services (assigned in sorted service order: deterministic).
-SERVICE_PALETTE = (
-    "#4e79a7",
-    "#f28e2b",
-    "#59a14f",
-    "#e15759",
-    "#76b7b2",
-    "#edc948",
-    "#b07aa1",
-    "#ff9da7",
-    "#9c755f",
-    "#86bcb6",
-    "#d37295",
-    "#a0cbe8",
-)
-EXTERNAL_COLOR = "#bab0ac"
-META_COLOR = "#d0d7de"
+# Service colours: icons.SERVICE_COLOURS (fixed per service, shared with the diagrams).
+EXTERNAL_COLOR = service_colour("external")
+META_COLOR = service_colour("meta")
 KIND_COLORS = {
     "ACCESS": "#d62728",
     "TRIGGER": "#ff7f0e",
@@ -317,14 +315,15 @@ def _compact(node: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _unanalyzed_modules(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def _unanalyzed_modules(model: dict[str, Any], every: bool = False) -> dict[str, dict[str, Any]]:
     """Module calls that could not be analyzed have no graph node; describe them
-    from the module tree so the UI can still show where they are and why."""
+    from the module tree so the UI can still show where they are and why (``every``:
+    each module call of the tree, analyzed or not)."""
     out: dict[str, dict[str, Any]] = {}
 
     def walk(mods: list[dict[str, Any]], parent: str) -> None:
         for m in mods:
-            if not m["analyzed"]:
+            if not m["analyzed"] or (every and m["address"]):
                 out[m["id"]] = {
                     "id": m["id"],
                     "kind": "module",
@@ -337,7 +336,7 @@ def _unanalyzed_modules(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
                     "location": m["location"],
                     "properties": {"source": m["source"], "status": m["status"]},
                     "attributes": {},
-                    "analyzed": False,
+                    "analyzed": m["analyzed"],
                 }
             walk(m["children"], m["id"] if m["address"] else "")
 
@@ -346,8 +345,9 @@ def _unanalyzed_modules(model: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def service_colors(model: dict[str, Any]) -> dict[str, str]:
-    services = sorted({_service_of(n) for n in model["nodes"] if n["service"]} - {META_SERVICE})
-    colors = {s: SERVICE_PALETTE[i % len(SERVICE_PALETTE)] for i, s in enumerate(services)}
+    """One fixed colour per service (the same in every repository and every view)."""
+    services = {_service_of(n) for n in model["nodes"] if n["service"]} - {META_SERVICE}
+    colors = {s: service_colour(s) for s in sorted(services)}
     colors[META_SERVICE] = META_COLOR
     return colors
 
@@ -356,31 +356,71 @@ def _group_id(module: str) -> str:
     return GROUP_PREFIX + module
 
 
+def _root_group_id(root: str) -> str:
+    return GROUP_PREFIX + ROOT_PREFIX + root
+
+
+def _module_root(module: str, roots: list[str]) -> str | None:
+    if "::" in module:
+        return module.split("::", 1)[0]
+    return roots[0] if len(roots) == 1 else None
+
+
 def _parent_module(module: str) -> str:
     """``module.a.module.b`` -> ``module.a``; top-level modules have no parent ("")."""
     head, sep, _ = module.rpartition(".module.")
     return head if sep else ""
 
 
-def module_groups(modules: set[str]) -> list[dict[str, Any]]:
-    """Compound parent nodes, one per non-root module (and each enclosing module)."""
+def module_groups(modules: set[str], roots: list[str] | None = None) -> list[dict[str, Any]]:
+    """Compound parent nodes, one per non-root module (and each enclosing module). The
+    label is the module call's name (``worker · module``); ``node`` is the module call to
+    open on click; ``root_group`` the root a top-level call belongs to."""
     wanted: set[str] = set()
     for m in modules:
         while m and m != ROOT_MODULE and m not in wanted:
             wanted.add(m)
             m = _parent_module(m)
-    return [
-        {
-            "data": {
-                "id": _group_id(m),
-                "label": m,
-                "module": m,
-                "parent": _group_id(_parent_module(m)) if _parent_module(m) else None,
-            },
-            "classes": "group",
-        }
-        for m in sorted(wanted)
-    ]
+    out = []
+    for m in sorted(wanted):
+        root = _module_root(m, roots or [])
+        out.append(
+            {
+                "data": {
+                    "id": _group_id(m),
+                    "label": f"{call_name(m) or m} · module",
+                    "module": m,
+                    "node": m,
+                    "parent": _group_id(_parent_module(m)) if _parent_module(m) else None,
+                    "root": root,
+                    "root_group": _root_group_id(root) if root is not None else None,
+                },
+                "classes": "group",
+            }
+        )
+    return out
+
+
+def _cluster_path(module: str, root: str | None) -> list[str]:
+    """The layout clusters of a node, outermost first: its root, then each module call."""
+    chain = []
+    m = module if module and module != ROOT_MODULE else ""
+    while m:
+        chain.append(_group_id(m))
+        m = _parent_module(m)
+    head = [_root_group_id(root)] if root is not None else ["group:external"]
+    return head + chain[::-1]
+
+
+def _default_visible(model: dict[str, Any], kinds: set[str]) -> set[str]:
+    """Nodes the Graph shows before any filter is touched (not meta, connected by an edge
+    of a kind shown by default): they come first in their cluster's grid."""
+    meta = {n["id"] for n in model["nodes"] if _service_of(n) == META_SERVICE}
+    out: set[str] = set()
+    for e in model["edges"]:
+        if e["kind"] in kinds and e["source"] not in meta and e["target"] not in meta:
+            out.update((e["source"], e["target"]))
+    return out
 
 
 def edge_short_label(edge: dict[str, Any]) -> str:
@@ -396,16 +436,20 @@ def graph_view(model: dict[str, Any]) -> dict[str, Any]:
     carry ``group`` (their module's compound parent id, if any); the UI sets
     ``parent`` from it when grouping by module is enabled."""
     colors = service_colors(model)
+    roots = list(model.get("roots") or [])
     nodes = []
     for n in model["nodes"]:
         if n["kind"] == "module":
             continue
         service = _service_of(n)
+        root = node_root(n["id"], roots)
         nodes.append(
             {
                 "data": {
                     "id": n["id"],
                     "label": short_name(n),
+                    # what the Graph draws: module call + type, never a bare "this"
+                    "display": node_label(n, root),
                     "short_name": short_name(n),
                     "name": n["name"],
                     "type": n["type"],
@@ -414,31 +458,62 @@ def graph_view(model: dict[str, Any]) -> dict[str, Any]:
                     "service": service or "external",
                     "module": _module_of(n),
                     "group": _group_id(n["module"]) if n["module"] else None,
+                    "root": root,
+                    "root_group": _root_group_id(root) if root is not None else None,
                     "file": n["location"]["file"] if n["location"] else "",
                     "color": colors.get(service, EXTERNAL_COLOR),
                 }
             }
         )
-    edges = [
-        {
-            "data": {
-                "id": e["id"],
-                "source": e["source"],
-                "target": e["target"],
-                "kind": e["kind"],
-                "label": e["label"],
-                "short_label": edge_short_label(e),
-                "color": KIND_COLORS.get(e["kind"], "#000000"),
+    ids = {d["data"]["id"] for d in nodes}
+    edges, dropped = [], []
+    for e in model["edges"]:
+        # an edge to something the Graph does not draw (a module call) would make
+        # Cytoscape reject it: listed instead of silently lost
+        if e["source"] not in ids or e["target"] not in ids:
+            dropped.append(e["id"])
+            continue
+        edges.append(
+            {
+                "data": {
+                    "id": e["id"],
+                    "source": e["source"],
+                    "target": e["target"],
+                    "kind": e["kind"],
+                    "label": e["label"],
+                    "short_label": edge_short_label(e),
+                    "color": KIND_COLORS.get(e["kind"], "#000000"),
+                }
             }
-        }
-        for e in model["edges"]
-    ]
+        )
     services = sorted({d["data"]["service"] for d in nodes})
-    kinds = [k for k in EDGE_KINDS if any(e["kind"] == k for e in model["edges"])]
+    kinds = [k for k in EDGE_KINDS if any(e["data"]["kind"] == k for e in edges)]
+    groups = module_groups({d["data"]["module"] for d in nodes}, roots)
+    structure = _structure_elements(model, nodes, groups, roots)
+    shown = _default_visible(model, {k for k in kinds if k not in DEFAULT_HIDDEN_KINDS})
+    positions, boxes = graph_layout(
+        [
+            (
+                d["data"]["id"],
+                _cluster_path(d["data"]["module"], d["data"]["root"]),
+                (d["data"]["id"] not in shown, d["data"]["service"], d["data"]["display"]),
+            )
+            for d in nodes
+        ]
+    )
+    # ungrouped: each module call / root is a node at the top of its cluster's box
+    for s in structure["nodes"]:
+        box = boxes.get(s["data"]["cluster"])
+        if box:
+            positions[s["data"]["id"]] = {"x": box["x"] + box["w"] / 2, "y": box["y"] + 12}
     return {
         "nodes": nodes,
         "edges": edges,
-        "groups": module_groups({d["data"]["module"] for d in nodes}),
+        "groups": groups,
+        "root_groups": structure["root_groups"],
+        "structure": {"nodes": structure["nodes"], "edges": structure["edges"]},
+        "positions": positions,
+        "dropped_edges": dropped,
         "filters": {
             "kinds": kinds,
             "modules": sorted({d["data"]["module"] for d in nodes}),
@@ -455,6 +530,93 @@ def graph_view(model: dict[str, Any]) -> dict[str, Any]:
             "kinds": dict(KIND_COLORS),
         },
     }
+
+
+def _structure_elements(
+    model: dict[str, Any],
+    nodes: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+    roots: list[str],
+) -> dict[str, list[dict[str, Any]]]:
+    """Containment: one compound per root (the module groups nest inside it when the
+    Graph groups by module) and, for the ungrouped Graph, one node per root and module
+    call with a CONTAINS edge root -> module call -> each resource."""
+    root_dirs = sorted({d["data"]["root"] for d in nodes + groups if d["data"]["root"] is not None})
+    color = service_colour("terraform")
+    root_groups = [
+        {
+            "data": {
+                "id": _root_group_id(r),
+                "label": f"root {r}/" if r != "." else "root ./",
+                "node": root_node_id(r),
+                "parent": None,
+            },
+            "classes": "group root-group",
+        }
+        for r in root_dirs
+    ]
+    s_nodes = [
+        {
+            "data": {
+                "id": root_node_id(r),
+                "label": f"root {r}/" if r != "." else "root ./",
+                "display": f"root {r}/" if r != "." else "root ./",
+                "kind": "root",
+                "service": "terraform",
+                "module": ROOT_MODULE,
+                "color": color,
+                "cluster": _root_group_id(r),
+            },
+            "classes": "structure",
+        }
+        for r in root_dirs
+    ]
+    s_edges = []
+
+    def contains(parent: str, child: str) -> None:
+        s_edges.append(
+            {
+                "data": {
+                    "id": f"contains:{parent}->{child}",
+                    "source": parent,
+                    "target": child,
+                    "kind": "CONTAINS",
+                    "label": "contains",
+                    "short_label": "",
+                    "color": "#8c959f",
+                }
+            }
+        )
+
+    for g in groups:
+        d = g["data"]
+        s_nodes.append(
+            {
+                "data": {
+                    "id": d["module"],
+                    "label": d["label"],
+                    "display": d["label"],
+                    "kind": "module",
+                    "service": "terraform",
+                    "module": d["module"],
+                    "color": color,
+                    "cluster": d["id"],
+                },
+                "classes": "structure",
+            }
+        )
+        parent = _parent_module(d["module"])
+        if parent:
+            contains(parent, d["module"])
+        elif d["root"] is not None:
+            contains(root_node_id(d["root"]), d["module"])
+    for n in nodes:
+        d = n["data"]
+        if d["module"] != ROOT_MODULE:
+            contains(d["module"], d["id"])
+        elif d["root"] is not None:
+            contains(root_node_id(d["root"]), d["id"])
+    return {"root_groups": root_groups, "nodes": s_nodes, "edges": s_edges}
 
 
 def _evidence_items(edge: dict[str, Any], source: SourceLines | None) -> list[dict[str, Any]]:
@@ -494,8 +656,10 @@ def _edge_ref(edge: dict[str, Any], other: str) -> dict[str, Any]:
 def node_detail(
     model: dict[str, Any], node_id: str, source: SourceLines | None = None
 ) -> dict[str, Any] | None:
+    if node_id.startswith(ROOT_PREFIX):
+        return root_detail(model, node_id[len(ROOT_PREFIX) :], source)
     node = next((n for n in model["nodes"] if n["id"] == node_id), None)
-    node = node or _unanalyzed_modules(model).get(node_id)
+    node = node or _unanalyzed_modules(model, every=True).get(node_id)
     if node is None:
         return None
     out_edges = [e for e in model["edges"] if e["source"] == node_id]
@@ -519,6 +683,7 @@ def node_detail(
         "summary": {
             "description": description,
             "short_name": short_name(node),
+            "label": node_label(node, node_root(node_id, list(model.get("roots") or []))),
             "kind": node["kind"],
             "type": node["type"],
             "service": _service_of(node),
@@ -534,6 +699,78 @@ def node_detail(
         },
         "evidence": evidence,
         "unknowns": [u for u in model["unknowns"] if u["subject"] == node_id],
+    }
+
+
+def root_detail(
+    model: dict[str, Any], root_dir: str, source: SourceLines | None = None
+) -> dict[str, Any] | None:
+    """A root (stack) as a node of the pane: its backend block as the defining code, the
+    signals that make it a root as evidence, the unknowns of its resources."""
+    root = next(
+        (r for r in (model.get("structure") or {}).get("roots", []) if r["dir"] == root_dir), None
+    )
+    if root is None:
+        return None
+    roots = list(model.get("roots") or [])
+    backend = root["backend"]
+    loc = backend.get("location")
+    defined = (
+        {
+            "node": ROOT_PREFIX + root_dir,
+            "module": ROOT_MODULE,
+            **{k: loc[k] for k in ("file", "start_line", "end_line")},
+            "lines": snippet_lines(loc, source, context=2),
+        }
+        if loc
+        else None
+    )
+    evidence = []
+    for sig in root.get("signals") or []:
+        ev = sig.get("location")
+        if not ev:
+            continue
+        evidence.append(
+            {
+                "edge": "",
+                "kind": "ROOT",
+                "label": sig["signal"],
+                **{k: ev[k] for k in ("file", "start_line", "end_line")},
+                "note": "",
+                "lines": snippet_lines(ev, source),
+            }
+        )
+    label = f"root {root_dir}/" if root_dir != "." else "root ./"
+    modules = [
+        {
+            "address": m["address"],
+            "node": f"{root_dir}::{m['address']}" if len(roots) > 1 else m["address"],
+        }
+        for m in root.get("modules") or []
+    ]
+    return {
+        "type": "node",
+        "id": ROOT_PREFIX + root_dir,
+        "title": label,
+        "short_name": label,
+        "summary": {
+            "description": f"{root['kind']} root ({root.get('role', 'deployable')}), "
+            f"{backend_text(backend)} backend — {backend.get('origin', '')}",
+            "short_name": label,
+            "label": label,
+            "kind": "root",
+            "type": "root",
+            "service": "terraform",
+            "module": ROOT_MODULE,
+            "outgoing": len(modules),
+            "incoming": 0,
+        },
+        "node": {"properties": {}},
+        "defined_by": defined,
+        "edges": {"outgoing": [], "incoming": []},
+        "modules": modules,
+        "evidence": evidence,
+        "unknowns": [u for u in model["unknowns"] if node_root(u["subject"], roots) == root_dir],
     }
 
 
@@ -1025,6 +1262,10 @@ class Api:
             return json_response(build_flows(model))
         if path == "/api/shapes":
             return json_response(build_shapes(model))
+        if path == "/api/stack-cards":
+            return json_response(stack_cards(model))
+        if path == "/api/env-matrix":
+            return json_response(env_matrix_table(model))
         if path == "/api/root-view":
             root, view = query.get("root", ""), query.get("view", "")
             data = build_root_view(model, root, view)

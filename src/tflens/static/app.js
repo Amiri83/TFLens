@@ -84,6 +84,8 @@
         layoutGraph();
       }
     }
+    const note = document.getElementById("graph-note");
+    if (note) note.classList.toggle("hidden", view !== "graph" || !note.textContent);
   }
 
   // ------------------------------------------------------------ file:line references
@@ -133,12 +135,12 @@
   // ------------------------------------------------------------ environments
   // One row per environment name (dev | intg | uat | prod: every stack with its own
   // tfvars), never a total across environments; the files of each stack's environment.
-  function envCountsTable(envs) {
+  function envCountsTable(envs, columns) {
     const types = envs.types || [];
     const head = el("tr", {}, el("th", {}, "Environment"),
       ...types.map((t) => el("th", {}, t.label)), el("th", {}, "Unknowns"), el("th", {}, "Files"));
     const byId = new Map(envs.environments.map((r) => [r.id, r]));
-    const rows = envColumns(envs).map((c) => {
+    const rows = (columns || envColumns(envs)).map((c) => {
       const files = (c.environments || [c.id]).flatMap((id) => {
         const r = byId.get(id);
         return r ? [...r.backend_hcl, ...r.var_files] : [];
@@ -497,71 +499,119 @@
     select.disabled = !envs.switchable;
   }
 
+  // The validation status of an environment name (confirmed / hint-only / contradicted).
+  function envStatus(envs, name) {
+    const g = ((envs.env_debug || {}).groups || []).find((x) => x.env === name);
+    return g ? g.status : "confirmed";
+  }
+
+  function confirmedColumns(envs) {
+    return envColumns(envs).filter((c) => envStatus(envs, c.name || c.id) === "confirmed");
+  }
+
+  function sumCounts(counts) {
+    return Object.values(counts || {}).reduce((a, b) => a + b, 0);
+  }
+
+  // One row per stack, one column per confirmed environment: the instances that stack
+  // creates there with its own tfvars (hover a number for the types).
+  function stackCountsTable(envs, columns) {
+    const names = columns.map((c) => c.name || c.id);
+    const stacks = (envs.stacks || []).filter((s) => !s.library && s.environments.length);
+    const cell = new Map(envs.environments.map((r) => [`${r.stack}\u0000${r.name}`, r]));
+    const types = new Map((envs.types || []).map((t) => [t.type, t.label]));
+    const head = el("tr", {}, el("th", {}, "Stack"), ...names.map((n) => el("th", { class: "num" }, n)));
+    const rows = stacks.map((s) => el("tr", { "data-stack": s.id }, el("td", { class: "mono" }, s.id),
+      ...names.map((n) => {
+        const r = cell.get(`${s.id}\u0000${n}`);
+        if (!r) return el("td", { class: "num muted", title: `${s.id} has no ${n} environment` }, "—");
+        const uncertain = sumCounts(r.uncertain);
+        const what = Object.entries(r.counts || {}).map(([t, c]) => `${types.get(t) || t}: ${c}`).join("\n");
+        return el("td", { class: uncertain ? "num st-unknown" : "num", title: what || "nothing counted" },
+          countText(sumCounts(r.counts), uncertain));
+      })));
+    return el("table", { class: "env-counts stack-counts" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
   function renderOverview(ov, envs) {
     const box = document.getElementById("overview");
     const toc = [];
     const parts = [];
-    if (ov.purpose && ov.purpose.length) {
-      toc.push(["ov-purpose", "Purpose (guess)"]);
-      parts.push(el("h2", { id: "ov-purpose" }, "Purpose (guess)"), overviewList(ov.purpose));
-    }
-    parts.push(el("h2", { id: "ov-top" }, "What this repository deploys"), overviewList(ov.summary));
-    toc.push(["ov-top", "What it deploys"]);
-    if (envs && envs.environments.length) {
+    // the default view: only the final, validated results
+    toc.push(["ov-confirmed", "Confirmed results"]);
+    parts.push(el("h2", { id: "ov-confirmed", class: "rv-section" }, "Confirmed results"));
+    const cols = envs ? confirmedColumns(envs) : [];
+    if (envs && cols.length) {
+      const dropped = envColumns(envs).length - cols.length;
+      parts.push(el("p", { class: "muted" }, `${cols.length} confirmed environment(s), each analyzed with its own tfvars: only what its count / for_each / conditionals create is counted.` +
+        (dropped ? ` ${dropped} unconfirmed environment(s) left out (see Details).` : "")));
       toc.push(["ov-env-counts", "Counts per environment"]);
-      parts.push(el("h2", { id: "ov-env-counts" }, "Counts per environment"),
-        el("p", { class: "muted" }, "Each environment analyzed with its own tfvars: only the blocks its count / for_each / conditionals create are counted."),
-        envCountsTable(envs), ...envUnknowns(envs));
+      parts.push(el("h3", { id: "ov-env-counts" }, "Counts per environment"), envCountsTable(envs, cols));
+      if ((envs.stacks || []).filter((s) => !s.library && s.environments.length).length) {
+        toc.push(["ov-stack-counts", "Counts per stack"]);
+        parts.push(el("h3", { id: "ov-stack-counts" }, "Counts per stack"), stackCountsTable(envs, cols));
+      }
+    } else if (envs) {
+      const cur = envs.current;
+      parts.push(el("p", { class: "muted" }, "No confirmed environment: the counts below are the code with the variables' defaults."),
+        el("table", { class: "env-counts" }, el("thead", {}, el("tr", {}, ...(envs.types || []).map((t) => el("th", { class: "num" }, t.label)), el("th", { class: "num" }, "Unknowns"))),
+          el("tbody", {}, el("tr", {}, ...(envs.types || []).map((t) => el("td", { class: "num" },
+            countText((cur.counts || {})[t.type] || 0, (cur.uncertain || {})[t.type] || 0))), el("td", { class: "num" }, String(cur.unknown_count || 0))))));
+    }
+    // everything else (guesses, why-chains, per-root explanations) behind one toggle
+    const details = [];
+    const dsec = (id, title, ...content) => {
+      toc.push([id, title]);
+      details.push(el("h2", { id, class: "rv-section" }, title), ...content);
+    };
+    if (ov.purpose && ov.purpose.length) dsec("ov-purpose", "Purpose (guess)", overviewList(ov.purpose));
+    dsec("ov-top", "What this repository deploys", overviewList(ov.summary));
+    if (envs && envs.environments.length) {
+      details.push(...envUnknowns(envs));
+      if (cols.length < envColumns(envs).length) {
+        dsec("ov-env-all", "All detected environments (confirmed or not)", envCountsTable(envs));
+      }
     }
     if (ov.inventory) {
+      // a failed analysis: what is in the repository is the result worth showing
       parts.push(el("h3", {}, "What is in the repository"), inventoryTable(ov.inventory));
     }
     ov.roots.forEach((r, i) => {
       const id = `ov-root-${i}`;
       toc.push([id, r.title]);
-      parts.push(el("h2", { id, class: "ov-root" }, `Root ${r.title}`, " ", locLink(r.location)));
-      if (!r.analyzed) parts.push(el("p", { class: "unknown" }, `Not analyzed: ${r.status}`));
+      details.push(el("h2", { id, class: "ov-root" }, `Root ${r.title}`, " ", locLink(r.location)));
+      if (!r.analyzed) details.push(el("p", { class: "unknown" }, `Not analyzed: ${r.status}`));
       for (const s of r.sections) {
-        parts.push(el("h3", {}, s.title), overviewList(s.lines));
+        details.push(el("h3", {}, s.title), overviewList(s.lines));
       }
     });
     if (ov.resources && ov.resources.length) {
       toc.push(["ov-res", "All resources"]);
-      parts.push(allResources(ov, "all-resources-ov", "ov-res", false));
+      details.push(allResources(ov, "all-resources-ov", "ov-res", false));
     }
-    if (ov.environments.length) {
-      toc.push(["ov-envs", "Environments"]);
-      parts.push(el("h2", { id: "ov-envs" }, "Environments"), overviewList(ov.environments));
-    }
-    if (ov.docs && ov.docs.length) {
-      toc.push(["ov-docs", "Documentation"]);
-      parts.push(el("h2", { id: "ov-docs" }, "Documentation"), overviewList(ov.docs));
-    }
+    if (ov.environments.length) dsec("ov-envs", "Environments", overviewList(ov.environments));
+    if (ov.docs && ov.docs.length) dsec("ov-docs", "Documentation", overviewList(ov.docs));
     if (ov.docs_diff && ov.docs_diff.length) {
-      toc.push(["ov-docs-diff", "Docs vs code"]);
-      parts.push(el("h2", { id: "ov-docs-diff" }, "Docs vs code"),
+      dsec("ov-docs-diff", "Docs vs code",
         el("p", { class: "muted" }, "Resources the Markdown files name that the code does not declare, and resources the code declares that no Markdown file mentions (by address or type)."),
         overviewList(ov.docs_diff));
     }
-    if (ov.ci && ov.ci.length) {
-      toc.push(["ov-ci", "CI / CD and lock files"]);
-      parts.push(el("h2", { id: "ov-ci" }, "CI / CD and lock files"), overviewList(ov.ci));
-    }
+    if (ov.ci && ov.ci.length) dsec("ov-ci", "CI / CD and lock files", overviewList(ov.ci));
     if (ov.history) {
-      toc.push(["ov-hist", "History"]);
-      parts.push(el("h2", { id: "ov-hist" }, "History"), overviewList(ov.history.summary));
+      dsec("ov-hist", "History", overviewList(ov.history.summary));
       if (ov.history.hot_files.length) {
-        parts.push(el("h3", {}, "Most-changed files"), overviewList(ov.history.hot_files));
+        details.push(el("h3", {}, "Most-changed files"), overviewList(ov.history.hot_files));
       }
       if (ov.history.commits.length) {
-        parts.push(el("h3", {}, "Recent commits"), overviewList(ov.history.commits));
+        details.push(el("h3", {}, "Recent commits"), overviewList(ov.history.commits));
       }
     }
-    toc.push(["ov-disc", "Discovery"]);
-    parts.push(el("h2", { id: "ov-disc" }, "Discovery"), overviewList(ov.discovery));
+    dsec("ov-disc", "Discovery", overviewList(ov.discovery));
+    parts.push(el("details", { class: "ov-details", id: "ov-details" },
+      el("summary", {}, "Details — purpose (guess), what it deploys, per-root explanations, resources, docs, CI, history"),
+      ...details));
     box.replaceChildren(...parts);
-    document.getElementById("toc").replaceChildren(...toc.map(([id, label]) =>
-      el("a", { class: "file link", onclick: () => document.getElementById(id).scrollIntoView() }, label)));
+    document.getElementById("toc").replaceChildren(...tocLinks(toc));
   }
 
   // The resource inventory, collapsed: the flows come first.
@@ -658,7 +708,12 @@
 
   function tocLinks(toc) {
     return toc.map(([tid, label]) =>
-      el("a", { class: "file link", onclick: () => document.getElementById(tid).scrollIntoView() }, label));
+      el("a", { class: "file link", onclick: () => {
+        const target = document.getElementById(tid);
+        // a section inside a closed details toggle: open it first
+        for (let d = target.closest("details"); d; d = d.parentElement.closest("details")) d.open = true;
+        target.scrollIntoView();
+      } }, label));
   }
 
   function renderFlow(fl, ov) {
@@ -697,6 +752,71 @@
   }
 
   let shownRoot = null; // {root, view} last shown in the Root view
+  let cardsData = []; // api/stack-cards: one card per stack, above the root shown
+
+  // ------------------------------------------------------------ stack cards
+  function chip(text, cls, attrs) {
+    return el("span", { class: `chip ${cls || ""}`.trim(), ...(attrs || {}) }, text);
+  }
+
+  function linkLine(lk, inbound) {
+    const other = inbound ? lk.from_stack || "?" : lk.to_stack || `${lk.backend || "?"} state outside this repository`;
+    return el("li", { class: lk.status === "unresolved" ? "st-unknown" : "" },
+      inbound ? "← " : "→ ", el("span", { class: "mono" }, other), lk.env ? ` (${lk.env})` : "", " via ",
+      link(lk.data_source.split("::").pop(), () => showDetail("node", lk.data_source)), " ", locLink(lk.location));
+  }
+
+  function stackCard(c) {
+    const p = c.purpose || {};
+    const purpose = p.text
+      ? el("p", { class: "card-purpose" }, p.text, " ", el("span", { class: "tag" }, "from ", locLink(p.location)))
+      : el("p", { class: "muted card-purpose" }, `Purpose not shown: ${p.note || "not confirmed"}.`);
+    const envs = c.environments.length
+      ? c.environments.map((e) => chip(e.name, `env st-${e.status}`, { title: e.status }))
+      : [el("span", { class: "muted" }, "none (variable defaults)")];
+    const perEnv = Object.entries(c.backend.per_env || {});
+    const backend = perEnv.length
+      ? el("ul", { class: "card-list" }, ...perEnv.map(([env, cell]) => el("li", {},
+        el("button", { type: "button", class: "link-btn", title: "Open the backend file",
+          onclick: () => showBackendCell({ stack: c.id }, env, cell) }, `${env}:`), " ",
+        el("span", { class: "mono wrap" }, [cell.bucket, cell.key].filter(Boolean).join(" / ") || cell.type))))
+      : el("span", { class: "mono wrap" }, c.backend.text || "—", " ", locLink(c.backend.location));
+    const resources = c.resources.length
+      ? el("div", { class: "chips" }, ...c.resources.map((r) => chip(`${r.label} ×${r.count}`, "res", { title: r.type })))
+      : el("span", { class: "muted" }, "none declared");
+    const modules = c.modules.length
+      ? el("ul", { class: "card-list" }, ...c.modules.map((m) => el("li", {},
+        link(m.address, () => showDetail("node", m.node)), " ",
+        el("span", { class: "tag mono" }, `${m.source}${m.version ? ` @ ${m.version}` : ""}${m.analyzed ? "" : " (not analyzed)"}`))))
+      : el("span", { class: "muted" }, "none");
+    const links = c.outbound.length || c.inbound.length
+      ? el("ul", { class: "card-list" }, ...c.outbound.map((l) => linkLine(l, false)), ...c.inbound.map((l) => linkLine(l, true)))
+      : el("span", { class: "muted" }, "none");
+    return el("article", { class: "stack-card", "data-stack": c.id },
+      el("div", { class: "card-head" },
+        el("h3", {}, link(c.id, () => c.node && showDetail("node", c.node))),
+        c.status !== "confirmed" ? chip(c.status, `st-${c.status}`) : null,
+        c.layout ? el("span", { class: "tag" }, c.layout) : null),
+      purpose,
+      el("dl", { class: "card-facts" },
+        el("dt", {}, "Environments"), el("dd", { class: "chips" }, ...envs),
+        el("dt", {}, "Backend"), el("dd", {}, backend),
+        el("dt", {}, `Resources (${c.resource_total})`), el("dd", {}, resources),
+        el("dt", {}, `Modules (${c.modules.length})`), el("dd", {}, modules),
+        el("dt", {}, "Remote state"), el("dd", {}, links)),
+      el("div", { class: "card-foot" }, el("button", { type: "button", class: "btn",
+        onclick: () => showRootView(c.roots[0], "").then(() => {
+          const head = document.getElementById("rv-root");
+          if (head) head.scrollIntoView();
+        }) }, "Open in Root view")));
+  }
+
+  function stackCards() {
+    if (!cardsData.length) return [];
+    return [el("h2", { id: "rv-stacks", class: "rv-section first" }, `Stacks (${cardsData.length})`),
+      el("p", { class: "muted" }, "Resources are the blocks each stack declares, by type. The purpose comes from the stack's own README, and only once the stack is confirmed."),
+      el("div", { class: "stack-cards" }, ...cardsData.map(stackCard))];
+  }
 
   function shapesSummary(shapes) {
     const head = shapes.mixed
@@ -720,8 +840,9 @@
     }
     shownRoot = { root, view: view || "" };
     const s = d.shape;
-    const toc = [["rv-shapes", "Roots by shape"], ["rv-root", `Root ${s.title}`]];
-    const parts = [shapesSummary(shapesData),
+    const toc = [...(cardsData.length ? [["rv-stacks", "Stacks"]] : []),
+      ["rv-shapes", "Roots by shape"], ["rv-root", `Root ${s.title}`]];
+    const parts = [...stackCards(), shapesSummary(shapesData),
       el("h2", { id: "rv-root", class: "rv-root" }, `Root ${s.title} `,
         el("span", { class: `shape-badge shape-${s.shape}` }, s.shape_label), " ", locLink(s.location)),
       el("p", { class: "rv-summary" }, s.summary),
@@ -836,18 +957,27 @@
       const ele = cy.getElementById(id);
       focus(ele.length ? ele : cy.getElementById(`group:${id}`));
     }
-    const parts = [el("h2", {}, d.title)];
     const s = d.summary;
+    // the label the views draw (module call · type), the full address right under it
+    const parts = type === "node"
+      ? [el("h2", {}, s.label || d.title), el("div", { class: "address mono", title: "Full address" }, d.title)]
+      : [el("h2", {}, d.title)];
     if (type === "node") {
       parts.push(el("dl", {},
         el("dt", {}, "Name"), el("dd", {}, s.short_name),
-        el("dt", {}, "Id"), el("dd", {}, d.id),
+        el("dt", {}, "Address"), el("dd", { class: "mono" }, d.id),
         el("dt", {}, "What"), el("dd", {}, s.description),
         el("dt", {}, "Type"), el("dd", {}, s.type),
         el("dt", {}, "Service"), el("dd", {}, s.service || "—"),
         el("dt", {}, "Module"), el("dd", {}, s.module),
-        el("dt", {}, "Edges"), el("dd", {}, `${s.outgoing} out, ${s.incoming} in`)));
+        s.kind === "root" ? null : el("dt", {}, "Edges"),
+        s.kind === "root" ? null : el("dd", {}, `${s.outgoing} out, ${s.incoming} in`)));
       parts.push(...nodeExtras(d.node.properties || {}));
+      if (d.modules && d.modules.length) {
+        parts.push(el("h3", {}, `Modules called (${d.modules.length})`),
+          el("ul", { class: "links" }, ...d.modules.map((m) =>
+            el("li", { class: "mono" }, link(m.address, () => showDetail("node", m.node))))));
+      }
       parts.push(el("h3", {}, "Defined by"));
       if (d.defined_by) {
         parts.push(evidenceBlock(`${locText(d.defined_by)} (module ${d.defined_by.module})`, d.defined_by.lines));
@@ -941,6 +1071,10 @@
     document.getElementById("filter-kinds").before(
       el("div", { class: "presets" }, ...PRESETS.map(([name, kinds]) =>
         el("button", { type: "button", onclick: () => setKinds(kinds) }, name))));
+    document.getElementById("search").after(
+      el("div", { class: "presets" },
+        el("button", { type: "button", id: "graph-fit", title: "Show the whole graph (labels may be too small to read)", onclick: () => cy && fitGraph(true) }, "Fit all"),
+        el("button", { type: "button", id: "graph-readable", title: "Zoom to a readable size from the top-left corner", onclick: () => cy && fitGraph(false) }, "Readable size")));
   }
 
   function visible(ele) {
@@ -955,23 +1089,34 @@
     const showMeta = document.getElementById("show-meta").checked;
     const hideIsolated = document.getElementById("hide-isolated").checked;
     const q = document.getElementById("search").value.trim().toLowerCase();
-    const members = cy.nodes().not(".group");
+    const members = cy.nodes().not(".group").not(".structure");
+    const structure = cy.nodes(".structure");
     const groups = cy.nodes(".group");
+    const contains = cy.edges('[kind = "CONTAINS"]');
+    const flows = cy.edges().not(contains);
     cy.batch(() => {
       members.forEach((n) => {
         const service = n.data("service");
         const ok = (service === "meta" ? showMeta : services.has(service)) && modules.has(n.data("module"));
         n.style("display", ok ? "element" : "none");
       });
-      cy.edges().forEach((e) => {
+      flows.forEach((e) => {
         const ok = kinds.has(e.data("kind")) && visible(e.source()) && visible(e.target());
         e.style("display", ok ? "element" : "none");
       });
       if (hideIsolated) {
+        // containment (resource -> module -> root) does not count as a connection
         members.forEach((n) => {
-          if (visible(n) && !n.connectedEdges().filter(visible).length) n.style("display", "none");
+          if (visible(n) && !n.connectedEdges().not(contains).filter(visible).length) n.style("display", "none");
         });
       }
+      // ungrouped: a module call / root node stays while anything it contains is shown
+      // (nested calls first, roots last)
+      structure.sort((a, b) => structDepth(b) - structDepth(a)).forEach((s) => {
+        const shown = s.outgoers('edge[kind = "CONTAINS"]').targets().filter(visible).length;
+        s.style("display", shown ? "element" : "none");
+      });
+      contains.forEach((e) => e.style("display", visible(e.source()) && visible(e.target()) ? "element" : "none"));
       // a module group stays visible while any of its members is (deepest groups first)
       groups.sort((a, b) => b.ancestors().length - a.ancestors().length).forEach((g) => {
         g.style("display", g.children().filter(visible).length ? "element" : "none");
@@ -979,13 +1124,30 @@
       cy.elements().removeClass("faded match");
       if (q) {
         const hits = members.filter((n) =>
-          visible(n) && (n.id().toLowerCase().includes(q) || String(n.data("name")).toLowerCase().includes(q)));
+          visible(n) && [n.id(), n.data("name"), n.data("display")].some((v) => String(v).toLowerCase().includes(q)));
         cy.elements().addClass("faded");
         hits.removeClass("faded").addClass("match");
         hits.ancestors().removeClass("faded");
         hits.connectedEdges().removeClass("faded");
       }
     });
+    graphEmptyNote();
+  }
+
+  function structDepth(n) {
+    return n.data("kind") === "root" ? -1 : String(n.id()).split(".module.").length;
+  }
+
+  // Filters that leave nothing to draw say so instead of an empty canvas.
+  function graphEmptyNote() {
+    let note = document.getElementById("graph-note");
+    if (!note) {
+      note = el("div", { id: "graph-note", class: "graph-note hidden" });
+      document.getElementById("center").append(note);
+    }
+    const shown = cy ? cy.nodes(":visible").length : 0;
+    note.textContent = shown ? "" : "Nothing to draw with these filters: tick more edge kinds, services or modules, or untick “Hide unconnected nodes”.";
+    note.classList.toggle("hidden", Boolean(shown) || document.getElementById("graph").classList.contains("hidden"));
   }
 
   // Highlight an element's neighbourhood and dim everything else (Esc resets).
@@ -1025,11 +1187,12 @@
       tip.replaceChildren(el("strong", {}, t.data("kind")), " ", t.data("label"),
         el("div", { class: "tag" }, `${t.source().id()} → ${t.target().id()}`));
     } else if (t.hasClass("group")) {
-      tip.replaceChildren(el("strong", {}, t.data("module")),
-        el("div", { class: "tag" }, `${t.descendants().not(".group").length} nodes`));
+      tip.replaceChildren(el("strong", {}, t.data("label")),
+        el("div", { class: "tag" }, `${t.data("module") || t.data("node")} · ${t.descendants().not(".group").length} nodes · click for its code`));
     } else {
-      tip.replaceChildren(el("strong", {}, t.id()),
-        el("div", { class: "tag" }, `${t.data("type")} · ${t.data("service")} · module ${t.data("module")}`));
+      tip.replaceChildren(el("strong", {}, t.data("display") || t.id()),
+        el("div", { class: "tag mono" }, t.id()),
+        t.data("type") ? el("div", { class: "tag" }, `${t.data("type")} · ${t.data("service")}`) : null);
     }
     const pos = evt.renderedPosition || t.renderedPosition();
     tip.style.left = `${pos.x + 12}px`;
@@ -1041,11 +1204,88 @@
     tooltip().classList.add("hidden");
   }
 
+  // Grouped: root ⊃ module call ⊃ resource as compound nodes (containment). Ungrouped:
+  // one node per root and module call, with a CONTAINS edge to what each contains.
   function elements(data, grouped) {
     // fresh copies: the graph is rebuilt from the same data when grouping is toggled
-    const nodes = data.nodes.map((n) => ({ data: { ...n.data, parent: grouped ? n.data.group : null } }));
-    const groups = data.groups.map((g) => ({ data: { ...g.data }, classes: g.classes }));
-    return { nodes: grouped ? groups.concat(nodes) : nodes, edges: data.edges.map((e) => ({ data: { ...e.data } })) };
+    const pos = data.positions || {};
+    const at = (d) => (pos[d.id] ? { x: pos[d.id].x, y: pos[d.id].y } : undefined);
+    const nodes = data.nodes.map((n) => ({
+      data: { ...n.data, parent: grouped ? n.data.group || n.data.root_group || null : null },
+      position: at(n.data),
+    }));
+    const edges = data.edges.map((e) => ({ data: { ...e.data } }));
+    const st = data.structure || { nodes: [], edges: [] };
+    if (!grouped) {
+      return {
+        nodes: nodes.concat(st.nodes.map((s) => ({ data: { ...s.data }, classes: s.classes, position: at(s.data) }))),
+        edges: edges.concat(st.edges.map((e) => ({ data: { ...e.data } }))),
+      };
+    }
+    const roots = (data.root_groups || []).map((g) => ({ data: { ...g.data }, classes: g.classes }));
+    const groups = data.groups.map((g) => ({
+      data: { ...g.data, parent: g.data.parent || g.data.root_group || null }, classes: g.classes,
+    }));
+    return { nodes: roots.concat(groups, nodes), edges };
+  }
+
+  // Colours the canvas cannot take from CSS: read from the theme's custom properties.
+  function themeColor(name, fallback) {
+    const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return v || fallback;
+  }
+
+  function graphStyle() {
+    const text = themeColor("--fg", "#1f2328");
+    const bg = themeColor("--bg-panel", "#ffffff");
+    const muted = themeColor("--fg-muted", "#424a53");
+    const accent = themeColor("--accent", "#0969da");
+    return [
+      { selector: "node", style: {
+        "background-color": "data(color)", label: "data(display)", "font-size": 12, color: text,
+        "text-valign": "bottom", "text-margin-y": 4, width: 26, height: 26,
+        "border-width": 2, "border-color": bg,
+        "text-wrap": "ellipsis", "text-max-width": 160,
+        "text-background-color": bg, "text-background-opacity": 0.8, "text-background-padding": 2,
+        "min-zoomed-font-size": 6 } },
+      { selector: 'node[kind = "external"]', style: { shape: "diamond" } },
+      { selector: 'node[kind = "data"]', style: { shape: "round-rectangle" } },
+      { selector: 'node[category = "relationship"], node[category = "policy"]', style: { width: 18, height: 18 } },
+      { selector: "node.structure", style: {
+        shape: "round-rectangle", width: 34, height: 22, "font-weight": 600, "text-valign": "top", "text-margin-y": -4 } },
+      { selector: "node.group", style: {
+        shape: "round-rectangle", "background-color": themeColor("--group-bg", "#eef1f4"), "background-opacity": 0.55,
+        "border-width": 1.5, "border-color": themeColor("--group-border", "#6e7781"), "border-style": "dashed",
+        label: "data(label)", "font-size": 13, "font-weight": 600, color: muted,
+        "text-valign": "top", "text-halign": "center", "text-max-width": 600, "text-margin-y": -2,
+        "text-background-opacity": 0, padding: 18, "min-zoomed-font-size": 5 } },
+      { selector: "node.root-group", style: {
+        "border-style": "solid", "border-width": 2, "border-color": themeColor("--tf", "#7b42bc"),
+        "background-opacity": 0.18, "font-size": 15, color: themeColor("--tf", "#7b42bc") } },
+      { selector: "edge", style: {
+        "line-color": "data(color)", "target-arrow-color": "data(color)",
+        "target-arrow-shape": "triangle", "curve-style": "bezier", "control-point-step-size": 28,
+        width: 1.8, "arrow-scale": 1, "font-size": 11, color: text,
+        "text-background-color": bg, "text-background-opacity": 0.9,
+        "text-background-padding": 2, "text-rotation": "autorotate" } },
+      { selector: 'edge[kind = "CONFIG"]', style: { "line-style": "dashed", width: 1.2 } },
+      { selector: 'edge[kind = "RUNS_ON"]', style: { "line-style": "dotted" } },
+      { selector: 'edge[kind = "CONTAINS"]', style: {
+        "line-style": "dashed", width: 1, "target-arrow-shape": "none", "line-color": themeColor("--group-border", "#6e7781"), opacity: 0.6 } },
+      { selector: "edge.hover", style: { label: "data(short_label)", width: 3, "z-index": 10 } },
+      { selector: "node:selected", style: { "border-width": 4, "border-color": accent } },
+      { selector: "edge:selected", style: {
+        "line-color": accent, "target-arrow-color": accent, width: 3.5, label: "data(short_label)" } },
+      { selector: ".faded", style: { opacity: 0.15 } },
+      { selector: ".match", style: { "border-width": 4, "border-color": themeColor("--warn", "#bf8700") } },
+      { selector: ".dimmed", style: { opacity: 0.12 } },
+    ];
+  }
+
+  function graphError(container, err) {
+    container.replaceChildren(el("div", { class: "banner st-failed" },
+      `The graph could not be drawn: ${err && err.message ? err.message : err}. `,
+      "The other views and the detail pane still work."));
   }
 
   function buildGraph(data, keepFilters) {
@@ -1070,45 +1310,31 @@
       return;
     }
     if (cy) cy.destroy();
-    cy = window.cytoscape({
-      container,
-      elements: elements(data, document.getElementById("group-modules").checked),
-      wheelSensitivity: 0.3,
-      style: [
-        { selector: "node", style: {
-          "background-color": "data(color)", label: "data(label)", "font-size": 9,
-          "text-valign": "bottom", "text-margin-y": 3, width: 18, height: 18,
-          "text-wrap": "ellipsis", "text-max-width": 120 } },
-        { selector: 'node[kind = "external"]', style: { shape: "diamond" } },
-        { selector: 'node[kind = "data"]', style: { shape: "round-rectangle" } },
-        { selector: 'node[category = "relationship"], node[category = "policy"]', style: { width: 12, height: 12 } },
-        { selector: "node.group", style: {
-          shape: "round-rectangle", "background-color": "#eaeef2", "background-opacity": 0.5,
-          "border-width": 1, "border-color": "#8c959f", "border-style": "dashed",
-          label: "data(label)", "font-size": 10, "font-weight": 600, color: "#57606a",
-          "text-valign": "top", "text-halign": "center", "text-max-width": 400, padding: 14 } },
-        { selector: "edge", style: {
-          "line-color": "data(color)", "target-arrow-color": "data(color)",
-          "target-arrow-shape": "triangle", "curve-style": "bezier", "control-point-step-size": 28,
-          width: 1.5, "arrow-scale": 0.9, "font-size": 8, color: "#1f2328",
-          "text-background-color": "#ffffff", "text-background-opacity": 0.85,
-          "text-background-padding": 1, "text-rotation": "autorotate" } },
-        { selector: 'edge[kind = "CONFIG"]', style: { "line-style": "dashed", width: 1 } },
-        { selector: 'edge[kind = "RUNS_ON"]', style: { "line-style": "dotted" } },
-        { selector: "edge.hover", style: { label: "data(short_label)", width: 2.5, "z-index": 10 } },
-        { selector: "node:selected", style: { "border-width": 3, "border-color": "#0969da" } },
-        { selector: "edge:selected", style: {
-          "line-color": "#0969da", "target-arrow-color": "#0969da", width: 3, label: "data(short_label)" } },
-        { selector: ".faded", style: { opacity: 0.15 } },
-        { selector: ".match", style: { "border-width": 3, "border-color": "#bf8700" } },
-        { selector: ".dimmed", style: { opacity: 0.12 } },
-      ],
-      layout: { name: "grid" },
-    });
+    cy = null;
+    const big = data.nodes.length > 250;
+    try {
+      // positions come with the data (a packed, readable layout computed by the server):
+      // no force-directed layout over hundreds of nodes on the page's thread
+      cy = window.cytoscape({
+        container,
+        elements: elements(data, document.getElementById("group-modules").checked),
+        wheelSensitivity: 0.3,
+        minZoom: 0.05,
+        maxZoom: 3,
+        textureOnViewport: big,
+        hideEdgesOnViewport: big,
+        style: graphStyle(),
+        layout: { name: "preset", fit: false },
+      });
+    } catch (err) {
+      graphError(container, err);
+      throw err; // reported by loadAll as well: never swallowed
+    }
     cy.on("tap", (evt) => {
       const t = evt.target;
       if (t === cy) clearFocus();
-      else if (t.hasClass("group")) showDetail("node", t.data("module"));
+      else if (t.hasClass("group")) showDetail("node", t.data("node") || t.data("module"));
+      else if (t.isEdge() && t.data("kind") === "CONTAINS") showDetail("node", t.target().id());
       else showDetail(t.isEdge() ? "edge" : "node", t.id());
     });
     cy.on("mouseover", "node, edge", (evt) => {
@@ -1125,11 +1351,27 @@
     if (graphFitted) layoutGraph();
   }
 
+  // Below this zoom node labels (12px) are unreadable and nodes shrink to dots: a large
+  // graph is shown from its top-left corner at a readable size instead of fitted whole.
+  const MIN_READABLE_ZOOM = 0.55;
+
   function layoutGraph() {
     if (!cy) return;
-    cy.layout({ name: "cose", animate: false, randomize: false, nodeDimensionsIncludeLabels: true,
-      eles: cy.elements(":visible") }).run();
-    cy.fit(cy.elements(":visible"), 30);
+    const pos = (graphData && graphData.positions) || {};
+    cy.layout({ name: "preset", fit: false, positions: (n) => pos[n.id()] || n.position() }).run();
+    fitGraph(false);
+  }
+
+  function fitGraph(whole) {
+    const eles = cy.elements(":visible");
+    graphEmptyNote();
+    if (!eles.length) return;
+    cy.fit(eles, 30);
+    if (!whole && cy.zoom() < MIN_READABLE_ZOOM) {
+      const bb = eles.boundingBox();
+      cy.zoom(MIN_READABLE_ZOOM);
+      cy.pan({ x: 30 - bb.x1 * MIN_READABLE_ZOOM, y: 30 - bb.y1 * MIN_READABLE_ZOOM });
+    }
   }
 
   // ------------------------------------------------------------ repository
@@ -1197,10 +1439,12 @@
 
   // ------------------------------------------------------------ diagrams
   const DIAGRAMS = [
-    ["architecture", "Architecture (flows)", "Services grouped by root and module; TRIGGER / ACCESS / NETWORK flows only."],
-    ["module-tree", "Module tree", "Each root and the modules it calls, with source and version."],
-    ["env-matrix", "Environment matrix", "Root × environment, with each root's backend."],
+    ["architecture", "Architecture (flows)", "Services grouped by root and module; TRIGGER / ACCESS / NETWORK flows only. Click a box for its code, evidence and unknowns."],
+    ["module-tree", "Module tree", "Each root and the modules it calls, with source and version. Click a root or a module call for its code."],
+    ["env-matrix", "Environment matrix", "Stacks × environments: the backend (bucket / key) each stack uses in each environment. Click a cell for its backend file; filter and sort."],
   ];
+  // drawn inline (clickable nodes) instead of as an image
+  const INTERACTIVE = new Set(["architecture", "module-tree"]);
 
   function renderDiagrams() {
     const box = document.getElementById("diagrams");
@@ -1208,14 +1452,142 @@
       el("a", { class: "link", href: "api/handoff?download=1", download: "handoff.md" }, "Download handoff.md"),
       " — the overview and these diagrams (Mermaid) in one file, for Claude Code.")];
     for (const [name, title, note] of DIAGRAMS) {
-      parts.push(el("h2", { id: `dg-${name}` }, title),
+      let body;
+      if (name === "env-matrix") body = envMatrixBox();
+      else if (INTERACTIVE.has(name)) body = diagramPanel(name, title, "", true);
+      else body = diagramPanel(name, title);
+      parts.push(el("h2", { id: `dg-${name}`, class: "rv-section" }, title),
         el("p", { class: "muted" }, note, " ",
           el("a", { class: "link", href: `api/diagram?name=${name}&format=mmd&download=1`, download: `${name}.mmd` }, "Mermaid (.mmd)"),
           " · ",
           el("a", { class: "link", href: `api/diagram?name=${name}&format=svg&download=1`, download: `${name}.svg` }, "SVG")),
-        diagramPanel(name, title));
+        body);
     }
     box.replaceChildren(...parts);
+  }
+
+  // A node of an inline diagram: select it and open its code, evidence and unknowns.
+  function selectDiagramNode(g) {
+    for (const s of document.querySelectorAll(".diagram-svg .node.selected")) s.classList.remove("selected");
+    g.classList.add("selected");
+    showDetail("node", g.dataset.node);
+  }
+
+  // ------------------------------------------------------------ environment matrix
+  // An HTML table (not a picture): one row per stack, one column per environment, each
+  // cell the backend bucket / key; a cell opens its backend file in the detail pane.
+  function envMatrixBox() {
+    const box = el("div", { class: "env-matrix", id: "env-matrix" }, el("p", { class: "muted" }, "Loading the environment matrix…"));
+    api("api/env-matrix").then((m) => renderEnvMatrix(box, m)).catch((err) =>
+      box.replaceChildren(el("p", { class: "st-failed" }, `Environment matrix: ${err.message}`)));
+    return box;
+  }
+
+  function backendSummary(cell) {
+    if (!cell) return "";
+    return [cell.type, cell.bucket, cell.key, cell.region].filter(Boolean).join(" ");
+  }
+
+  function renderEnvMatrix(box, m) {
+    const state = { q: "", sort: "stack", dir: 1, hidden: new Set() };
+    const filter = el("input", { type: "search", class: "matrix-filter", placeholder: "Filter stacks, buckets, keys…",
+      "aria-label": "Filter the environment matrix" });
+    const envToggles = el("div", { class: "chips" }, ...m.columns.map((c) => el("label", { class: "chip" },
+      el("input", { type: "checkbox", checked: "", value: c.name, onchange: (e) => {
+        if (e.target.checked) state.hidden.delete(c.name); else state.hidden.add(c.name);
+        draw();
+      } }), ` ${c.name}`)));
+    const table = el("table", { class: "matrix" });
+    const count = el("span", { class: "muted small" });
+    filter.addEventListener("input", () => { state.q = filter.value.trim().toLowerCase(); draw(); });
+
+    function sortBy(key) {
+      state.dir = state.sort === key ? -state.dir : 1;
+      state.sort = key;
+      draw();
+    }
+
+    function header(label, key, title) {
+      const arrow = state.sort === key ? (state.dir > 0 ? " ▲" : " ▼") : "";
+      return el("th", { scope: "col", title: title || `Sort by ${label}` },
+        el("button", { type: "button", class: "th-sort", "data-sort": key, onclick: () => sortBy(key) }, label + arrow));
+    }
+
+    function draw() {
+      const cols = m.columns.filter((c) => !state.hidden.has(c.name));
+      const text = (r) => [r.stack, backendSummary(r.default), ...cols.map((c) => backendSummary(r.cells[c.name]))].join(" ").toLowerCase();
+      const rows = m.rows.filter((r) => !state.q || text(r).includes(state.q));
+      const keyOf = (r) => (state.sort === "stack" ? r.stack : backendSummary(r.cells[state.sort]));
+      // stacks without that environment always last, whatever the direction
+      rows.sort((a, b) => (!keyOf(a) - !keyOf(b)) || state.dir * keyOf(a).localeCompare(keyOf(b)));
+      const head = el("tr", {}, header("Stack", "stack"),
+        ...cols.map((c) => header(c.name, c.name, `${c.name} (${c.status}) — sort by its backend`)));
+      if (!cols.length) head.append(el("th", {}, "Backend (no environment)"));
+      const body = rows.map((r) => el("tr", { "data-stack": r.stack },
+        el("th", { scope: "row", class: "matrix-stack" },
+          link(r.stack, () => r.node && showDetail("node", r.node)),
+          r.roots.length > 1 ? el("div", { class: "tag" }, r.roots.join(", ")) : null),
+        ...(cols.length ? cols.map((c) => matrixCell(r, c.name, r.cells[c.name]))
+          : [matrixCell(r, "", r.default)])));
+      table.replaceChildren(el("thead", {}, head), el("tbody", {}, ...body));
+      count.textContent = `${rows.length} of ${m.rows.length} stack(s) · ${cols.length} environment(s)`;
+      if (!rows.length) table.append(el("caption", { class: "muted" }, "No stack matches the filter."));
+    }
+
+    if (!m.rows.length) {
+      box.replaceChildren(el("p", { class: "muted" }, "No stack detected."));
+      return;
+    }
+    box.replaceChildren(el("div", { class: "matrix-toolbar" }, filter, envToggles, count),
+      el("div", { class: "matrix-scroll" }, table));
+    draw();
+  }
+
+  function matrixCell(row, env, cell) {
+    if (!cell) return el("td", { class: "matrix-cell empty", title: `${row.stack} has no ${env} environment` }, "—");
+    const unknown = (cell.settings || []).some((s) => !s.known);
+    return el("td", { class: `matrix-cell${cell.wired === false ? " not-wired" : ""}` },
+      el("button", { type: "button", class: "cell-btn", "data-env": env, title: "Open the backend file",
+        onclick: (e) => {
+          for (const c of document.querySelectorAll(".matrix .cell-btn.selected")) c.classList.remove("selected");
+          e.currentTarget.classList.add("selected");
+          showBackendCell(row, env, cell);
+        } },
+        el("span", { class: "bk-type" }, cell.type),
+        cell.bucket ? el("span", { class: "bk-bucket" }, cell.bucket) : null,
+        cell.key ? el("span", { class: "bk-key" }, cell.key) : null,
+        !cell.bucket && !cell.key ? el("span", { class: "muted" }, cell.origin || "no bucket / key") : null,
+        unknown ? el("span", { class: "tag st-unknown" }, "some settings set at init time") : null));
+  }
+
+  async function showBackendCell(row, env, cell) {
+    const panel = document.getElementById("detail");
+    const parts = [el("h2", {}, env ? `${row.stack} · ${env}` : `${row.stack} · backend`),
+      el("div", { class: "address mono" }, `${cell.type} backend`),
+      el("dl", {},
+        el("dt", {}, "Bucket"), el("dd", { class: "mono" }, cell.bucket || "—"),
+        el("dt", {}, "Key"), el("dd", { class: "mono" }, cell.key || "—"),
+        el("dt", {}, "Region"), el("dd", { class: "mono" }, cell.region || "—"),
+        el("dt", {}, "From"), el("dd", {}, cell.origin || "—"))];
+    if ((cell.settings || []).length) {
+      parts.push(el("h3", {}, "Settings"), el("table", { class: "tags" }, el("tbody", {}, ...cell.settings.map((s) =>
+        el("tr", { class: s.known ? "" : "st-unknown" }, el("td", { class: "mono" }, s.key),
+          el("td", { class: "mono" }, s.known ? String(s.value) : "UNKNOWN"),
+          el("td", {}, s.location ? locLink(s.location) : el("span", { class: "tag" }, s.reason || "")))))));
+    }
+    if ((cell.files || []).length || (cell.var_files || []).length) {
+      parts.push(el("h3", {}, "Files"), el("p", {}, ...fileLinks([...(cell.files || []), ...(cell.var_files || [])])));
+    }
+    panel.replaceChildren(...parts);
+    panel.scrollTop = 0;
+    const loc = cell.location;
+    if (!loc) return;
+    try {
+      const d = await api(`api/source?file=${encodeURIComponent(loc.file)}&start=${loc.start_line}&end=${loc.end_line}`);
+      panel.append(el("h3", {}, "Backend file"), evidenceBlock(locText(d), d.lines));
+    } catch (err) {
+      panel.append(el("p", { class: "muted" }, `${locText(loc)}: ${err.message}`));
+    }
   }
 
   // A diagram at its natural size (never below 100%) in a scrolling viewport:
@@ -1224,18 +1596,22 @@
   // size so the viewport's scrollbars match what is drawn.
   const ZOOM_STEP = 1.25, ZOOM_MAX = 4;
 
-  function diagramPanel(name, title, query) {
+  // `inline`: the SVG is put in the page (not an <img>) so its nodes (data-node) are
+  // clickable: each opens its code, evidence and unknowns in the detail pane.
+  function diagramPanel(name, title, query, inline) {
     const url = `api/diagram?name=${name}&format=svg${query || ""}`;
-    const img = el("img", { src: url, alt: title, title: "Open the full-size SVG in a new tab" });
+    const img = el("img", { alt: title, title: "Open the full-size SVG in a new tab" });
+    if (!inline) img.src = url;
     const zoom = el("div", { class: "diagram-zoom" },
       el("a", { href: url, target: "_blank", rel: "noopener" }, img));
     const sizer = el("div", { class: "diagram-sizer" }, zoom);
     const view = el("div", { class: "diagram", "data-diagram": name }, sizer);
     const label = el("span", { class: "diagram-scale muted" }, "100%");
     let scale = 1, pendingFit = false;
+    let natural = () => [img.naturalWidth, img.naturalHeight];
 
     function apply(s) {
-      const w = img.naturalWidth, h = img.naturalHeight;
+      const [w, h] = natural();
       if (!w || !h) return;
       scale = Math.min(ZOOM_MAX, Math.max(1, s));
       zoom.style.transform = `scale(${scale})`;
@@ -1251,14 +1627,40 @@
       if (pendingFit && view.clientWidth) fit();
     });
     function fit() {
-      const w = img.naturalWidth, room = view.clientWidth;
+      const w = natural()[0], room = view.clientWidth;
       apply(w && room && w <= room ? room / w : 1);
       pendingFit = !room;
       if (room && w) shown.disconnect();
     }
     function zoomBy(f) { pendingFit = false; apply(scale * f); }
 
-    img.addEventListener("load", fit);
+    if (inline) {
+      zoom.replaceChildren(el("p", { class: "muted" }, `Loading ${title}…`));
+      fetch(url)
+        .then((r) => (r.ok ? r.text() : Promise.reject(new Error(r.statusText))))
+        .then((text) => {
+          const doc = new DOMParser().parseFromString(text, "image/svg+xml");
+          if (doc.documentElement.nodeName !== "svg") throw new Error("not an SVG");
+          const svgEl = document.importNode(doc.documentElement, true);
+          const w = parseFloat(svgEl.getAttribute("width")), h = parseFloat(svgEl.getAttribute("height"));
+          natural = () => [w, h];
+          svgEl.removeAttribute("style"); // natural size: the viewport scrolls, it never shrinks
+          svgEl.classList.add("diagram-svg");
+          for (const g of svgEl.querySelectorAll("[data-node]")) {
+            g.setAttribute("tabindex", "0");
+            g.setAttribute("role", "button");
+            g.addEventListener("click", () => selectDiagramNode(g));
+            g.addEventListener("keydown", (e) => {
+              if (e.key === "Enter" || e.key === " ") { e.preventDefault(); selectDiagramNode(g); }
+            });
+          }
+          zoom.replaceChildren(svgEl);
+          fit();
+        })
+        .catch((err) => zoom.replaceChildren(el("p", { class: "st-failed" }, `${title}: ${err.message}`)));
+    } else {
+      img.addEventListener("load", fit);
+    }
     shown.observe(view);
 
     const bar = el("div", { class: "diagram-toolbar" },
@@ -1327,14 +1729,16 @@
 
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree, ov, fl, shapes, envs, disc] = await Promise.all(
+    const [summary, graph, tree, ov, fl, shapes, envs, disc, cards] = await Promise.all(
       [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview"), api("api/flow"),
-        api("api/shapes"), api("api/environments"), api("api/discovery")]);
+        api("api/shapes"), api("api/environments"), api("api/discovery"),
+        api("api/stack-cards").catch(() => [])]);
     renderDiscovery(disc);
     renderEnvSwitch(envs);
     renderEnvironments(envs);
     renderOverview(ov, envs);
     renderFlow(fl, ov);
+    cardsData = cards;
     renderRoots(shapes);
     renderFailure(summary, ov);
     document.getElementById("title").textContent = summary.title;
@@ -1344,22 +1748,86 @@
     // a recorded run: diff against the previous run (managed mode only)
     document.getElementById("changes").classList.toggle("hidden", !location.pathname.startsWith("/runs/"));
     renderDiagrams();
-    const s = summary.summary;
-    const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
-    const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
-    const f = summary.flow;
-    const shownEnv = envs.environments.length
-      ? `${envs.active || "no environment"}: ${envs.current.text} · total ${envs.total.text} · `
-      : "";
-    document.getElementById("summary").textContent = shownEnv +
-      `${f.flows} flows · ${f.steps} steps · ${f.unverified} unverified links · ` +
-      `${s.files} files · ${s.modules} modules · ${nodes} nodes · edges: ${edges} · ` +
-      `${s.unknowns} unknowns · ${s.parse_errors} parse errors`;
+    renderSummaryBar(summary, envs);
     document.getElementById("tree").replaceChildren(treeNode(tree));
     buildGraph(graph);
   }
 
+  // ------------------------------------------------------------ header summary
+  // Four numbers in the header (environments, stacks, resources, unknowns); a click
+  // expands everything else (flows, files, modules, nodes, edges, parse errors).
+  function renderSummaryBar(summary, envs) {
+    const s = summary.summary;
+    const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
+    const f = summary.flow;
+    const envCount = envs.environments.length ? confirmedColumns(envs).length : 0;
+    const stacks = (envs.stacks || []).filter((x) => !x.library).length || (summary.roots || []).length;
+    const resources = s.nodes.resource || 0;
+    const stat = (n, label, cls) => el("span", { class: `sum-stat ${cls || ""}`.trim() }, el("b", {}, String(n)), ` ${label}`);
+    const bar = document.getElementById("summary");
+    const panel = document.getElementById("summary-details");
+    const toggle = el("button", { type: "button", class: "summary-toggle", "aria-expanded": String(!panel.hidden),
+      "aria-controls": "summary-details", title: "Show all the numbers" },
+    stat(envCount, envCount === 1 ? "env" : "envs"), stat(stacks, stacks === 1 ? "stack" : "stacks"),
+    stat(resources, "resources"), stat(s.unknowns, "unknowns", s.unknowns ? "warn" : ""),
+    el("span", { class: "caret", "aria-hidden": "true" }, "▾"));
+    toggle.addEventListener("click", () => {
+      const open = panel.hidden;
+      panel.hidden = !open;
+      toggle.setAttribute("aria-expanded", String(open));
+    });
+    bar.replaceChildren(toggle);
+    const item = (label, value, cls) => [el("dt", {}, label), el("dd", { class: cls || "" }, value)];
+    const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
+    panel.replaceChildren(el("dl", { class: "summary-grid" },
+      ...(envs.environments.length ? [
+        ...item("Environment shown", `${(envs.selected || []).join(", ") || envs.active || "none (variable defaults)"}`),
+        ...item("Counts shown", envs.current.text),
+        ...item("Total (all environments)", envs.total ? envs.total.text : "—"),
+      ] : []),
+      ...item("Flows", `${f.flows} flows · ${f.steps} steps`),
+      ...item("Unverified links", String(f.unverified), f.unverified ? "st-unknown" : ""),
+      ...item("Files", String(s.files)),
+      ...item("Modules", String(s.modules)),
+      ...item("Nodes", String(nodes)),
+      ...item("Edges", edges),
+      ...item("Unknowns", String(s.unknowns), s.unknowns ? "st-unknown" : ""),
+      ...item("Parse errors", String(s.parse_errors), s.parse_errors ? "st-failed" : "")));
+  }
+
+  // ------------------------------------------------------------ theme
+  // auto (the system's), light or dark; kept in localStorage.
+  const THEMES = ["auto", "light", "dark"];
+
+  function applyTheme(theme) {
+    if (theme === "auto") delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = theme;
+    const btn = document.getElementById("theme-toggle");
+    if (btn) {
+      btn.textContent = { auto: "◐ Auto", light: "☀ Light", dark: "☾ Dark" }[theme];
+      btn.title = `Theme: ${theme} (click to change)`;
+    }
+    if (cy) cy.style(graphStyle());
+  }
+
+  function initTheme() {
+    let theme = "auto";
+    try { theme = localStorage.getItem("tflens-theme") || "auto"; } catch (err) { /* storage off */ }
+    if (!THEMES.includes(theme)) theme = "auto";
+    applyTheme(theme);
+    const btn = document.getElementById("theme-toggle");
+    if (btn) {
+      btn.addEventListener("click", () => {
+        theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+        try { localStorage.setItem("tflens-theme", theme); } catch (err) { /* storage off */ }
+        applyTheme(theme);
+      });
+    }
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => cy && cy.style(graphStyle()));
+  }
+
   document.addEventListener("DOMContentLoaded", () => {
+    initTheme();
     for (const t of document.querySelectorAll(".tab")) t.addEventListener("click", () => setView(t.dataset.view));
     document.getElementById("search").addEventListener("input", applyFilters);
     document.getElementById("hide-isolated").addEventListener("change", applyFilters);
@@ -1367,6 +1835,12 @@
       if (e.key === "Escape") {
         clearFocus();
         hideTooltip();
+        const panel = document.getElementById("summary-details");
+        if (panel && !panel.hidden) {
+          panel.hidden = true;
+          const t = document.querySelector(".summary-toggle");
+          if (t) t.setAttribute("aria-expanded", "false");
+        }
       }
     });
     const envSelect = document.getElementById("env");
