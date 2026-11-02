@@ -115,6 +115,17 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS ix_runs_repo ON runs(repo_id, ts);
 
+-- Canvas layouts saved for a run (layouts.py): where the user left the nodes of the Graph
+-- and of each diagram, per view. UI state, so a read-only recorded run still writes here.
+-- In this schema (not a migration): CREATE IF NOT EXISTS adds it to older databases too.
+CREATE TABLE IF NOT EXISTS run_layouts (
+    run_id     INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    view       TEXT NOT NULL,              -- graph | architecture | module-tree | flow-3@root ...
+    positions  TEXT NOT NULL DEFAULT '{}', -- JSON {node id: {"x": .., "y": ..}}
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (run_id, view)
+);
+
 -- Applied schema migrations (see MIGRATIONS).
 CREATE TABLE IF NOT EXISTS schema_version (
     version    INTEGER PRIMARY KEY,

@@ -325,8 +325,20 @@ first save; just starting the server or browsing writes neither.
 
 ### Analyzer and security (both modes)
 
-- **Graph**: nodes colored by service, edges by kind (CONFIG dashed, RUNS_ON
-  dotted); filters by edge kind, service and module; search by name or id.
+- **Graph**: nodes show their service icon in their service colour, edges are coloured
+  by kind (CONFIG dashed, RUNS_ON dotted); filters by edge kind, service and module;
+  search by name or id.
+- **Canvases** (the Graph, and every diagram: Architecture, Module tree, each Flow, a
+  root's Network / IAM diagram): one shared component with IPLens's toolbar — Fit,
+  zoom out / in with the live zoom %, 100%, full screen, and export as PNG, SVG or an
+  editable draw.io `.drawio` file of what is drawn. Edit draw.io style: drag nodes, pan,
+  wheel zoom, Shift / Ctrl + click or Shift + drag to select several, drag a root /
+  module frame to move it with its contents, snap to a 20 px grid, arrow keys to nudge;
+  edges are orthogonal and re-route as nodes move; "Tidy" lays the shown nodes out
+  (dagre). The layout is saved per run (SQLite) and restored on reload; "Reset layout"
+  goes back to the diagram's own. The legend shows / hides each edge type
+  (TRIGGER / ACCESS / NETWORK / CONFIG). The same service colours and icons are used
+  in the tables.
 - **Overview**: see above; a `file:line` opens the source snippet.
 - **Repository**: the whole repository tree (analyzed files marked, skipped
   directories with their reason, roots tagged); selecting a file lists what it
@@ -337,15 +349,20 @@ first save; just starting the server or browsing writes neither.
 The server binds to loopback unless allowed otherwise. It serves only requests
 whose Host header names it (DNS-rebinding guard), checks a CSRF token on every
 form POST, and sends a `default-src 'self'` CSP on every response. The UI makes
-no external requests; the graph library is vendored (copy `cytoscape.min.js` into
-`src/tflens/static/vendor/`).
+no external requests: the graph and layout libraries (`cytoscape.min.js`,
+`dagre.min.js`) are vendored in `src/tflens/static/vendor/`, and no font is downloaded
+(Inter is used when installed locally, else the system UI font).
 
 JSON API (all GET; under `/runs/<id>/` for a run): `api/summary`, `api/graph`,
 `api/nodes`, `api/edges`, `api/node?id=`, `api/edge?id=`, `api/tree`,
 `api/file?path=`, `api/overview`, `api/source?file=&start=&end=`, `api/model`,
 `api/diagram?name=architecture|module-tree|env-matrix&format=svg|mmd`,
 `api/diagram?name=flow-<n>|network|iam&format=svg|drawio[&root=<dir>]`, `api/handoff`
-(add `download=1` for an attachment), `api/discovery`, `api/job[?id=]`; `POST
+(add `download=1` for an attachment), `api/discovery`, `api/job[?id=]`,
+`api/canvas?name=architecture|module-tree|flow-<n>|network|iam[&root=<dir>]` (a diagram
+as canvas elements), `api/icons`, `api/layout?view=<view>`; `POST api/layout?view=`
+(body `{"positions": {...}}`) and `POST api/layout/reset?view=` (both modes, a recorded
+run too; header `X-TFLens: 1`); `POST
 api/discover[?aws=1]`, `POST api/job/cancel?id=` and `POST api/regenerate` (a synchronous
 Discover without progress) (standalone only, need the header `X-TFLens: 1`). Managed:
 `POST /repos/<id>/discover` (form; `background=1` returns the job as JSON),

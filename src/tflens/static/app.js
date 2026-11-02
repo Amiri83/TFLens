@@ -8,6 +8,8 @@
 (function () {
   let cy = null;
   let graphData = null;
+  let graphCanvas = null; // the Graph's editable canvas (diagram.js), toolbar and legend
+  let iconsData = null; // api/icons: service icons and colours shared by every view
 
   // ------------------------------------------------------------ helpers
   function el(tag, attrs, ...children) {
@@ -58,6 +60,24 @@
       );
     }
     return pre;
+  }
+
+  // A service's icon and colour, the same as on the Graph and the diagrams (api/icons):
+  // `style` is {service, colour, icon}, e.g. iconsData.types[type].
+  function svcIcon(style) {
+    if (!style || !iconsData) return null;
+    return el("img", { class: "svc-icon", src: iconsData.icons[style.icon] || iconsData.icons.generic,
+      alt: "", title: style.service, style: `border-color:${style.colour}` });
+  }
+
+  function typeStyle(type) {
+    return iconsData ? iconsData.types[type] || null : null;
+  }
+
+  // A table cell's service label: icon, colour bar, text.
+  function svcLabel(style, ...text) {
+    if (!style) return el("span", {}, ...text);
+    return el("span", { class: "svc", style: `--svc:${style.colour}` }, svcIcon(style), ...text);
   }
 
   function evidenceBlock(title, lines, note) {
@@ -393,7 +413,8 @@
       const values = cols.map(([, inv]) => countText(inv[row.key].count, inv[row.key].uncertain));
       const common = mostCommon(values);
       return el("tr", { class: row.differs ? "inv-row differs" : "inv-row", "data-row": row.key },
-        el("td", {}, row.label, row.differs ? el("span", { class: "tag st-unknown" }, " differs") : null),
+        el("td", {}, svcLabel(iconsData && iconsData.inventory[row.key], row.label),
+          row.differs ? el("span", { class: "tag st-unknown" }, " differs") : null),
         ...cols.map(([id, inv], i) => {
           const cell = inv[row.key];
           const cls = ["num", "inv-cell"];
@@ -695,7 +716,7 @@
       : el("p", { class: "muted" }, `Entry point: ${c.entry_label} (${c.entry_kind}). `);
     entry.append(...diagramLinks(c.id, diagramQuery));
     const parts = [el("h2", { id, class: "flow-title" }, `Flow ${c.n}: ${c.title}`), entry,
-      diagramPanel(c.id, `Flow ${c.n}`, diagramQuery),
+      diagramView(c.id, `Flow ${c.n}`, diagramQuery),
       c.steps.length ? el("ol", { class: "flow-steps" }, ...c.steps.map(flowStep))
         : el("p", { class: "muted" }, "No step: nothing it sends to or reads from is declared."),
       ...flowContext(c)];
@@ -782,7 +803,12 @@
         el("span", { class: "mono wrap" }, [cell.bucket, cell.key].filter(Boolean).join(" / ") || cell.type))))
       : el("span", { class: "mono wrap" }, c.backend.text || "—", " ", locLink(c.backend.location));
     const resources = c.resources.length
-      ? el("div", { class: "chips" }, ...c.resources.map((r) => chip(`${r.label} ×${r.count}`, "res", { title: r.type })))
+      ? el("div", { class: "chips" }, ...c.resources.map((r) => {
+        const ch = chip(`${r.label} ×${r.count}`, "res", { title: r.type });
+        const st = typeStyle(r.type);
+        if (st) { ch.prepend(svcIcon(st)); ch.style.borderColor = st.colour; }
+        return ch;
+      }))
       : el("span", { class: "muted" }, "none declared");
     const modules = c.modules.length
       ? el("ul", { class: "card-list" }, ...c.modules.map((m) => el("li", {},
@@ -874,7 +900,8 @@
         toc.push([id, `${d.view_label} diagram`]);
         parts.push(el("h2", { id, class: "rv-section" }, `${d.view_label} diagram `,
           ...diagramLinks(d.diagram, q)),
-          diagramPanel(d.diagram, `${d.view_label} diagram`, q));
+          canvasReady() ? diagramCanvas(d.diagram, `${d.view_label} diagram`, q)
+            : diagramPanel(d.diagram, `${d.view_label} diagram`, q));
       }
     }
     box.replaceChildren(...parts);
@@ -1131,6 +1158,7 @@
         hits.connectedEdges().removeClass("faded");
       }
     });
+    if (graphCanvas) graphCanvas.refreshLegend();
     graphEmptyNote();
   }
 
@@ -1171,37 +1199,70 @@
     cy.batch(() => cy.elements().removeClass("dimmed focused").unselect());
   }
 
-  function tooltip() {
-    let tip = document.getElementById("tooltip");
-    if (!tip) {
-      tip = el("div", { id: "tooltip", class: "hidden" });
-      document.getElementById("center").append(tip);
+  // The Graph's hover text: short (a title and one or two lines); a click opens the rest.
+  function graphTip(t) {
+    if (t.isEdge()) return [`${t.data("kind")} ${t.data("short_label") || t.data("label")}`, `${t.source().data("display") || t.source().id()} → ${t.target().data("display") || t.target().id()}`];
+    if (t.hasClass("group")) {
+      return [t.data("label"), `${t.descendants().not(".group").length} nodes · click for its code`];
     }
-    return tip;
+    return [t.data("display") || t.id(), t.data("type") ? `${t.data("type")} · ${t.data("service")}` : t.id()];
   }
 
-  function showTooltip(evt) {
-    const t = evt.target;
-    const tip = tooltip();
+  // A diagram canvas' hover text.
+  function canvasTip(t) {
     if (t.isEdge()) {
-      tip.replaceChildren(el("strong", {}, t.data("kind")), " ", t.data("label"),
-        el("div", { class: "tag" }, `${t.source().id()} → ${t.target().id()}`));
-    } else if (t.hasClass("group")) {
-      tip.replaceChildren(el("strong", {}, t.data("label")),
-        el("div", { class: "tag" }, `${t.data("module") || t.data("node")} · ${t.descendants().not(".group").length} nodes · click for its code`));
-    } else {
-      tip.replaceChildren(el("strong", {}, t.data("display") || t.id()),
-        el("div", { class: "tag mono" }, t.id()),
-        t.data("type") ? el("div", { class: "tag" }, `${t.data("type")} · ${t.data("service")}`) : null);
+      return [`${t.data("kind")}${t.data("label") ? ` · ${t.data("label")}` : ""}`,
+        `${t.source().data("label") || t.source().id()} → ${t.target().data("label") || t.target().id()}`];
     }
-    const pos = evt.renderedPosition || t.renderedPosition();
-    tip.style.left = `${pos.x + 12}px`;
-    tip.style.top = `${pos.y + 12}px`;
-    tip.classList.remove("hidden");
+    return [t.data("label") || t.id(), String(t.data("sub") || "").split("\n")[0]];
   }
 
-  function hideTooltip() {
-    tooltip().classList.add("hidden");
+  // A click on a diagram canvas: the node's code, evidence and unknowns (or the code it
+  // stands for), an edge's evidence.
+  function canvasTap(t) {
+    const d = t.data();
+    if (t.isEdge()) {
+      if (d.edge) showDetail("edge", d.edge);
+      else if (d.evidence) showStep(d, t);
+      return;
+    }
+    if (d.detail) showDetail("node", d.detail);
+    else if (d.code_ref) showSource(d.code_ref);
+  }
+
+  // A Flow / Network / IAM step: what it is, its evidence (file:line + snippet) and what
+  // is not known about it.
+  async function showStep(d, t) {
+    const panel = document.getElementById("detail");
+    const name = (id) => (t.cy().getElementById(id).data("label") || id);
+    const parts = [el("h2", {}, d.summary || d.label || d.id),
+      el("dl", {},
+        el("dt", {}, "Kind"), el("dd", {}, kindBadge(d.kind)),
+        el("dt", {}, "Step"), el("dd", {}, d.label || "—"),
+        el("dt", {}, "From"), el("dd", {}, link(name(d.source), () => showDetail("node", d.source))),
+        el("dt", {}, "To"), el("dd", {}, link(name(d.target), () => showDetail("node", d.target))),
+        el("dt", {}, "Status"), el("dd", {}, d.status || "verified"))];
+    parts.push(el("h3", {}, `Evidence (${d.evidence.length})`));
+    if (!d.evidence.length) parts.push(el("p", { class: "muted" }, "No evidence recorded."));
+    for (const ev of d.evidence) {
+      const loc = ev.location;
+      if (!loc || !loc.start_line) {
+        parts.push(el("p", { class: "muted" }, `${ev.what}: no code reference`));
+        continue;
+      }
+      try {
+        const src = await api(`api/source?file=${encodeURIComponent(loc.file)}&start=${loc.start_line}&end=${loc.end_line}`);
+        parts.push(evidenceBlock(`${ev.what} — ${locText(loc)}`, src.lines));
+      } catch (err) {
+        parts.push(el("p", { class: "muted" }, `${ev.what} — ${locText(loc)}: ${err.message}`));
+      }
+    }
+    const unknown = { unverified: "Not verified: a reference without the matching IAM grant, or the reverse.",
+      iam_only: "IAM only: the role may do this, but no code refers to the target." }[d.status];
+    parts.push(el("h3", {}, `Unknowns (${unknown ? 1 : 0})`),
+      unknown ? el("div", { class: "unknown" }, unknown) : el("p", { class: "muted" }, "None."));
+    panel.replaceChildren(...parts);
+    panel.scrollTop = 0;
   }
 
   // Grouped: root ⊃ module call ⊃ resource as compound nodes (containment). Ungrouped:
@@ -1240,11 +1301,17 @@
     const bg = themeColor("--bg-panel", "#ffffff");
     const muted = themeColor("--fg-muted", "#424a53");
     const accent = themeColor("--accent", "#0969da");
+    const selBg = themeColor("--sel-bg", "#ddeeff");
+    const icon = (n) => (window.TFDiagram ? window.TFDiagram.iconUrl(n.data("icon")) : "none");
     return [
+      // each node: its service icon framed in its service colour (as in the diagrams)
       { selector: "node", style: {
-        "background-color": "data(color)", label: "data(display)", "font-size": 12, color: text,
+        shape: "round-rectangle", "background-color": "data(color)", "background-image": icon,
+        "background-fit": "cover", "background-clip": "node",
+        label: "data(display)", "font-size": 12, color: text,
+        "font-family": themeColor("--sans", "system-ui, sans-serif"),
         "text-valign": "bottom", "text-margin-y": 4, width: 26, height: 26,
-        "border-width": 2, "border-color": bg,
+        "border-width": 2, "border-color": "data(color)",
         "text-wrap": "ellipsis", "text-max-width": 160,
         "text-background-color": bg, "text-background-opacity": 0.8, "text-background-padding": 2,
         "min-zoomed-font-size": 6 } },
@@ -1255,6 +1322,7 @@
         shape: "round-rectangle", width: 34, height: 22, "font-weight": 600, "text-valign": "top", "text-margin-y": -4 } },
       { selector: "node.group", style: {
         shape: "round-rectangle", "background-color": themeColor("--group-bg", "#eef1f4"), "background-opacity": 0.55,
+        "background-image": "none",
         "border-width": 1.5, "border-color": themeColor("--group-border", "#6e7781"), "border-style": "dashed",
         label: "data(label)", "font-size": 13, "font-weight": 600, color: muted,
         "text-valign": "top", "text-halign": "center", "text-max-width": 600, "text-margin-y": -2,
@@ -1262,9 +1330,11 @@
       { selector: "node.root-group", style: {
         "border-style": "solid", "border-width": 2, "border-color": themeColor("--tf", "#7b42bc"),
         "background-opacity": 0.18, "font-size": 15, color: themeColor("--tf", "#7b42bc") } },
+      // orthogonal edges, re-routed while a node or a frame is moved
       { selector: "edge", style: {
         "line-color": "data(color)", "target-arrow-color": "data(color)",
-        "target-arrow-shape": "triangle", "curve-style": "bezier", "control-point-step-size": 28,
+        "target-arrow-shape": "triangle", "curve-style": "taxi", "taxi-direction": "auto",
+        "taxi-turn": "50%", "taxi-turn-min-distance": 10,
         width: 1.8, "arrow-scale": 1, "font-size": 11, color: text,
         "text-background-color": bg, "text-background-opacity": 0.9,
         "text-background-padding": 2, "text-rotation": "autorotate" } },
@@ -1273,9 +1343,15 @@
       { selector: 'edge[kind = "CONTAINS"]', style: {
         "line-style": "dashed", width: 1, "target-arrow-shape": "none", "line-color": themeColor("--group-border", "#6e7781"), opacity: 0.6 } },
       { selector: "edge.hover", style: { label: "data(short_label)", width: 3, "z-index": 10 } },
-      { selector: "node:selected", style: { "border-width": 4, "border-color": accent } },
+      // selected: the theme's accent and selection colours, legible in light and dark
+      { selector: "node:selected", style: {
+        "border-width": 4, "border-color": accent, "overlay-color": accent, "overlay-opacity": 0.18,
+        "overlay-padding": 4, "text-background-color": selBg, "text-background-opacity": 1,
+        color: themeColor("--sel-fg", text) } },
+      { selector: "node.group:selected", style: { "background-color": selBg, "background-opacity": 0.4, "overlay-opacity": 0 } },
       { selector: "edge:selected", style: {
         "line-color": accent, "target-arrow-color": accent, width: 3.5, label: "data(short_label)" } },
+      { selector: ".kind-off", style: { display: "none" } },
       { selector: ".faded", style: { opacity: 0.15 } },
       { selector: ".match", style: { "border-width": 4, "border-color": themeColor("--warn", "#bf8700") } },
       { selector: ".dimmed", style: { opacity: 0.12 } },
@@ -1301,22 +1377,50 @@
       document.getElementById("show-meta").checked = data.defaults.show_meta;
       document.getElementById("group-modules").checked = data.defaults.group_by_module;
     }
-    hideTooltip();
     const container = document.getElementById("graph");
-    if (typeof window.cytoscape !== "function") {
+    if (typeof window.cytoscape !== "function" || !window.TFDiagram) {
       container.replaceChildren(el("div", { class: "banner" },
-        "Graph library not found: copy cytoscape.min.js into src/tflens/static/vendor/. ",
+        "Graph library not found: copy cytoscape.min.js into src/tflens/static/vendor/ (and keep diagram.js). ",
         "The repository view and detail panel still work."));
       return;
     }
-    if (cy) cy.destroy();
+    if (graphCanvas) graphCanvas.destroy();
+    else if (cy) cy.destroy();
     cy = null;
     const big = data.nodes.length > 250;
+    // the shared diagram component: IPLens's toolbar (fit, zoom, full screen, exports),
+    // draw.io-style editing, the layout saved per run, the edge-type legend
+    graphCanvas = window.TFDiagram.create(container, {
+      key: "graph",
+      title: "Graph",
+      fileName: "graph",
+      positions: data.positions,
+      manualFit: true, // fitted when the tab is first shown (layoutGraph)
+      style: graphStyle,
+      kinds: graphKinds(data),
+      // the legend and the sidebar's "Edge kinds" are the same filter
+      kindFilter: {
+        isOn: (k) => checked("filter-kinds").has(k),
+        set: (k, on) => {
+          const box = document.querySelector(`#filter-kinds input[value="${k}"]`);
+          if (box) box.checked = on;
+          applyFilters();
+        },
+      },
+      onTap: (t) => {
+        if (t.hasClass("group")) showDetail("node", t.data("node") || t.data("module"));
+        else if (t.isEdge() && t.data("kind") === "CONTAINS") showDetail("node", t.target().id());
+        else showDetail(t.isEdge() ? "edge" : "node", t.id());
+      },
+      onBackground: clearFocus,
+      onReset: () => cy.layout({ name: "preset", fit: false, positions: (n) => data.positions[n.id()] || n.position() }).run(),
+      tooltip: graphTip,
+    });
     try {
       // positions come with the data (a packed, readable layout computed by the server):
       // no force-directed layout over hundreds of nodes on the page's thread
       cy = window.cytoscape({
-        container,
+        container: graphCanvas.canvas,
         elements: elements(data, document.getElementById("group-modules").checked),
         wheelSensitivity: 0.3,
         minZoom: 0.05,
@@ -1330,22 +1434,7 @@
       graphError(container, err);
       throw err; // reported by loadAll as well: never swallowed
     }
-    cy.on("tap", (evt) => {
-      const t = evt.target;
-      if (t === cy) clearFocus();
-      else if (t.hasClass("group")) showDetail("node", t.data("node") || t.data("module"));
-      else if (t.isEdge() && t.data("kind") === "CONTAINS") showDetail("node", t.target().id());
-      else showDetail(t.isEdge() ? "edge" : "node", t.id());
-    });
-    cy.on("mouseover", "node, edge", (evt) => {
-      if (evt.target.isEdge()) evt.target.addClass("hover");
-      showTooltip(evt);
-    });
-    cy.on("mouseout", "node, edge", (evt) => {
-      evt.target.removeClass("hover");
-      hideTooltip();
-    });
-    cy.on("pan zoom", hideTooltip);
+    graphCanvas.attach(cy);
     applyFilters();
     graphFitted = !document.getElementById("graph").classList.contains("hidden");
     if (graphFitted) layoutGraph();
@@ -1355,9 +1444,17 @@
   // graph is shown from its top-left corner at a readable size instead of fitted whole.
   const MIN_READABLE_ZOOM = 0.55;
 
+  // The legend's edge types: each kind drawn, its colour and count.
+  function graphKinds(data) {
+    const counts = {};
+    for (const e of data.edges) counts[e.data.kind] = (counts[e.data.kind] || 0) + 1;
+    return data.filters.kinds.map((k) => ({ kind: k, colour: data.colors.kinds[k], count: counts[k] || 0 }));
+  }
+
   function layoutGraph() {
     if (!cy) return;
-    const pos = (graphData && graphData.positions) || {};
+    // the server's layout, with the positions saved for this run on top
+    const pos = graphCanvas ? graphCanvas.positions() : (graphData && graphData.positions) || {};
     cy.layout({ name: "preset", fit: false, positions: (n) => pos[n.id()] || n.position() }).run();
     fitGraph(false);
   }
@@ -1423,7 +1520,7 @@
         el("tr", {}, el("th", {}, "Lines"), el("th", {}, "Kind"), el("th", {}, "Type"), el("th", {}, "Id")),
         ...d.resources.map((r) => el("tr", {},
           el("td", {}, `${r.location.start_line}-${r.location.end_line}`),
-          el("td", {}, r.kind), el("td", {}, r.type),
+          el("td", {}, r.kind), el("td", { class: "mono" }, svcLabel(typeStyle(r.type), r.type)),
           el("td", {}, link(r.id, () => showDetail("node", r.id)))))));
     }
     if (d.unknowns.length) {
@@ -1454,7 +1551,8 @@
     for (const [name, title, note] of DIAGRAMS) {
       let body;
       if (name === "env-matrix") body = envMatrixBox();
-      else if (INTERACTIVE.has(name)) body = diagramPanel(name, title, "", true);
+      // an editable canvas; without the graph library, the clickable inline SVG
+      else if (INTERACTIVE.has(name)) body = canvasReady() ? diagramCanvas(name, title) : diagramPanel(name, title, "", true);
       else body = diagramPanel(name, title);
       parts.push(el("h2", { id: `dg-${name}`, class: "rv-section" }, title),
         el("p", { class: "muted" }, note, " ",
@@ -1464,6 +1562,47 @@
         body);
     }
     box.replaceChildren(...parts);
+  }
+
+  function canvasReady() {
+    return typeof window.cytoscape === "function" && Boolean(window.TFDiagram);
+  }
+
+  // The layout key of a diagram (its saved positions): name, and root when it is a root's.
+  function canvasKey(name, query) {
+    const root = /[?&]root=([^&]*)/.exec(`&${query || ""}`);
+    const key = root ? `${name}@${decodeURIComponent(root[1])}` : name;
+    return key.replace(/[^\w.:@/-]+/g, "_").slice(0, 200);
+  }
+
+  // A diagram as an editable canvas (the shared diagram component), loaded when it is
+  // first shown: drag, select, move frames, snap, export, layout saved per run.
+  function diagramCanvas(name, title, query) {
+    const host = el("div", { class: "diagram-canvas", "data-diagram": name },
+      el("p", { class: "muted" }, `Loading ${title}…`));
+    window.TFDiagram.whenNear(host, () => {
+      api(`api/canvas?name=${name}${query || ""}`)
+        .then((data) => {
+          if (!data.nodes.length) {
+            host.replaceChildren(el("p", { class: "muted" }, data.empty || "Nothing to draw."));
+            return;
+          }
+          const key = canvasKey(name, query);
+          window.TFDiagram.create(host, {
+            key, title: data.title || title, fileName: key,
+            rankdir: name === "module-tree" ? "TB" : "LR",
+            onTap: canvasTap, tooltip: canvasTip,
+            onBackground: () => {},
+          }).draw(data);
+        })
+        .catch((err) => host.replaceChildren(el("p", { class: "st-failed" }, `${title}: ${err.message}`)));
+    });
+    return host;
+  }
+
+  // The canvas of a diagram, or (no graph library) its SVG in a scrolling panel.
+  function diagramView(name, title, query) {
+    return canvasReady() ? diagramCanvas(name, title, query) : diagramPanel(name, title, query);
   }
 
   // A node of an inline diagram: select it and open its code, evidence and unknowns.
@@ -1729,10 +1868,13 @@
 
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree, ov, fl, shapes, envs, disc, cards] = await Promise.all(
+    const [summary, graph, tree, ov, fl, shapes, envs, disc, cards, icons] = await Promise.all(
       [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview"), api("api/flow"),
         api("api/shapes"), api("api/environments"), api("api/discovery"),
-        api("api/stack-cards").catch(() => [])]);
+        api("api/stack-cards").catch(() => []), api("api/icons").catch(() => null)]);
+    // one set of service icons and colours for the Graph, every diagram and the tables
+    iconsData = icons;
+    if (window.TFDiagram && icons) window.TFDiagram.setIcons(icons.icons);
     renderDiscovery(disc);
     renderEnvSwitch(envs);
     renderEnvironments(envs);
@@ -1808,6 +1950,12 @@
       btn.title = `Theme: ${theme} (click to change)`;
     }
     if (cy) cy.style(graphStyle());
+    restyleCanvases();
+  }
+
+  // the diagrams' canvases take the theme's colours too (the Graph's is restyled above)
+  function restyleCanvases() {
+    if (window.TFDiagram) window.TFDiagram.restyleAll();
   }
 
   function initTheme() {
@@ -1823,7 +1971,10 @@
         applyTheme(theme);
       });
     }
-    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => cy && cy.style(graphStyle()));
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      if (cy) cy.style(graphStyle());
+      restyleCanvases();
+    });
   }
 
   document.addEventListener("DOMContentLoaded", () => {
@@ -1834,7 +1985,6 @@
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         clearFocus();
-        hideTooltip();
         const panel = document.getElementById("summary-details");
         if (panel && !panel.hidden) {
           panel.hidden = true;
