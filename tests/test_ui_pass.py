@@ -416,7 +416,7 @@ def test_service_colours_are_fixed_and_shared():
 def test_light_and_dark_themes():
     css = (STATIC / "app.css").read_text()
     assert ':root[data-theme="dark"]' in css and "@media (prefers-color-scheme: dark)" in css
-    assert re.search(r"body \{[^}]*font: 14px", css)
+    assert re.search(r"body \{[^}]*font: 15px", css)  # the 15px base (interactive diagrams pass)
     js = (STATIC / "app.js").read_text()
     assert 'themeColor("--fg"' in js and "cy.style(graphStyle())" in js
 

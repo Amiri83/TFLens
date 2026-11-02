@@ -52,6 +52,7 @@ from .config import AppPaths, default_paths
 from .crypto import LazySecretBox
 from .db import reading, writing
 from .jobs import JobBusy, JobContext, JobFailed, JobManager
+from .layouts import SqliteLayouts
 from .logging_setup import LEVELS, LOG_FILE, configure_logging, read_log
 from .server import CSP
 from .settings import (
@@ -261,6 +262,11 @@ def _api_target(sub: str) -> str:
     return f"/api/{sub}" + (f"?{query}" if query else "")
 
 
+def _api_body() -> bytes:
+    """A JSON API request's body (a saved canvas layout); empty for other methods."""
+    return request.get_data(cache=False) if request.method == "POST" else b""
+
+
 def _register_common(app: Flask) -> None:
     # Registered first so it runs before anything else touches the request.
     @app.before_request
@@ -337,7 +343,7 @@ def _register_standalone(app: Flask) -> None:
 
     @app.route("/api/<path:sub>", methods=["GET", "HEAD", "POST"])
     def api(sub: str):
-        return to_flask(_ext()["api"].handle(request.method, _api_target(sub)))
+        return to_flask(_ext()["api"].handle(request.method, _api_target(sub), _api_body()))
 
 
 # -- managed mode ------------------------------------------------------------------------
@@ -412,7 +418,9 @@ def _run_api(run_id: int) -> Api:
             Path(run["model_path"]),
             readonly=True,
             title=title,
-        )
+        ),
+        # the canvas layouts saved for this run, in the app database
+        layouts=SqliteLayouts(_paths().db_path, run_id, managed=True),
     )
     with ext["runs_lock"]:
         ext["runs"][run_id] = api
@@ -928,7 +936,7 @@ def _register_managed(app: Flask) -> None:
 
     @app.route("/runs/<int:run_id>/api/<path:sub>", methods=["GET", "HEAD", "POST"])
     def run_api(run_id: int, sub: str):
-        return to_flask(_run_api(run_id).handle(request.method, _api_target(sub)))
+        return to_flask(_run_api(run_id).handle(request.method, _api_target(sub), _api_body()))
 
     @app.get("/runs/<int:run_id>/changes")
     def run_changes(run_id: int):

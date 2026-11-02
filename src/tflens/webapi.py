@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from .canvas import KIND_COLOURS, canvas_view, icons_view, node_icon
 from .cards import stack_cards
 from .drawio import MIME as DRAWIO_MIME
 from .drawio import chain_drawio, tab_drawio
@@ -26,6 +27,7 @@ from .graphlayout import layout as graph_layout
 from .icons import service_colour
 from .jobs import JobBusy, JobContext, JobManager
 from .labels import call_name, node_label
+from .layouts import LayoutError, SqliteLayouts
 from .model import EDGE_KINDS, SCHEMA_VERSION
 from .output import dumps, library_roots
 from .overview import build_overview
@@ -50,13 +52,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 # Service colours: icons.SERVICE_COLOURS (fixed per service, shared with the diagrams).
 EXTERNAL_COLOR = service_colour("external")
 META_COLOR = service_colour("meta")
-KIND_COLORS = {
-    "ACCESS": "#d62728",
-    "TRIGGER": "#ff7f0e",
-    "NETWORK": "#1f77b4",
-    "CONFIG": "#7f7f7f",
-    "RUNS_ON": "#9467bd",
-}
+# Edge type colours: the same in the Graph, every diagram and the legend (canvas.py).
+KIND_COLORS = {k: KIND_COLOURS[k] for k in ("ACCESS", "TRIGGER", "NETWORK", "CONFIG", "RUNS_ON")}
 ROOT_MODULE = "(root)"
 # Data sources that only supply context (account, region, policy JSON); the UI
 # classifies them as service "meta" and hides them by default.
@@ -462,6 +459,7 @@ def graph_view(model: dict[str, Any]) -> dict[str, Any]:
                     "root_group": _root_group_id(root) if root is not None else None,
                     "file": n["location"]["file"] if n["location"] else "",
                     "color": colors.get(service, EXTERNAL_COLOR),
+                    "icon": node_icon(n["type"], service),
                 }
             }
         )
@@ -565,6 +563,7 @@ def _structure_elements(
                 "service": "terraform",
                 "module": ROOT_MODULE,
                 "color": color,
+                "icon": "terraform",
                 "cluster": _root_group_id(r),
             },
             "classes": "structure",
@@ -600,6 +599,7 @@ def _structure_elements(
                     "service": "terraform",
                     "module": d["module"],
                     "color": color,
+                    "icon": "module-local",
                     "cluster": d["id"],
                 },
                 "classes": "structure",
@@ -1139,9 +1139,40 @@ def _not_found(what: str) -> Response:
 
 
 class Api:
-    def __init__(self, store: ModelStore, jobs: JobManager | None = None) -> None:
+    def __init__(
+        self,
+        store: ModelStore,
+        jobs: JobManager | None = None,
+        layouts: SqliteLayouts | None = None,
+    ) -> None:
         self.store = store
         self.jobs = jobs or JobManager()
+        # saved canvas layouts: a recorded run's rows in the app database; standalone, a
+        # database next to model.json (written on the first save only)
+        self.layouts = layouts or SqliteLayouts(store.model_path.parent / "layouts.sqlite")
+
+    def _layout_api(self, method: str, path: str, query: dict[str, str], body: bytes) -> Response:
+        """``GET api/layout?view=V``: the saved positions (``null``: none, the canvas
+        starts from its own layout); ``POST`` with ``{"positions": {...}}`` saves them;
+        ``POST api/layout/reset?view=V`` forgets them (the "Reset layout" button)."""
+        view = query.get("view", "")
+        try:
+            if path == "/api/layout/reset" and method == "POST":
+                return json_response({"ok": True, "view": view, "reset": self.layouts.reset(view)})
+            if path == "/api/layout" and method == "POST":
+                try:
+                    data = json.loads(body.decode("utf-8") or "{}")
+                except (UnicodeDecodeError, ValueError):
+                    return json_response({"error": "body must be JSON"}, 400)
+                if not isinstance(data, dict):
+                    return json_response({"error": "body must be a JSON object"}, 400)
+                saved = self.layouts.save(view, data.get("positions"))
+                return json_response({"ok": True, "view": view, "count": len(saved)})
+            if path == "/api/layout" and method in ("GET", "HEAD"):
+                return json_response({"view": view, "positions": self.layouts.get(view)})
+        except LayoutError as exc:
+            return json_response({"error": "bad layout", "detail": str(exc)}, 400)
+        return _method_not_allowed()
 
     def _job_key(self) -> str:
         return f"standalone:{self.store.root}"
@@ -1196,13 +1227,15 @@ class Api:
             return {"available": False, "reason": f"{target.label}: {target.problem}"}
         return {"available": True, "label": target.label}
 
-    def handle(self, method: str, target: str) -> Response:
+    def handle(self, method: str, target: str, body: bytes = b"") -> Response:
         url = urlsplit(target)
         path = url.path
         query = {k: v[0] for k, v in parse_qs(url.query, keep_blank_values=True).items()}
         handled = self._jobs_api(method, path, query)
         if handled is not None:
             return handled
+        if path in ("/api/layout", "/api/layout/reset"):
+            return self._layout_api(method, path, query, body)
         if method == "POST":
             if path == "/api/regenerate":
                 if self.store.readonly:
@@ -1266,6 +1299,18 @@ class Api:
             return json_response(stack_cards(model))
         if path == "/api/env-matrix":
             return json_response(env_matrix_table(model))
+        if path == "/api/icons":
+            return json_response(icons_view(model))
+        if path == "/api/canvas":
+            # a diagram as editable canvas elements (Architecture, Module tree, flow-<n>,
+            # network / iam; with root=<dir>, that root's own)
+            name, source = query.get("name", ""), model
+            if "root" in query:
+                if query["root"] not in {r["dir"] for r in root_entries(model)}:
+                    return _not_found(f"root {query['root']!r}")
+                source = root_model(model, query["root"])
+            data = canvas_view(source, name, self.store.title)
+            return json_response(data) if data else _not_found(f"canvas {name!r}")
         if path == "/api/root-view":
             root, view = query.get("root", ""), query.get("view", "")
             data = build_root_view(model, root, view)
