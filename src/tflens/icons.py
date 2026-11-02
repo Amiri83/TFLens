@@ -93,6 +93,54 @@ TYPE_ICONS: dict[str, str] = {
     "aws_secretsmanager_secret": "secretsmanager",
 }
 
+# One colour per service, the same in every view (Graph nodes, filters, diagram boxes)
+# whatever else the repository contains; mid-tone so it reads on light and dark.
+SERVICE_COLOURS: dict[str, str] = {
+    "lambda": "#e8710a",
+    "ec2": "#c25e00",
+    "autoscaling": "#b8860b",
+    "ecs": "#d4880f",
+    "eks": "#a35200",
+    "ecr": "#cf7a2d",
+    "sqs": "#d6337a",
+    "sns": "#b5267b",
+    "eventbridge": "#e0457b",
+    "events": "#e0457b",
+    "sfn": "#a3367f",
+    "apigateway": "#7c4dff",
+    "kinesis": "#6f42c1",
+    "dynamodb": "#2f6fdb",
+    "rds": "#1f5fbf",
+    "elasticache": "#4a7fd6",
+    "s3": "#3f8f1f",
+    "efs": "#5a9a2a",
+    "vpc": "#8250df",
+    "ec2_network": "#8250df",
+    "elb": "#6639ba",
+    "cloudfront": "#9a6cf0",
+    "route53": "#7d5bd0",
+    "iam": "#cf2e45",
+    "kms": "#b3243a",
+    "secretsmanager": "#e05666",
+    "ssm": "#c0475a",
+    "cloudwatch": "#2b8a8a",
+    "logs": "#2b8a8a",
+    "terraform": "#7b42bc",
+    "external": "#8c959f",
+    "meta": "#afb8c1",
+}
+_FALLBACK_COLOURS = ("#1b7c83", "#9a6700", "#57606a", "#bf3989", "#0a7d55", "#6e7781", "#953800")
+
+
+def service_colour(service: str | None) -> str:
+    """A service's colour: fixed for known services, a stable pick otherwise."""
+    if not service:
+        return SERVICE_COLOURS["external"]
+    if service in SERVICE_COLOURS:
+        return SERVICE_COLOURS[service]
+    return _FALLBACK_COLOURS[sum(map(ord, service)) % len(_FALLBACK_COLOURS)]
+
+
 _XML_DECL = re.compile(r"<\?xml[^>]*\?>|<!DOCTYPE[^>]*>|<!--.*?-->", re.S)
 _SVG_OPEN = re.compile(r"<svg\b([^>]*)>", re.S)
 _VIEWBOX = re.compile(r'viewBox\s*=\s*"([^"]+)"')

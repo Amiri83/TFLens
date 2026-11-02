@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
-from .icons import colour, icon_for_type, symbol
+from .icons import colour, icon_for_type, service_colour, symbol
+from .labels import call_name, readable_name
 from .overview import FRIENDLY, SUPPORTING
 
 DIAGRAMS = ("architecture", "module-tree", "env-matrix")
@@ -80,7 +81,7 @@ def _label(n: dict[str, Any]) -> str:
     for key in ("function_name", "bucket", "name"):
         if isinstance(props.get(key), str) and props[key]:
             return props[key]
-    return n["name"]
+    return readable_name(n["name"], n)
 
 
 def _root_of(node_id: str, roots: list[str]) -> str:
@@ -178,12 +179,18 @@ def architecture_graph(model: dict[str, Any]) -> dict[str, Any]:
         tier = (
             "compute" if n["type"] in COMPUTE_TYPES else ("trigger" if nid in triggers else "data")
         )
+        call = call_name(n["module"] or "")
         out_nodes.append(
             {
                 "id": nid,
                 "label": _label(n),
                 "type": n["type"],
+                "service": n["service"],
                 "kind_label": FRIENDLY[n["type"]][0],
+                # the module call that creates it and its type: "worker · Lambda function"
+                "sub_label": f"{call} · {FRIENDLY[n['type']][0]}"
+                if call
+                else FRIENDLY[n["type"]][0],
                 "icon": icon_for_type(n["type"]),
                 "root": _root_of(nid, roots),
                 "module": _module_path(n),
@@ -299,12 +306,14 @@ def architecture_svg(model: dict[str, Any], title: str = "") -> str:
                     ny = y + gap + ri * (node_h + gap)
                     pos[n["id"]] = (nx, ny)
                     icons.add(n["icon"])
+                    # data-node: the UI opens the node's code, evidence and unknowns on click
                     node_svg.append(
-                        f'<g><rect x="{nx}" y="{ny}" width="{node_w}" height="{node_h}" rx="6" '
-                        f'fill="#ffffff" stroke="{colour(n["icon"])}" stroke-width="1.5"/>'
+                        f'<g class="node" data-node="{_x(n["id"])}"><title>{_x(n["id"])}</title>'
+                        f'<rect x="{nx}" y="{ny}" width="{node_w}" height="{node_h}" rx="6" '
+                        f'fill="#ffffff" stroke="{service_colour(n["service"])}" stroke-width="1.5"/>'
                         + _icon(n["icon"], nx + 8, ny + 9)
                         + _text(nx + 48, ny + 21, _cut(n["label"], 24), 12, "700")
-                        + _text(nx + 48, ny + 37, _cut(n["kind_label"], 28), 10, fill="#57606a")
+                        + _text(nx + 48, ny + 37, _cut(n["sub_label"], 28), 10, fill="#424a53")
                         + "</g>"
                     )
             y += lane_h + 8
@@ -396,14 +405,34 @@ def architecture_svg(model: dict[str, Any], title: str = "") -> str:
 # ------------------------------------------------------------------ module tree
 
 
+ROOT_PREFIX = "root:"
+
+
+def root_node_id(root_dir: str) -> str:
+    """The id the UI uses for a root (its detail: backend block, files, unknowns)."""
+    return ROOT_PREFIX + root_dir
+
+
+def _flat_modules(mods: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for m in mods:
+        out.append(m)
+        out += _flat_modules(m.get("children") or [])
+    return out
+
+
 def module_tree(model: dict[str, Any]) -> list[dict[str, Any]]:
     """Rows of the module tree: depth, label, details, icon, location, parent row."""
     rows: list[dict[str, Any]] = []
+    known = {n["id"] for n in model["nodes"]} | {
+        m["id"] for m in _flat_modules(model.get("modules") or [])
+    }
     for r in (model.get("structure") or {}).get("roots", []):
         role = r.get("role", "deployable")
         rows.append(
             {
                 "key": f"root:{r['dir']}",
+                "node": root_node_id(r["dir"]),
                 "parent": None,
                 "depth": 0,
                 "label": f"{r['dir']}/" if r["dir"] != "." else "./",
@@ -427,9 +456,14 @@ def module_tree(model: dict[str, Any]) -> list[dict[str, Any]]:
             key = f"{r['dir']}:{m['address']}"
             parent = index.get(parent_addr, index[""])
             depth = m["address"].count("module.") if m["address"] != "terraform.source" else 1
+            node = next(
+                (c for c in (f"{r['dir']}::{m['address']}", m["address"]) if c in known),
+                root_node_id(r["dir"]),
+            )
             rows.append(
                 {
                     "key": key,
+                    "node": node,
                     "parent": parent,
                     "depth": depth,
                     "label": m["address"],
@@ -488,10 +522,17 @@ def module_tree_svg(model: dict[str, Any], title: str = "") -> str:
                 f'<path d="M{px},{py:.0f} V{y + 11:.0f} H{x}" fill="none" stroke="#8c959f" stroke-width="1"/>'
             )
         icons.add(r["icon"])
-        body.append(_icon(r["icon"], x, y, 22))
-        body.append(_text(x + 30, y + 15, r["label"], 12, "700"))
         dx = x + 30 + len(r["label"]) * 7.4 + 12
-        body.append(_text(dx, y + 15, _cut(r["detail"], 90), 11, fill="#57606a"))
+        # one clickable group per row (data-node: the root or the module call)
+        body.append(
+            f'<g class="node" data-node="{_x(r["node"])}"><title>{_x(r["node"])}</title>'
+            f'<rect x="{x - 2}" y="{y - 3}" width="{dx - x + len(_cut(r["detail"], 90)) * CHAR_W:.0f}" '
+            f'height="{row_h - 6}" rx="4" fill="#ffffff" fill-opacity="0"/>'
+            + _icon(r["icon"], x, y, 22)
+            + _text(x + 30, y + 15, r["label"], 12, "700")
+            + _text(dx, y + 15, _cut(r["detail"], 90), 11, fill="#424a53")
+            + "</g>"
+        )
         width = max(width, dx + len(_cut(r["detail"], 90)) * CHAR_W + pad)
     if not rows:
         body.append(_text(pad, y0 + 14, "No roots detected.", 12, fill="#57606a"))
@@ -542,6 +583,96 @@ def env_matrix(model: dict[str, Any]) -> dict[str, Any]:
                 cells[name] = ""
         rows.append({"root": r["dir"], "backend": backend, "cells": cells})
     return {"columns": names, "rows": rows}
+
+
+_ENV_ORDER = {
+    "dev": 0,
+    "test": 1,
+    "intg": 2,
+    "qa": 3,
+    "uat": 4,
+    "stage": 5,
+    "staging": 5,
+    "prod": 9,
+}
+
+
+def _backend_cell(state: dict[str, Any], files: list[str]) -> dict[str, Any]:
+    settings = state.get("settings") or []
+    by_key = {s["key"]: s for s in settings}
+
+    def value(*keys: str) -> dict[str, Any] | None:
+        return next((by_key[k] for k in keys if k in by_key), None)
+
+    store = value("bucket", "organization", "storage_account_name")
+    key = value("key", "prefix", "path")
+    region = value("region")
+    return {
+        "type": state.get("type") or "?",
+        "bucket": store["value"] if store else None,
+        "key": key["value"] if key else None,
+        "region": region["value"] if region else None,
+        "settings": settings,
+        "files": files,
+        # the backend file: where the bucket / key are set, else the backend block
+        "location": next(
+            (s["location"] for s in (store, key) if s and s.get("location")),
+            state.get("location"),
+        ),
+        "origin": state.get("origin") or state.get("note") or "",
+    }
+
+
+def env_matrix_table(model: dict[str, Any]) -> dict[str, Any]:
+    """The interactive environment matrix: one row per stack, one column per environment
+    name, each cell the backend (bucket / key) that stack uses in that environment, with
+    the file:line it is set at; a stack without environments has its root's backend."""
+    structure = model.get("structure") or {"roots": [], "environments": []}
+    envs = structure.get("environments") or []
+    roots = {r["dir"]: r for r in structure.get("roots") or []}
+    validation = (model.get("pipeline") or {}).get("validation") or {}
+    status = {v["name"]: v["status"] for v in validation.get("envs") or []}
+    names = sorted({e["name"] for e in envs}, key=lambda n: (_ENV_ORDER.get(n.lower(), 6), n))
+    stacks = [s for s in model.get("stacks") or [] if not s.get("library")]
+    if not stacks:
+        stacks = [{"id": d, "roots": [d]} for d in roots if roots[d].get("role") != "library"]
+    rows = []
+    for s in stacks:
+        cells: dict[str, Any] = {}
+        for name in names:
+            env = next(
+                (
+                    e
+                    for e in envs
+                    if e["name"] == name
+                    and (e["root"] in s["roots"] or set(e.get("roots") or []) & set(s["roots"]))
+                ),
+                None,
+            )
+            if env is None:
+                continue
+            cell = _backend_cell(env.get("state") or {}, env.get("backend_hcl") or [])
+            cell["var_files"] = env.get("var_files") or []
+            cell["wired"] = env.get("wired", True)
+            cells[name] = cell
+        root = roots.get(s["roots"][0]) if s["roots"] else None
+        default = None
+        if root is not None:
+            b = root["backend"]
+            default = _backend_cell(b, b.get("config_files") or [])
+        rows.append(
+            {
+                "stack": s["id"],
+                "roots": s["roots"],
+                "node": root_node_id(s["roots"][0]) if s["roots"] else None,
+                "default": default,
+                "cells": cells,
+            }
+        )
+    return {
+        "columns": [{"name": n, "status": status.get(n, "confirmed")} for n in names],
+        "rows": rows,
+    }
 
 
 def env_matrix_mermaid(model: dict[str, Any]) -> str:

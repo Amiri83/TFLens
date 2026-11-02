@@ -33,6 +33,7 @@ from typing import Any
 
 from .flow import COMPUTE_TYPES, build_flows, kind_of
 from .flow import label_of as _flow_label
+from .labels import readable_name
 from .overview import FRIENDLY, _line, _plural
 from .snippets import location_label
 from .tabdiagrams import DIAGRAMS as TAB_DIAGRAMS
@@ -193,13 +194,13 @@ def label_of(n: dict[str, Any]) -> str:
     if isinstance(tags, dict) and isinstance(tags.get("Name"), str) and tags["Name"]:
         return tags["Name"]
     label = _flow_label(n)
-    if label != n["name"] or n["kind"] == "external":
+    if label != readable_name(n["name"], n) or n["kind"] == "external":
         return label
     for key in ("domain_name", "description"):
         value = n["attributes"].get(key)
         if isinstance(value, str) and value:
             return value
-    return n["name"]
+    return label
 
 
 def platform_category(rtype: str) -> str | None:
@@ -546,8 +547,13 @@ def _kind(n: dict[str, Any]) -> str:
     return kind_of(n)
 
 
-def _node_line(n: dict[str, Any], level: int, extra: str = "") -> dict[str, Any]:
-    text = f"{_kind(n)}: {label_of(n)}" + (f" — {extra}" if extra else "")
+def _node_line(
+    n: dict[str, Any], level: int, extra: str = "", code_name: bool = False
+) -> dict[str, Any]:
+    """``code_name``: a module's interface listing names its resources by their local
+    name in the code (``SQS queue: this`` next to its inputs and outputs)."""
+    name = n["name"] if code_name else label_of(n)
+    text = f"{_kind(n)}: {name}" + (f" — {extra}" if extra else "")
     return _line(text, n["location"], level, n["id"])
 
 
@@ -987,7 +993,7 @@ def catalog_sections(
             ):
                 defined.setdefault((n["type"], n["name"], n["kind"]), n)
         lines.append(_line(f"Resources ({len(defined)})", None))
-        lines += [_node_line(n, 1) for _k, n in sorted(defined.items())]
+        lines += [_node_line(n, 1, code_name=True) for _k, n in sorted(defined.items())]
         calls = [
             m
             for m in entry.get("modules", [])

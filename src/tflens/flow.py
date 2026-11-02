@@ -34,6 +34,7 @@ from collections import deque
 from typing import Any
 from xml.sax.saxutils import escape
 
+from .labels import readable_name
 from .overview import FRIENDLY
 from .snippets import location_label
 
@@ -184,7 +185,7 @@ def label_of(n: dict[str, Any]) -> str:
         for key in ("function_name", "bucket", "name", "alarm_name", "family", "cluster_name"):
             if isinstance(src.get(key), str) and src[key]:
                 return src[key]
-    return n["name"]
+    return readable_name(n["name"], n)
 
 
 def kind_of(n: dict[str, Any]) -> str:

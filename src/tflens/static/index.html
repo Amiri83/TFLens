@@ -25,7 +25,8 @@
     <label id="env-switch" class="env-switch hidden" title="Re-analyze with an environment's tfvars applied">Environment
       <select id="env"></select>
     </label>
-    <div id="summary"></div>
+    <div id="summary" class="summary-bar"></div>
+    <button type="button" id="theme-toggle" class="theme-toggle" title="Theme">◐ Auto</button>
     <form id="discover-form" class="discover-form hidden" method="post" action="api/discover" data-discover>
       <label class="inline" title="Read-only existence checks of the confirmed resources, this run only">
         <input type="checkbox" name="aws" value="1" id="discover-aws" disabled> AWS check
@@ -33,6 +34,7 @@
       <button type="submit" id="discover" title="Crawl → validate → (AWS) → render, and rewrite model.json">Discover</button>
     </form>
   </header>
+  <div id="summary-details" class="summary-details" hidden></div>
   <div id="discover-modal" class="discover-modal" hidden role="dialog" aria-modal="true" aria-labelledby="discover-title"
        data-api="1" data-current-url="api/job" data-status-url="api/job?id=__ID__" data-cancel-url="api/job/cancel?id=__ID__">
     <div class="discover-box">
