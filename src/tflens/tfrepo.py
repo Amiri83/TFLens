@@ -867,6 +867,8 @@ def discover_options(
         cli_vars=env_vars(env, decrypt) if env else {},
         scope=env_scope(env),
         git_root=Path(repo["path"]),
+        # no environment asked for: each stack is bound to its own default one
+        auto_env=env is None,
     )
 
 
@@ -881,16 +883,23 @@ def record_run(
     temporary directory renamed to ``out/<repo>/<run>/`` once complete, and the row is
     part of the caller's transaction (rolled back, and the files removed, on error): no
     half-written run. Returns the run id."""
+    from .envs import shown_env_names
     from .output import listing_text
 
     root = analysis_root(repo)
     listing = listing_text(analysis.model["discovery"]["inventory"])
     error = f"{analysis.failure}\n{listing}" if analysis.failed else ""
+    # ``runs.env`` stays the environment asked for ('' for a Discover: retention and the
+    # previous run are per asked-for environment); this is what a Discover bound
+    shown = shown_env_names(analysis.model) if env is None else []
     run_id = _insert_run(
         conn,
         repo,
         env,
-        summary=analysis.model["summary"],
+        summary={
+            **analysis.model["summary"],
+            **({"environments_shown": shown} if shown else {}),
+        },
         root=root,
         status=FAILED if analysis.failed else OK,
         error=error,
@@ -1011,6 +1020,7 @@ def _run_row(r: sqlite3.Row) -> dict[str, Any]:
     s = out["summary"]
     out["node_count"] = sum((s.get("nodes") or {}).values())
     out["edge_count"] = sum((s.get("edges") or {}).values())
+    out["env_shown"] = out.get("env") or ", ".join(s.get("environments_shown") or [])
     error = out.get("error") or ""
     out["reason"], _, out["error_detail"] = error.partition("\n")
     out["status"] = out.get("status") or OK

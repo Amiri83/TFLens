@@ -94,7 +94,7 @@ TYPE_ICONS: dict[str, str] = {
 }
 
 # One colour per service, the same in every view (Graph nodes, filters, diagram boxes)
-# whatever else the repository contains; mid-tone so it reads on light and dark.
+# whatever else the repository contains; mid-tone so it reads on any panel.
 SERVICE_COLOURS: dict[str, str] = {
     "lambda": "#e8710a",
     "ec2": "#c25e00",

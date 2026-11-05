@@ -4,7 +4,9 @@
    ``.venv``, ``.git``, ``dist``, ... are skipped and listed as such). READMEs, other
    Markdown files, ``docs/``, HANDOFF notes, CI files, scripts and the git log are read as
    *hints only*: a draft map of stacks, environments and links between stacks, each item
-   marked ``hint`` and carrying its sources (``file:line``, how it was read).
+   marked ``hint`` and carrying its sources (``file:line``, how it was read). A stack is
+   only proposed from docs / CI text that reads as a relative directory path and is a
+   directory the crawl found (:func:`stack_candidate`): never a number, hash, IP, ...
 2. **Validate**: every hint is checked against real repository files only (``.tf``,
    ``.tfvars``, ``backend-*.hcl`` / ``*.tfbackend``). An environment is a real tfvars /
    backend file (or environment directory holding Terraform code) in that stack's tree;
@@ -35,6 +37,7 @@ from typing import Any, Protocol, TypeVar
 from .crawl import ci_system, crawl, doc_files
 from .detect import COMMON_STEMS, GENERIC_STEMS, backend_env
 from .engine import in_scope
+from .envs import env_id
 from .loader import ENV_CONTAINERS, ENV_WORDS, RepoSource, load_repo
 from .output import Analysis, run_analysis
 
@@ -76,6 +79,14 @@ _LINK_WORDS_RE = re.compile(
     re.I,
 )
 _DYNAMIC = re.compile(r"[$%{}<>*]")
+# A path segment that names a directory (no spaces, modes like u+x, host:port, ...) ...
+_DIR_SEGMENT_RE = re.compile(r"^[\w][\w.-]*$")
+# ... and is not a value: 42, 0644, 123456789012, 10.0.0.1, 2026-01-02, 1.2.3
+_NUMERIC_RE = re.compile(r"^\d[\d.,_:-]*$")
+_HEX_RE = re.compile(r"^(0x)?[0-9a-f]+$", re.I)
+_UUID_RE = re.compile(r"^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$", re.I)
+_FILE_MODE_RE = re.compile(r"^[-dlbcps]?([-r][-w][-xsStT]){3}[.+@]?$")
+MIN_HASH_LEN = 7  # a short git hash
 
 
 class Cancelled(Exception):
@@ -211,6 +222,46 @@ def _norm_path(value: str) -> str | None:
     return posixpath.normpath(value)
 
 
+def _value_like(segment: str) -> bool:
+    """A path segment that is a value rather than a directory name: a number, IP, version,
+    date, account id, hash, UUID or file mode (or a dotfile, or not a name at all)."""
+    if segment.startswith(".") or not _DIR_SEGMENT_RE.match(segment):
+        return True
+    if _NUMERIC_RE.match(segment) or _UUID_RE.match(segment) or _FILE_MODE_RE.match(segment):
+        return True
+    if not _HEX_RE.match(segment):
+        return False
+    if segment.lower().startswith("0x") or len(segment) > MIN_HASH_LEN:
+        return True
+    # as short as a git hash: a hash when it has a digit, else a word ("defaced", "facade")
+    return len(segment) == MIN_HASH_LEN and any(c.isdigit() for c in segment)
+
+
+def looks_like_dir(path: str) -> bool:
+    """Whether a normalized path reads as a real relative directory: no value-like segment
+    (numbers, hex / hashes, IPs / CIDRs, account ids, file modes, dotfiles) and no file
+    extension."""
+    if not path or path.startswith("/") or posixpath.splitext(path)[1]:
+        return False
+    return not any(_value_like(p) for p in path.split("/"))
+
+
+def crawled_dirs(all_files: list[str]) -> set[str]:
+    """Every directory the crawl found: the ancestors of the files it listed."""
+    out: set[str] = set()
+    for f in all_files:
+        d = posixpath.dirname(f)
+        while d and d not in out:
+            out.add(d)
+            d = posixpath.dirname(d)
+    return out
+
+
+def stack_candidate(path: str | None, dirs: set[str]) -> bool:
+    """Phase 1's only way to propose a stack: a relative directory path, found by the crawl."""
+    return path is not None and path in dirs and looks_like_dir(path)
+
+
 class _Hints:
     """The draft map: hints keyed by (kind, name), each with its sources."""
 
@@ -256,7 +307,8 @@ class _Hints:
         return out
 
 
-def _scan_line(hints: _Hints, file: str, n: int, via: str, line: str) -> None:
+def _scan_line(hints: _Hints, file: str, n: int, via: str, line: str, found: set[str]) -> None:
+    """The hints of one line; ``found``: the directories of the crawl."""
     dirs: list[str] = []
     for m in _ENV_WORD_RE.finditer(line):
         hints.add("env", m.group(1), file, n, via, line)
@@ -281,14 +333,16 @@ def _scan_line(hints: _Hints, file: str, n: int, via: str, line: str) -> None:
                 stem = posixpath.basename(posixpath.dirname(path))
         if stem:
             hints.add("env", stem, file, n, via, line, files=path)
+    if via == "git":  # stacks are proposed from docs and CI only
+        return
     for m in _DIR_RE.finditer(line):
         path = _norm_path(m.group(1))
-        if path is not None and not posixpath.splitext(path)[1]:
+        if stack_candidate(path, found):
             dirs.append(path)
     if via == "docs" and _STACK_WORDS_RE.search(line):
         for m in _CODE_PATH_RE.finditer(line):
             path = _norm_path(m.group(1))
-            if path is not None and not posixpath.splitext(path)[1]:
+            if stack_candidate(path, found):
                 dirs.append(path)
     dirs = list(dict.fromkeys(dirs))
     for d in dirs:
@@ -301,17 +355,18 @@ def _scan_line(hints: _Hints, file: str, n: int, via: str, line: str) -> None:
 def hypothesize(repo: RepoSource, crawled: dict[str, Any]) -> list[dict[str, Any]]:
     """Phase 1's draft map from docs, CI and the git log (every item a ``hint``)."""
     hints = _Hints()
+    found = crawled_dirs(repo.all_files)
     for f, via in hint_sources(repo.all_files):
         lines = _read(repo.root, f)
         if lines is None:
             continue
         for n, line in enumerate(lines, 1):
-            _scan_line(hints, f, n, via, line)
+            _scan_line(hints, f, n, via, line, found)
     for c in (crawled.get("git") or {}).get("commits", []):
         text = c.get("subject", "")
         if c.get("body"):
             text += " " + c["body"].replace("\n", " ")
-        _scan_line(hints, f"git:{c.get('short', '')}", 0, "git", text)
+        _scan_line(hints, f"git:{c.get('short', '')}", 0, "git", text, found)
     return hints.result()
 
 
@@ -347,10 +402,12 @@ def validate(model: dict[str, Any], hints: list[dict[str, Any]]) -> dict[str, An
     by_kind: dict[str, dict[str, dict[str, Any]]] = {"env": {}, "stack": {}, "link": {}}
     for h in hints:
         by_kind[h["kind"]][h["name"]] = h
+    all_envs = structure.get("environments", [])
+    stack_of_env = {eid: s["id"] for s in model.get("stacks", []) for eid in s["environments"]}
 
     # environments: one item per name
     confirmed: dict[str, list[dict[str, Any]]] = {}
-    for e in structure.get("environments", []):
+    for e in all_envs:
         evidence = _env_evidence(e, files)
         e["evidence_files"] = evidence
         e["status"] = CONFIRMED if evidence else HINT_ONLY
@@ -373,7 +430,10 @@ def validate(model: dict[str, Any], hints: list[dict[str, Any]]) -> dict[str, An
             ev = sorted({f for e in confirmed[name] for f in e["evidence_files"]})
             item.update(
                 status=CONFIRMED,
-                stacks=sorted({e["root"] for e in confirmed[name]}),
+                # the stacks as everywhere else (envs/*, not envs/dev)
+                stacks=sorted(
+                    {stack_of_env.get(env_id(e, all_envs), e["root"]) for e in confirmed[name]}
+                ),
                 evidence=ev,
                 evidence_count=len(ev),
                 kinds=sorted({k for e in confirmed[name] for k in e.get("kinds", [])}),
@@ -408,22 +468,53 @@ def validate(model: dict[str, Any], hints: list[dict[str, Any]]) -> dict[str, An
             item["mismatch"] = item["reason"]
         envs.append(item)
 
-    # stacks: the roots, and every directory named as one
+    # stacks: one item per stack of the model (the same stacks the header and the tables
+    # count), with the hints naming it or one of its roots; then the other directories named
+    known_stacks = [dict(s) for s in model.get("stacks", [])]
+    in_stack = {r for s in known_stacks for r in s["roots"]} | {s["id"] for s in known_stacks}
+    known_stacks += [{"id": r, "roots": [r], "library": False} for r in roots if r not in in_stack]
     stacks = []
-    for name in sorted(set(roots) | set(by_kind["stack"])):
-        hint = by_kind["stack"].get(name)
+    claimed_hints: set[str] = set()
+    for s in known_stacks:
+        names = [n for n in by_kind["stack"] if n == s["id"] or n in s["roots"]]
+        claimed_hints.update(names)
+        found = [by_kind["stack"][n] for n in names]
+        if s.get("library") and not found:
+            continue  # a reusable module nothing calls, not named as a stack: not a stack
+        item = {
+            "name": s["id"],
+            "roots": list(s["roots"]),
+            "hint_mentions": sum(h["mentions"] for h in found),
+            "hint_sources": [src for h in found for src in h["sources"]][:MAX_SOURCES],
+            "via": sorted({v for h in found for v in h["via"]}),
+        }
+        if not found:
+            item["hinted"] = False
+        if s.get("library"):
+            item.update(
+                status=CONTRADICTED,
+                reason=f"{s['id']}/ is a reusable module nothing calls: not deployed from here",
+            )
+            item["mismatch"] = item["reason"]
+        else:
+            reason = "a root module / unit (its .tf / terragrunt.hcl)"
+            if len(s["roots"]) > 1:
+                reason = f"{len(s['roots'])} root modules / units: " + ", ".join(s["roots"][:5])
+            item.update(status=CONFIRMED, reason=reason)
+        stacks.append(item)
+    for name in sorted(set(by_kind["stack"]) - claimed_hints):
+        hint = by_kind["stack"][name]
         item = {
             "name": name,
-            "hint_mentions": hint["mentions"] if hint else 0,
-            "hint_sources": hint["sources"] if hint else [],
-            "via": hint["via"] if hint else [],
+            "hint_mentions": hint["mentions"],
+            "hint_sources": hint["sources"],
+            "via": hint["via"],
         }
         inside = _owning(name, roots)
-        if name in roots:
-            item.update(status=CONFIRMED, reason="a root module / unit (its .tf / terragrunt.hcl)")
-        elif inside:
+        if inside:
             item.update(
                 status=CONFIRMED,
+                role="directory",  # holds stacks, is not one: not counted as a stack
                 reason="directory holding the root(s) " + ", ".join(inside[:5]),
             )
         elif _exists(name, all_files):
@@ -434,11 +525,10 @@ def validate(model: dict[str, Any], hints: list[dict[str, Any]]) -> dict[str, An
             )
         else:
             item.update(status=CONTRADICTED, reason=f"{name}/ is not in the repository")
-        if hint is None:
-            item["hinted"] = False
-        elif item["status"] != CONFIRMED:
+        if item["status"] != CONFIRMED:
             item["mismatch"] = item["reason"]
         stacks.append(item)
+    stacks.sort(key=lambda it: it["name"])
 
     # links: remote state reads between stacks
     code_links = sorted(
@@ -522,7 +612,11 @@ def validate(model: dict[str, Any], hints: list[dict[str, Any]]) -> dict[str, An
         "links": links,
         "stack_ids": stack_ids,
         "mismatches": mismatches,
-        "counts": {"envs": counts(envs), "stacks": counts(stacks), "links": counts(links)},
+        "counts": {
+            "envs": counts(envs),
+            "stacks": counts([s for s in stacks if s.get("role") != "directory"]),
+            "links": counts(links),
+        },
     }
 
 
@@ -544,7 +638,12 @@ def confirmed_only(model: dict[str, Any]) -> None:
     structure["environments"] = keep
     for s in model.get("stacks", []):  # environment ids: name, or <root>:<name>
         s["environments"] = [e for e in s["environments"] if e.split(":")[-1] not in dropped]
+        if s.get("selected") and s["selected"].split(":")[-1] in dropped:
+            s["selected"] = next(iter(s["environments"]), None)
+            s["default"] = s["selected"] is not None
     analysis = model.get("environment_analysis") or {}
+    if analysis.get("selected"):
+        analysis["selected"] = [e for e in analysis["selected"] if e.split(":")[-1] not in dropped]
     for key in ("columns", "environments"):
         if key in analysis:
             analysis[key] = [

@@ -8,7 +8,7 @@
       <td>{% if r.model_path %}<a href="{{ url_for('run_view', run_id=r.id) }}"><b>{{ r.id }}</b></a>{% else %}<b>{{ r.id }}</b>{% endif %}</td>
       <td>{{ r.ts | localtime }}</td>
       <td>{% if r.repo_id %}<a href="{{ url_for('settings_tfrepo', repo_id=r.repo_id) }}">{{ r.repo }}</a>{% else %}{{ r.repo }} <span class="muted small">(removed)</span>{% endif %}</td>
-      <td class="mono">{{ r.env or '—' }}</td>
+      <td class="mono run-env">{{ r.env_shown or '—' }}</td>
       <td class="mono small">{{ r.commit_sha[:12] if r.commit_sha else '—' }}</td>
       <td class="small">{% if r.status == 'failed' %}<span class="badge err">failed</span>
           <div class="run-reason">{{ r.reason }}</div>

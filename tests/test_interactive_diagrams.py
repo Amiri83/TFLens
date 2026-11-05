@@ -83,8 +83,8 @@ def _check_elements(data):
 # ---------------------------------------------------------------- 1 + 7. one component, vendored
 
 
-def test_page_loads_only_local_scripts_in_order():
-    html = (STATIC / "index.html").read_text()
+def test_page_loads_only_local_scripts_in_order(tmp_path):
+    html = _api(tmp_path).handle("GET", "/").body.decode()
     scripts = re.findall(r'<script src="([^"]+)"', html)
     assert scripts[:4] == [
         "/static/vendor/cytoscape.min.js",
@@ -98,8 +98,9 @@ def test_page_loads_only_local_scripts_in_order():
     for name in ("cytoscape", "dagre"):
         assert (STATIC / "vendor" / f"{name}.LICENSE").is_file()
     # no remote script, style sheet or font anywhere in the page's assets
-    for path in [STATIC / "index.html", STATIC / "app.css", STATIC / "style.css"] + [
-        STATIC / f for f in ("app.js", "diagram.js", "discover.js")
+    templates = STATIC.parent / "templates"
+    for path in [templates / "base.html", templates / "analyzer.html"] + [
+        STATIC / f for f in ("app.css", "style.css", "app.js", "diagram.js", "discover.js")
     ]:
         text = path.read_text()
         assert not re.search(r"""(src|href)=["']https?://""", text), path
@@ -385,11 +386,9 @@ def _theme(css: str, selector: str) -> dict[str, str]:
 
 
 def test_higher_contrast_text():
-    css = (STATIC / "app.css").read_text()
-    light, dark = _theme(css, ":root {"), _theme(css, ':root[data-theme="dark"] {')
-    for theme in (light, dark):
-        for fg in ("--fg", "--fg-muted", "--fg-faint"):
-            assert _contrast(theme[fg], theme["--bg-panel"]) >= 7.0, fg  # WCAG AAA
+    theme = _theme((STATIC / "app.css").read_text(), ":root {")
+    for fg in ("--fg", "--fg-muted", "--fg-faint"):
+        assert _contrast(theme[fg], theme["--bg-panel"]) >= 7.0, fg  # WCAG AAA
 
 
 # ---------------------------------------------------------------- 5. colours, icons, legend
@@ -454,12 +453,9 @@ def test_canvas_legend_lists_edge_types_in_order(tmp_path):
 
 def test_selected_node_is_legible_in_dark_mode():
     css = (STATIC / "app.css").read_text()
-    for selector in (':root[data-theme="dark"] {', ':root:not([data-theme="light"]) {'):
-        dark = _theme(css, selector)
-        assert _luminance(dark["--sel-bg"]) < 0.2  # a dark fill, not a fixed light one
-        assert _contrast(dark["--sel-bg"], dark["--sel-fg"]) >= 4.5
-    light = _theme(css, ":root {")
-    assert _contrast(light["--sel-bg"], light["--sel-fg"]) >= 4.5
+    dark = _theme(css, ":root {")
+    assert _luminance(dark["--sel-bg"]) < 0.2  # a dark fill
+    assert _contrast(dark["--sel-bg"], dark["--sel-fg"]) >= 4.5
     assert not re.search(
         r"fill: #[0-9a-f]{6}",
         css.split(

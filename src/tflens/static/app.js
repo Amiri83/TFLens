@@ -232,7 +232,7 @@
       } else if (!s.environments.length) {
         pick = el("span", { class: "st-unknown" }, `— ${s.no_env_reason || "no environment files found"}`);
       } else if (!envs.switchable) {
-        pick = el("strong", {}, s.selected || "none (variable defaults)");
+        pick = el("strong", {}, s.selected ? `${s.selected}${s.default ? " (default)" : ""}` : "none (variable defaults)");
       } else {
         pick = el("select", { "data-stack": s.id, onchange: (ev) => selectStackEnv(s.id, ev.target.value) },
           el("option", { value: "" }, "none (variable defaults)"),
@@ -439,7 +439,7 @@
     const parts = [];
     const section = (id, title, ...content) => {
       toc.push([id, title]);
-      parts.push(el("h2", { id, class: "rv-section" }, title), ...content);
+      parts.push(el("h2", { id, class: "rv-section" }, title), ...content.filter(Boolean));
     };
     if (!envs.environments.length) {
       const why = (envs.stacks || []).filter((s) => s.no_env_reason).map((s) => `${s.id}: ${s.no_env_reason}`);
@@ -452,14 +452,15 @@
       const shown = envs.active ? `${envs.active}${envs.default ? " (default)" : ""}` : "no environment (variable defaults)";
       parts.push(el("p", {}, `Shown: ${shown}. The flows, the Root view (Network, IAM) and the graph follow the environment selected here or in the switcher above.`));
     }
+    const counts = envs.counts;
     if ((envs.stacks || []).length > 1) {
-      section("env-stacks", `Stacks (${envs.stacks.length})`,
-        el("p", { class: "muted" }, "Each root with its own state is a stack; its environments are the tfvars / backend configurations bound to it (the nearest root above them)."),
+      const library = counts.library_stacks ? ` Reusable modules nothing calls are listed but not counted (${counts.library_stacks}).` : "";
+      section("env-stacks", `Stacks (${counts.stacks})`,
+        el("p", { class: "muted" }, `Each root with its own state is a stack; its environments are the tfvars / backend configurations bound to it (the nearest root above them).${library}`),
         stacksTable(envs));
     }
     if ((envs.stacks || []).length) {
-      const dbg = envs.env_debug || { confirmed: 0 };
-      section("env-debug", `Environments (debug): ${dbg.confirmed} confirmed`,
+      section("env-debug", `Environments (debug): ${counts.environments} confirmed`,
         el("p", { class: "muted" }, "Grouped by environment. Evidence = real tfvars / backend-<env>.hcl / environment directory files in a stack's tree; docs, CI and git mentions are hints and never create an environment."),
         envFilesDebug(envs));
     }
@@ -471,7 +472,10 @@
         parts.push(el("p", { class: "st-unknown" },
           `Not wired: ${envs.not_wired.join(", ")} — tfvars only (no backend configuration, no CI / script line uses it); still analyzed.`));
       }
-      section("env-files", `Detected environments (${envs.environments.length})`, envFilesTable(envs));
+      section("env-files", `Detected environments (${counts.environments})`,
+        counts.stack_environments !== counts.environments
+          ? el("p", { class: "muted" }, `${counts.stack_environments} rows: one per stack that has the environment.`) : null,
+        envFilesTable(envs));
       section("env-state", "State file per environment", stateTable(envs));
     }
     section("env-inventory", "Service inventory",
@@ -1343,7 +1347,7 @@
       { selector: 'edge[kind = "CONTAINS"]', style: {
         "line-style": "dashed", width: 1, "target-arrow-shape": "none", "line-color": themeColor("--group-border", "#6e7781"), opacity: 0.6 } },
       { selector: "edge.hover", style: { label: "data(short_label)", width: 3, "z-index": 10 } },
-      // selected: the theme's accent and selection colours, legible in light and dark
+      // selected: the theme's accent and selection colours
       { selector: "node:selected", style: {
         "border-width": 4, "border-color": accent, "overlay-color": accent, "overlay-opacity": 0.18,
         "overlay-padding": 4, "text-background-color": selBg, "text-background-opacity": 1,
@@ -1823,12 +1827,31 @@
         h.line ? locLink({ file: h.file, start_line: h.line, end_line: h.line }) : h.file, ` — ${h.text}`))));
   }
 
-  function validationTable(items, label) {
+  function validationRows(items, label) {
     const head = el("tr", {}, el("th", {}, label), el("th", {}, "Status"), el("th", {}, "Evidence (code)"), el("th", {}, "Hints (docs / CI / git)"));
     const rows = items.map((it) => el("tr", { class: `val-row val-${it.status}`, "data-name": it.name },
       el("td", { class: "mono" }, it.name), el("td", {}, statusTag(it.status)),
       el("td", {}, it.reason || ""), el("td", {}, hintSources(it) || el("span", { class: "muted" }, "none"))));
     return el("table", { class: "validation" }, el("thead", {}, head), el("tbody", {}, ...rows));
+  }
+
+  // Contradicted items, collapsed behind their count: they are noise until asked for.
+  function contradictedGroup(items, content) {
+    return items.length
+      ? el("details", { class: "contradicted-group" }, el("summary", {}, `${items.length} contradicted`), content(items))
+      : null;
+  }
+
+  function validationTable(items, label) {
+    const shown = items.filter((it) => it.status !== "contradicted");
+    const hidden = items.filter((it) => it.status === "contradicted");
+    return el("div", {}, shown.length || !hidden.length ? validationRows(shown, label) : null,
+      contradictedGroup(hidden, (group) => validationRows(group, label)));
+  }
+
+  function mismatchLines(items) {
+    return el("ul", { class: "overview-lines" }, ...items.map((m) => el("li", { class: "ov-line st-unknown" },
+      statusTag(m.status), ` ${m.kind} `, el("span", { class: "mono" }, m.name), `: ${m.text} `, m.location ? locLink(m.location) : null)));
   }
 
   function renderDiscovery(d) {
@@ -1842,17 +1865,22 @@
     const parts = [];
     const section = (id, title, ...content) => {
       toc.push([id, title]);
-      parts.push(el("h2", { id, class: "rv-section" }, title), ...content);
+      parts.push(el("h2", { id, class: "rv-section" }, title), ...content.filter(Boolean));
     };
     section("dc-phases", "Phases", el("ol", { class: "overview-lines" }, ...d.phases.map((p) =>
       el("li", { class: "ov-line" }, el("b", {}, p.label), ` — ${p.status}${p.detail ? `: ${p.detail}` : ""}`))));
     const v = d.validation;
+    const openMismatches = v.mismatches.filter((m) => m.status !== "contradicted");
     section("dc-mismatch", `Docs vs code (${v.mismatches.length})`, v.mismatches.length
-      ? el("ul", { class: "overview-lines" }, ...v.mismatches.map((m) => el("li", { class: "ov-line st-unknown" },
-        statusTag(m.status), ` ${m.kind} `, el("span", { class: "mono" }, m.name), `: ${m.text} `, m.location ? locLink(m.location) : null)))
+      ? el("div", {}, openMismatches.length ? mismatchLines(openMismatches) : null,
+        contradictedGroup(v.mismatches.filter((m) => m.status === "contradicted"), mismatchLines))
       : el("p", { class: "muted" }, "None: docs, CI and the code agree."));
-    section("dc-envs", "Environments", validationTable(v.envs, "Environment"));
-    section("dc-stacks", "Stacks", validationTable(v.stacks, "Stack"));
+    section("dc-envs", `Environments (${d.counts.environments} confirmed)`, validationTable(v.envs, "Environment"));
+    // directories the docs name that hold stacks are not stacks of their own
+    const dirs = v.stacks.filter((s) => s.role === "directory");
+    section("dc-stacks", `Stacks (${d.counts.stacks})`, validationTable(v.stacks.filter((s) => s.role !== "directory"), "Stack"),
+      dirs.length ? el("h3", {}, "Directories named in docs / CI, holding stacks") : null,
+      dirs.length ? validationRows(dirs, "Directory") : null);
     section("dc-links", "Links between stacks", v.links.length ? validationTable(v.links, "Link") : el("p", { class: "muted" }, "None."));
     const aws = d.aws;
     section("dc-aws", "AWS check", el("p", { class: aws.status === "done" ? "" : "muted" }, `${aws.status}: ${aws.message}`),
@@ -1884,11 +1912,8 @@
     renderRoots(shapes);
     renderFailure(summary, ov);
     document.getElementById("title").textContent = summary.title;
-    // a recorded run (managed mode) is read-only: no Discover, a way back to the runs
+    // a recorded run (managed mode) is read-only: no Discover
     document.getElementById("discover-form").classList.toggle("hidden", Boolean(summary.readonly));
-    document.getElementById("home").classList.toggle("hidden", !location.pathname.startsWith("/runs/"));
-    // a recorded run: diff against the previous run (managed mode only)
-    document.getElementById("changes").classList.toggle("hidden", !location.pathname.startsWith("/runs/"));
     renderDiagrams();
     renderSummaryBar(summary, envs);
     document.getElementById("tree").replaceChildren(treeNode(tree));
@@ -1902,8 +1927,8 @@
     const s = summary.summary;
     const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
     const f = summary.flow;
-    const envCount = envs.environments.length ? confirmedColumns(envs).length : 0;
-    const stacks = (envs.stacks || []).filter((x) => !x.library).length || (summary.roots || []).length;
+    // the same numbers as the tables and the debug sections (envs.scope_counts)
+    const { environments: envCount, stacks } = envs.counts;
     const resources = s.nodes.resource || 0;
     const stat = (n, label, cls) => el("span", { class: `sum-stat ${cls || ""}`.trim() }, el("b", {}, String(n)), ` ${label}`);
     const bar = document.getElementById("summary");
@@ -1937,49 +1962,8 @@
       ...item("Parse errors", String(s.parse_errors), s.parse_errors ? "st-failed" : "")));
   }
 
-  // ------------------------------------------------------------ theme
-  // auto (the system's), light or dark; kept in localStorage.
-  const THEMES = ["auto", "light", "dark"];
-
-  function applyTheme(theme) {
-    if (theme === "auto") delete document.documentElement.dataset.theme;
-    else document.documentElement.dataset.theme = theme;
-    const btn = document.getElementById("theme-toggle");
-    if (btn) {
-      btn.textContent = { auto: "◐ Auto", light: "☀ Light", dark: "☾ Dark" }[theme];
-      btn.title = `Theme: ${theme} (click to change)`;
-    }
-    if (cy) cy.style(graphStyle());
-    restyleCanvases();
-  }
-
-  // the diagrams' canvases take the theme's colours too (the Graph's is restyled above)
-  function restyleCanvases() {
-    if (window.TFDiagram) window.TFDiagram.restyleAll();
-  }
-
-  function initTheme() {
-    let theme = "auto";
-    try { theme = localStorage.getItem("tflens-theme") || "auto"; } catch (err) { /* storage off */ }
-    if (!THEMES.includes(theme)) theme = "auto";
-    applyTheme(theme);
-    const btn = document.getElementById("theme-toggle");
-    if (btn) {
-      btn.addEventListener("click", () => {
-        theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
-        try { localStorage.setItem("tflens-theme", theme); } catch (err) { /* storage off */ }
-        applyTheme(theme);
-      });
-    }
-    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
-      if (cy) cy.style(graphStyle());
-      restyleCanvases();
-    });
-  }
-
   document.addEventListener("DOMContentLoaded", () => {
-    initTheme();
-    for (const t of document.querySelectorAll(".tab")) t.addEventListener("click", () => setView(t.dataset.view));
+    for (const t of document.querySelectorAll(".tab[data-view]")) t.addEventListener("click", () => setView(t.dataset.view));
     document.getElementById("search").addEventListener("input", applyFilters);
     document.getElementById("hide-isolated").addEventListener("change", applyFilters);
     document.addEventListener("keydown", (e) => {
@@ -1995,7 +1979,11 @@
     });
     const envSelect = document.getElementById("env");
     envSelect.addEventListener("change", () => selectEnv(envSelect.value));
-    loadAll().catch((err) => {
+    loadAll().then(() => {
+      // a run tab linked from another page of the run (Changes): ?view=graph
+      const view = new URLSearchParams(location.search).get("view");
+      if (VIEWS.includes(view)) setView(view);
+    }).catch((err) => {
       document.getElementById("detail").replaceChildren(el("p", {}, `Failed to load: ${err.message}`));
     });
   });

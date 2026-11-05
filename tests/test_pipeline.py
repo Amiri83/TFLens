@@ -148,12 +148,17 @@ def test_stack_and_link_hints_are_validated(tmp_path):
     (repo / "docs").mkdir()
     (repo / "docs" / "stacks.md").write_text(
         "The `network/` stack is applied before `app/`, which reads its state.\n"
-        "Deploy the `legacy/` stack first.\n"
+        "Deploy the `legacy/` stack first, then the `gone/` stack.\n"
     )
+    # real directories, no root module in them; gone/ is not in the repository at all
+    for name in ("network", "app", "legacy"):
+        (repo / name).mkdir()
+        (repo / name / "notes.txt").write_text("example\n")
     v = discover(repo, Options(git=False)).model["pipeline"]["validation"]
     stacks = {s["name"]: s for s in v["stacks"]}
     assert stacks["legacy"]["status"] == CONTRADICTED
-    assert "not in the repository" in stacks["legacy"]["reason"]
+    assert "holds no root module" in stacks["legacy"]["reason"]
+    assert "gone" not in stacks  # Phase 1 only proposes directories the crawl found
     links = {lk["name"]: lk for lk in v["links"]}
     assert links["network -> app"]["status"] == HINT_ONLY
 

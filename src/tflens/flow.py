@@ -840,8 +840,8 @@ def env_lines(
     decide what the code creates)."""
     if not environments:
         return []
-    names = ", ".join(e["name"] for e in environments)
-    head = f"Environments ({len(environments)}: {names}): start with their files"
+    unique = list(dict.fromkeys(e["name"] for e in environments))  # dev in two stacks is one
+    head = f"Environments ({len(unique)}: {', '.join(unique)}): start with their files"
     if active:
         head += f"; analyzed as {active['name']}"
     lines = [_line(head, environments[0]["evidence"][0] if environments[0]["evidence"] else None)]

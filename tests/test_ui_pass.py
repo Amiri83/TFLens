@@ -413,19 +413,19 @@ def test_service_colours_are_fixed_and_shared():
     assert f'stroke="{SERVICE_COLOURS["lambda"]}"' in svg(api.store.model(), "architecture")
 
 
-def test_light_and_dark_themes():
+def test_one_dark_theme():
     css = (STATIC / "app.css").read_text()
-    assert ':root[data-theme="dark"]' in css and "@media (prefers-color-scheme: dark)" in css
+    assert "color-scheme: dark" in css and "prefers-color-scheme" not in css
     assert re.search(r"body \{[^}]*font: 15px", css)  # the 15px base (interactive diagrams pass)
     js = (STATIC / "app.js").read_text()
-    assert 'themeColor("--fg"' in js and "cy.style(graphStyle())" in js
+    assert 'themeColor("--fg"' in js and "style: graphStyle()" in js
 
 
 # ---------------------------------------------------------------- 8. header summary bar
 
 
 def test_header_is_a_compact_summary_bar():
-    html = (STATIC / "index.html").read_text()
+    html = (STATIC.parent / "templates" / "analyzer.html").read_text()
     assert '<div id="summary-details" class="summary-details" hidden></div>' in html
     js = (STATIC / "app.js").read_text()
     body = js.split("function renderSummaryBar(summary, envs) {", 1)[1].split("\n  }\n", 1)[0]
