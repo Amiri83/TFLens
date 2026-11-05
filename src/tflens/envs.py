@@ -78,12 +78,22 @@ def find_env(environments: list[dict[str, Any]], wanted: str) -> dict[str, Any] 
     return next((e for e in environments if e["name"] == wanted), None)
 
 
+def env_confirmed(env: dict[str, Any]) -> bool:
+    """Whether real files stand behind an environment: its validation status, or (before
+    validation) that it lists any evidence at all."""
+    if "status" in env:
+        return env["status"] == "confirmed"
+    evidence = [env[k] for k in ("var_files", "backend_hcl", "evidence") if k in env]
+    return any(evidence) or not evidence
+
+
 def default_env(environments: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """The environment applied when none is asked for: ``dev`` when there is one, else
-    the first detected (None when there is none), so names resolve instead of showing
-    the blocks' labels."""
-    return next((e for e in environments if e["name"].lower() == "dev"), None) or next(
-        iter(environments), None
+    """The environment applied when none is asked for: among the confirmed ones, ``dev``
+    when there is one, else the first (None when there is none), so names resolve instead
+    of showing the blocks' labels."""
+    confirmed = [e for e in environments if env_confirmed(e)]
+    return next((e for e in confirmed if e["name"].lower() == "dev"), None) or next(
+        iter(confirmed), None
     )
 
 
@@ -512,6 +522,31 @@ NO_ENV_COLUMN = "(no environment)"
 def column_order(name: str) -> tuple[int, str]:
     low = name.lower()
     return (_PROMOTION.index(low) if low in _PROMOTION else len(_PROMOTION), low)
+
+
+def scope_counts(model: dict[str, Any]) -> dict[str, int]:
+    """The one count of stacks and environments every view shows (header, tables, debug
+    sections). ``stacks``: the model's stacks, without the reusable modules nothing calls
+    (``library_stacks``); ``environments``: the confirmed environment names (``dev`` in two
+    stacks is one); ``stack_environments``: one per stack that has one (table rows)."""
+    every = model.get("stacks") or []
+    deployed = [s for s in every if not s.get("library")]
+    envs = (model.get("structure") or {}).get("environments", [])
+    return {
+        "stacks": len(deployed) or len(model.get("roots") or []),
+        "library_stacks": len(every) - len(deployed),
+        "environments": len({e["name"] for e in envs if env_confirmed(e)}),
+        "stack_environments": sum(len(s["environments"]) for s in deployed),
+    }
+
+
+def shown_env_names(model: dict[str, Any]) -> list[str]:
+    """The environment names a model was analyzed with (one per stack, deduplicated, in
+    promotion order): the Environment column of the Runs table."""
+    selected = [s["selected"] for s in model.get("stacks") or [] if s.get("selected")]
+    if not selected and model.get("environment"):
+        selected = [model["environment"]["name"]]
+    return sorted({e.split(":")[-1] for e in selected}, key=column_order)
 
 
 def env_columns(

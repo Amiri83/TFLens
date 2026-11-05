@@ -21,7 +21,14 @@ from .canvas import KIND_COLOURS, canvas_view, icons_view, node_icon
 from .cards import stack_cards
 from .drawio import MIME as DRAWIO_MIME
 from .drawio import chain_drawio, tab_drawio
-from .envs import difference_lines, env_counts_text, inventory_rows, node_root, summarize
+from .envs import (
+    difference_lines,
+    env_counts_text,
+    inventory_rows,
+    node_root,
+    scope_counts,
+    summarize,
+)
 from .flow import build_flows, chain_svg
 from .graphlayout import layout as graph_layout
 from .icons import service_colour
@@ -998,6 +1005,7 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
         total = analysis["total"]
         out["total"] = {**total, "text": env_counts_text(total)}
     out["env_debug"] = env_debug(model)
+    out["counts"] = scope_counts(model)
     return out
 
 
@@ -1087,7 +1095,7 @@ def discovery_view(model: dict[str, Any]) -> dict[str, Any]:
             "available": False,
             "note": "this model was written before phased discovery: run Discover",
         }
-    return {"available": True, **pipe}
+    return {"available": True, **pipe, "counts": scope_counts(model)}
 
 
 def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
@@ -1256,7 +1264,9 @@ class Api:
         if method not in ("GET", "HEAD"):
             return _method_not_allowed()
         if path in ("/", "/index.html"):
-            return static_file("index.html")
+            from .web import analyzer_page  # the shared shell's template (web imports this)
+
+            return Response(200, "text/html; charset=utf-8", analyzer_page(self.store).encode())
         if path.startswith("/static/"):
             return static_file(path[len("/static/") :])
         if not path.startswith("/api/"):

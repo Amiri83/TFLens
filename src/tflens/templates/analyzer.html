@@ -1,40 +1,27 @@
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TFLens</title>
-  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
-  <link rel="stylesheet" href="/static/app.css">
-</head>
-<body>
-  <header>
-    <a id="home" class="home hidden" href="/runs">&larr; Runs</a>
-    <h1>TFLens <span id="title"></span></h1>
-    <nav>
-      <button type="button" class="tab active" data-view="environments">Environments</button>
-      <button type="button" class="tab" data-view="roots">Root view</button>
-      <button type="button" class="tab" data-view="flow">Flow</button>
-      <button type="button" class="tab" data-view="overview">Overview</button>
-      <button type="button" class="tab" data-view="graph">Graph</button>
-      <button type="button" class="tab" data-view="diagrams">Diagrams</button>
-      <button type="button" class="tab" data-view="repo">Repository</button>
-      <button type="button" class="tab" data-view="discovery">Discovery</button>
-    </nav>
-    <a id="changes" class="home hidden" href="changes">Changes</a>
+{% extends "base.html" %}
+{# The run analyzer: `tflens serve --dir` at / and a recorded run at /runs/<id>/. Its data
+   comes from the page-relative api/* endpoints (static/app.js). #}
+{% block title %}{{ page_title }}{% endblock %}
+{% block page_css %}{% endblock %}
+{% block body_class %}analyzer{% endblock %}
+{% block subnav %}
+  <div class="subnav">
+    <h1 class="run-title"><span id="title"></span></h1>
+    {% with as_links=False %}{% include "_run_subnav.html" %}{% endwith %}
     <label id="env-switch" class="env-switch hidden" title="Re-analyze with an environment's tfvars applied">Environment
       <select id="env"></select>
     </label>
     <div id="summary" class="summary-bar"></div>
-    <button type="button" id="theme-toggle" class="theme-toggle" title="Theme">◐ Auto</button>
     <form id="discover-form" class="discover-form hidden" method="post" action="api/discover" data-discover>
       <label class="inline" title="Read-only existence checks of the confirmed resources, this run only">
         <input type="checkbox" name="aws" value="1" id="discover-aws" disabled> AWS check
         <span id="discover-aws-why" class="muted small"></span></label>
       <button type="submit" id="discover" title="Crawl → validate → (AWS) → render, and rewrite model.json">Discover</button>
     </form>
-  </header>
+  </div>
   <div id="summary-details" class="summary-details" hidden></div>
+{% endblock %}
+{% block before_main %}
   <div id="discover-modal" class="discover-modal" hidden role="dialog" aria-modal="true" aria-labelledby="discover-title"
        data-api="1" data-current-url="api/job" data-status-url="api/job?id=__ID__" data-cancel-url="api/job/cancel?id=__ID__">
     <div class="discover-box">
@@ -53,7 +40,8 @@
   </div>
   <button type="button" id="discover-badge" class="discover-badge" hidden></button>
   <div id="failure" class="failure hidden"></div>
-  <main>
+{% endblock %}
+{% block content %}
     <aside id="sidebar">
       <section class="view-environments">
         <h3>Contents</h3>
@@ -110,11 +98,11 @@
     <aside id="detail">
       <p class="muted">Click a file:line reference, a node or an edge to see its evidence.</p>
     </aside>
-  </main>
-  <script src="/static/vendor/cytoscape.min.js"></script>
-  <script src="/static/vendor/dagre.min.js"></script>
-  <script src="/static/diagram.js"></script>
-  <script src="/static/app.js"></script>
-  <script src="/static/discover.js"></script>
-</body>
-</html>
+{% endblock %}
+{% block page_scripts %}
+  <script src="{{ url_for('static', filename='vendor/cytoscape.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='vendor/dagre.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='diagram.js') }}"></script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='discover.js') }}"></script>
+{% endblock %}

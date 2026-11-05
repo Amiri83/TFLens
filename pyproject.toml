@@ -35,7 +35,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 tflens = [
-    "static/*.html",
     "static/*.css",
     "static/*.js",
     "static/*.svg",

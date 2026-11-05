@@ -1,0 +1,13 @@
+{# The run tabs, under the shared menu. In the analyzer (`as_links` false) they are buttons
+   switching views in place (app.js); on another page of the run they link to the analyzer. #}
+<nav class="run-tabs" aria-label="Run">
+  {% for view, label in [
+      ('environments', 'Environments'), ('roots', 'Root view'), ('flow', 'Flow'),
+      ('overview', 'Overview'), ('graph', 'Graph'), ('diagrams', 'Diagrams'),
+      ('repo', 'Repository'), ('discovery', 'Discovery')] %}
+    {% if as_links %}<a class="tab" href="{{ url_for('run_view', run_id=run_id, view=view) }}">{{ label }}</a>
+    {% else %}<button type="button" class="tab{{ ' active' if loop.first }}" data-view="{{ view }}">{{ label }}</button>
+    {% endif %}
+  {% endfor %}
+  {% if run_id %}<a id="changes" class="tab{{ ' active' if as_links }}" href="{{ url_for('run_changes', run_id=run_id) }}"{% if as_links %} aria-current="page"{% endif %}>Changes</a>{% endif %}
+</nav>

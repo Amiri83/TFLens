@@ -1,15 +1,18 @@
 <!doctype html>
+{# The one UI shell: every page of the app (Repos, Runs, Accounts, Settings, Logs, the run
+   analyzer and its tabs, errors) extends this template: dark theme (app.css), one shared
+   top menu, an optional sub-nav under it (the run tabs). #}
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}TFLens{% endblock %} · TFLens</title>
   <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-  <script src="{{ url_for('static', filename='localtime.js') }}" defer></script>
-  <script src="{{ url_for('static', filename='forms.js') }}" defer></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  {% block page_css %}<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">{% endblock %}
 </head>
-<body>
-<header>
+<body data-shell="tflens" class="{% block body_class %}page{% endblock %}">
+<header class="shell-header">
   <span class="brand">{% if managed %}<a href="{{ url_for('tfrepos_page') }}">TFLens</a>{% else %}TFLens{% endif %}</span>
   {% if managed %}
   <nav class="tabs" aria-label="Main">
@@ -26,11 +29,20 @@
   <span class="ctx">static, read-only Terraform analysis · no cloud calls unless a run's AWS check is on · v{{ version }}</span>
   {% endif %}
 </header>
+{% block subnav %}{% endblock %}
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+  <div class="flashes">
+    {% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}
+  </div>
+  {% endif %}
+{% endwith %}
+{% block before_main %}{% endblock %}
 <main>
-  {% for category, message in get_flashed_messages(with_categories=true) %}
-    <div class="flash {{ category }}">{{ message }}</div>
-  {% endfor %}
   {% block content %}{% endblock %}
 </main>
+{% block page_scripts %}{% endblock %}
+<script src="{{ url_for('static', filename='localtime.js') }}" defer></script>
+<script src="{{ url_for('static', filename='forms.js') }}" defer></script>
 </body>
 </html>

@@ -496,7 +496,7 @@ def _summary(
     if environments:
         lines.append(
             _line(
-                f"{_plural(len(environments), 'environment')}: "
+                f"{_plural(len({e['name'] for e in environments}), 'environment')}: "
                 + ", ".join(
                     f"{e['name']}" + (f" ({e['root']})" if e["root"] != "." else "")
                     for e in environments

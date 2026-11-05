@@ -1,11 +1,16 @@
 {% extends "base.html" %}
 {% block title %}Changes · run {{ run.id }}{% endblock %}
+{% block subnav %}
+  <div class="subnav">
+    {% with as_links=True, run_id=run.id %}{% include "_run_subnav.html" %}{% endwith %}
+  </div>
+{% endblock %}
 {% block content %}
-<h1>Changes: run {{ run.id }} <span class="muted small">{{ run.repo }}{% if run.env %} ({{ run.env }}){% endif %}</span></h1>
+<h1>Changes: run {{ run.id }} <span class="muted small">{{ run.repo }}{% if run.env_shown %} ({{ run.env_shown }}){% endif %}</span></h1>
 <form method="get" class="row card">
   <div><label for="base">Compared with</label>
     <select id="base" name="base" data-autosubmit>
-      {% for b in bases %}<option value="{{ b.id }}" {{ 'selected' if base and b.id == base.id }}>run {{ b.id }} · {{ b.env or 'no environment' }} · {{ b.commit_sha[:12] if b.commit_sha else 'no commit' }}</option>{% endfor %}
+      {% for b in bases %}<option value="{{ b.id }}" {{ 'selected' if base and b.id == base.id }}>run {{ b.id }} · {{ b.env_shown or 'no environment' }} · {{ b.commit_sha[:12] if b.commit_sha else 'no commit' }}</option>{% endfor %}
     </select></div>
   <noscript><div><button type="submit">Compare</button></div></noscript>
   <div><a class="btn" href="{{ url_for('run_view', run_id=run.id) }}">Open run {{ run.id }}</a></div>

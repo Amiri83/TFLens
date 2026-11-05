@@ -1,50 +1,24 @@
-/* Settings / Accounts / Repos / Runs / Logs pages: IPLens's style.css (its general
-   part, same variables and WCAG AA colour pairs); the analyzer page has its own app.css. */
+/* Settings / Accounts / Repos / Runs / Logs pages: forms, tables and cards, on top of
+   app.css (the shared shell and the one dark theme: every colour here is one of its
+   variables). The analyzer page does not load this file. */
 :root {
-  --bg: #f6f7f9; --fg: #1f2933; --muted: #535e6b; --card: #fff; --line: #dde2e8;
-  --link: #2457c5; --focus: #2457c5;
-  --used: #3b6fd8; --idle: #e8a33a; --reserved: #8a94a3; --free: #e3e8ee;
-  --ok: #2f8f4e; --warn: #c27c0e; --err: #c0392b;
-  /* header / navigation */
-  --nav-bg: #1f2933; --nav-bg-hover: #2f3a46; --nav-fg: #e4e9ef; --nav-fg-active: #fff;
-  --nav-ctx: #c9d2dc; --nav-accent: #8fb4ff; --nav-warn: #ffd27a;
-  /* badges */
-  --badge-bg: #e8edf3; --badge-fg: #364250;
-  --ok-bg: #e1f3e6; --ok-fg: #1c6634;
-  --warn-bg: #fdf0d9; --warn-fg: #7a4800;
-  --err-bg: #fbe4e1; --err-fg: #a3261a;
+  --muted: var(--fg-faint); --card: var(--bg-panel); --line: var(--border);
+  --link: var(--accent); --err: var(--danger);
+  --badge-bg: var(--bg-hover); --badge-fg: var(--fg-muted);
+  --ok-fg: var(--ok); --warn-fg: var(--warn);
+  --err-bg: var(--danger-bg); --err-fg: var(--danger);
   /* rows greyed out by a rule: visibly muted, still readable */
-  --blocked-bg: #eef0f3; --blocked-fg: #545e69; --blocked-link: #3b5689;
+  --blocked-bg: var(--bg-subtle); --blocked-fg: var(--fg-faint); --blocked-link: var(--accent);
 }
-* { box-sizing: border-box; }
 /* The hidden attribute always wins, even over a display set by a class or element rule. */
 [hidden] { display: none !important; }
-/* typography: the analyzer page's (app.css) — one sans stack at 15px, mono for code */
+/* typography: the analyzer page's (app.css) — one sans stack at 15px, mono for code;
+   the document scrolls here (the analyzer's panes scroll on their own) */
 body { margin: 0; font: 15px/1.6 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-       background: var(--bg); color: var(--fg); }
-:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-header { background: var(--nav-bg); color: var(--nav-fg-active); padding: 0 1.25rem;
-         display: flex; align-items: stretch; gap: 1.5rem; height: 48px; }
-header .brand { font-weight: 700; letter-spacing: .02em; align-self: center; }
-header nav { display: flex; align-self: stretch; }
-header nav a { display: flex; align-items: center; padding: 0 .9rem; color: var(--nav-fg); white-space: nowrap;
-               text-decoration: none; font-weight: 500;
-               border-top: 3px solid transparent; border-bottom: 3px solid transparent; }
-header nav a:hover { color: var(--nav-fg-active); background: var(--nav-bg-hover);
-                     text-decoration: underline; text-underline-offset: 4px; }
-header nav a.active { color: var(--nav-fg-active); font-weight: 700;
-                      border-bottom-color: var(--nav-accent); background: var(--nav-bg-hover); }
-header nav a:focus-visible { color: var(--nav-fg-active); background: var(--nav-bg-hover);
-                             outline: 2px solid var(--nav-accent); outline-offset: -2px; }
-header .ctx { margin-left: auto; align-self: center; color: var(--nav-ctx); font-size: 12px;
-              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-header .ctx b { color: var(--nav-fg-active); }
-header .ctx-warn { color: var(--nav-warn); font-size: 12px; align-self: center; }
-header .account-switch { align-self: center; display: flex; gap: .3rem; }
-header .account-switch select { max-width: 260px; padding: .2rem .4rem; font-size: 12px; }
+       display: block; height: auto; min-height: 100%; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
            clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-main { padding: 1.25rem; max-width: 1400px; margin: 0 auto; }
+main { display: block; padding: 1.25rem; max-width: 1400px; margin: 0 auto; }
 h1 { font-size: 24px; line-height: 1.25; margin: 0 0 1rem; }
 h2 { font-size: 20px; line-height: 1.3; margin: 1.5rem 0 .5rem; }
 a { color: var(--link); }
@@ -65,16 +39,13 @@ tr.blocked td a { color: var(--blocked-link); }
 .badge.err { background: var(--err-bg); color: var(--err-fg); }
 .badge.warn { background: var(--warn-bg); color: var(--warn-fg); }
 a.badge:hover { text-decoration: underline; }
-.flash { padding: .55rem .8rem; border-radius: 5px; margin-bottom: .5rem; }
-.flash.ok { background: var(--ok-bg); } .flash.error { background: var(--err-bg); }
-.flash.warn { background: var(--warn-bg); }
-button, .btn { background: var(--link); color: #fff; border: 0; border-radius: 5px;
+button, .btn { background: var(--link); color: var(--accent-fg); border: 0; border-radius: 5px;
                padding: .4rem .85rem; cursor: pointer; font: inherit; text-decoration: none;
                display: inline-block; }
 button.secondary, .btn.secondary { background: var(--badge-bg); color: var(--fg); }
-button.danger { background: var(--err); }
+button.danger { background: var(--err); color: var(--accent-fg); }
 input, select, textarea { font: inherit; padding: .35rem .5rem; border: 1px solid var(--line);
-                          border-radius: 4px; background: #fff; }
+                          border-radius: 4px; color: var(--fg); background: var(--bg-subtle); }
 label { display: block; font-weight: 600; margin: .6rem 0 .2rem; }
 .row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
 .inline { display: inline; }
@@ -89,15 +60,13 @@ textarea.secret-paste { width: 100%; max-width: 760px; }
 .history-actions { align-items: flex-end; margin-top: .5rem; }
 table.history td:first-child { width: 4.5rem; }
 
-.log-ERROR td, .log-CRITICAL td { background: #fdf0ee; }
-.log-WARNING td { background: #fdf8ec; }
+.log-ERROR td, .log-CRITICAL td { background: var(--danger-bg); }
+.log-WARNING td { background: var(--warn-bg); }
 pre.logmsg { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .run-reason { margin-top: 2px; max-width: 32rem; color: var(--err-fg); word-break: break-word; }
 pre.listing { margin: 4px 0 0; font-size: 11.5px; white-space: pre; overflow-x: auto; max-width: 40rem; }
 
 /* TFLens additions */
-header .brand a { color: inherit; text-decoration: none; }
-header .ctx code { color: var(--nav-fg-active); }
 .mode-note { margin: 0 0 1rem; }
 td.actions { white-space: nowrap; }
 td.actions form, td.actions .btn { margin-right: .25rem; }
@@ -107,22 +76,3 @@ fieldset[data-group] { border: 0; padding: 0; margin: 0; }
 details.env-edit > summary { cursor: pointer; }
 .counts span { margin-right: .6rem; white-space: nowrap; }
 textarea { max-width: 100%; }
-
-/* Discover progress screen (discover.js) */
-.discover-modal { position: fixed; inset: 0; z-index: 1000; display: flex; align-items: flex-start; justify-content: center; padding-top: 6vh; background: rgba(31, 35, 40, .45); }
-.discover-modal[hidden] { display: none; }
-.discover-box { width: min(46rem, 94vw); max-height: 86vh; overflow: auto; padding: 16px 20px; background: #fff; color: #1f2328; border-radius: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, .25); }
-.discover-box h2 { margin: 0 0 8px; font-size: 18px; }
-.discover-phases { margin: 0 0 8px; padding-left: 0; list-style: none; }
-.discover-phases .phase { padding: 3px 6px; border-left: 4px solid #d0d7de; margin-bottom: 2px; }
-.discover-phases .phase.current { border-left-color: #0969da; background: #ddf4ff; font-weight: 600; }
-.discover-phases .phase-done { border-left-color: #1a7f37; }
-.discover-phases .phase-off, .discover-phases .phase-skipped, .discover-phases .phase-not-run { color: #57606a; }
-.discover-phases .phase-cancelled, .discover-phases .phase-failed { border-left-color: #cf222e; }
-.discover-phases .phase-status { font-size: 12px; color: #57606a; font-weight: normal; }
-.discover-now { margin: 6px 0; font-size: 13px; }
-.discover-log { height: 14rem; margin: 0; padding: 6px 8px; overflow: auto; font-size: 12px; white-space: pre-wrap; background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; }
-.discover-messages { margin: 8px 0 0; padding-left: 0; list-style: none; }
-.discover-actions { display: flex; gap: 8px; justify-content: flex-end; margin: 10px 0 0; }
-.discover-badge { position: fixed; right: 16px; bottom: 16px; z-index: 999; padding: 6px 12px; border-radius: 16px; background: #0969da; color: #fff; border: 0; cursor: pointer; max-width: 30rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.discover-badge[hidden] { display: none; }

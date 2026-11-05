@@ -226,7 +226,6 @@
 
   const doc = root.document;
   let icons = {};
-  const instances = new Set();
 
   function el(tag, attrs, ...children) {
     const node = doc.createElement(tag);
@@ -343,7 +342,7 @@
       { selector: "edge.reverse", style: { "source-arrow-shape": "triangle", "target-arrow-shape": "none" } },
       { selector: 'edge[kind = "CONTAINS"]', style: { width: 1.5, "target-arrow-shape": "none", opacity: 0.8 } },
       { selector: "edge.hover", style: { width: 3.5, "z-index": 10 } },
-      // selected: the theme's selection colours (never a fixed light fill in dark mode)
+      // selected: the theme's selection colours
       { selector: "node:selected", style: {
         "border-color": accent, "border-width": 4, "background-color": selBg, color: selFg,
         "text-background-color": selBg, "text-background-opacity": 1 } },
@@ -755,7 +754,6 @@
         }
         drawGrid();
       });
-      instances.add(api);
       loadSaved();
       return cy;
     }
@@ -789,14 +787,9 @@
       say,
       setKinds(kinds) { state.kinds = kinds || []; renderLegend(); },
       refreshLegend: renderLegend,
-      restyle() {
-        if (!state.cy || state.cy.destroyed() || !wrap.isConnected) { instances.delete(api); return; }
-        state.cy.style((o.style || canvasStyle)());
-      },
       view: () => currentView(),
       save: scheduleSave,
       destroy() {
-        instances.delete(api);
         if (state.cy) state.cy.destroy();
         state.cy = null;
       },
@@ -814,7 +807,5 @@
     themeVar,
     setIcons(map) { icons = map || {}; },
     iconUrl,
-    // the theme changed: every canvas takes the new colours
-    restyleAll() { for (const d of [...instances]) d.restyle(); },
   };
 })(typeof window !== "undefined" ? window : globalThis);

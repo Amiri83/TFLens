@@ -215,6 +215,14 @@ def create_app(
     return app
 
 
+def analyzer_page(store: ModelStore) -> str:
+    """The analyzer page of ``store`` outside a request (``Api.handle("GET", "/")``); the
+    app's own routes render the same template."""
+    app = create_app(store=store, testing=True)
+    with app.test_request_context("/"):
+        return render_template("analyzer.html", run_id=None, page_title=store.title)
+
+
 def log_dir_for(paths: AppPaths, settings: Settings) -> Path:
     return Path(settings.log_dir).expanduser() if settings.log_dir else paths.default_log_dir
 
@@ -339,7 +347,7 @@ def _register_standalone(app: Flask) -> None:
     @app.get("/")
     @app.get("/index.html")
     def index():
-        return to_flask(_ext()["api"].handle("GET", "/"))
+        return render_template("analyzer.html", run_id=None, page_title=_ext()["api"].store.title)
 
     @app.route("/api/<path:sub>", methods=["GET", "HEAD", "POST"])
     def api(sub: str):
@@ -932,7 +940,8 @@ def _register_managed(app: Flask) -> None:
 
     @app.get("/runs/<int:run_id>/")
     def run_view(run_id: int):
-        return to_flask(_run_api(run_id).handle("GET", "/"))
+        title = _run_api(run_id).store.title  # 404 when the run has no model
+        return render_template("analyzer.html", run_id=run_id, page_title=title)
 
     @app.route("/runs/<int:run_id>/api/<path:sub>", methods=["GET", "HEAD", "POST"])
     def run_api(run_id: int, sub: str):
