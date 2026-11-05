@@ -185,8 +185,6 @@ ul.overview-lines { list-style: none; padding: 0; margin: 4px 0 8px; }
 .st-failed { color: var(--danger); }
 .st-skipped { color: var(--fg-faint); }
 .st-confirmed { color: var(--ok); font-weight: 600; }
-.st-hint-only { color: var(--warn); font-weight: 600; }
-.st-contradicted { color: var(--danger); font-weight: 600; }
 .failure { padding: 10px 16px; background: var(--danger-bg); border-bottom: 1px solid var(--danger-border); color: var(--fg); }
 h2.rv-section { margin-top: 26px; padding-top: 12px; border-top: 1px solid var(--border); }
 h2.rv-section.first, h2.rv-section:first-child { margin-top: 4px; border-top: 0; padding-top: 0; }
@@ -196,8 +194,6 @@ h2.rv-section.first, h2.rv-section:first-child { margin-top: 4px; border-top: 0;
   border: 1px solid var(--border); border-radius: 999px; background: var(--bg-subtle); color: var(--fg);
 }
 .chip.env.st-confirmed { border-color: var(--ok); background: var(--ok-bg); }
-.chip.env.st-hint-only, .chip.st-hint-only { border-color: var(--warn-border); background: var(--warn-bg); }
-.chip.env.st-contradicted, .chip.st-contradicted { border-color: var(--danger-border); background: var(--danger-bg); }
 details.drilldown { border: 1px solid var(--border); border-radius: var(--radius); padding: 6px 12px; margin: 8px 0; background: var(--bg-panel); }
 details.drilldown > summary { cursor: pointer; font-weight: 600; }
 details.all-resources-ov > summary { cursor: pointer; font-weight: 600; font-size: 15px; }
@@ -382,7 +378,6 @@ td.matrix-cell.not-wired { opacity: .75; }
 }
 .stack-card .card-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .stack-card h3 { margin: 0; font-size: 16px; text-transform: none; letter-spacing: 0; font-family: var(--mono); overflow-wrap: anywhere; }
-.stack-card .card-purpose { margin: 0; }
 .stack-card dl.card-facts { grid-template-columns: 130px 1fr; gap: 6px 10px; margin: 4px 0; }
 .stack-card dl.card-facts dt { font-size: 12px; text-transform: uppercase; letter-spacing: .3px; padding-top: 2px; }
 .stack-card ul.card-list { list-style: none; margin: 0; padding: 0; }
@@ -413,8 +408,4 @@ td.matrix-cell.not-wired { opacity: .75; }
 .discover-form.hidden { display: none; }
 .discover-form button { padding: 4px 12px; border-radius: 6px; border: 0; background: #2da44e; color: #fff; font-weight: 600; }
 table.validation td { vertical-align: top; }
-details.contradicted-group { margin: var(--sp-2) 0; }
-details.contradicted-group > summary { cursor: pointer; color: var(--fg-muted); }
-pre.discovery-tree { max-width: none; max-height: 70vh; overflow: auto; }
-#discovery { padding: 16px 24px; overflow: auto; height: 100%; }
 pre.listing { font: 13px/1.5 var(--mono); padding: 10px 12px; background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--radius); }

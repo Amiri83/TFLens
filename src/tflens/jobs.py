@@ -39,10 +39,11 @@ class JobFailed(RuntimeError):
 
 
 class Job:
-    def __init__(self, key: str, label: str) -> None:
+    def __init__(self, key: str, label: str, auto: bool = False) -> None:
         self.id = secrets.token_hex(8)
         self.key = key
         self.label = label
+        self.auto = auto  # nobody asked for it: the progress screen stays out of the way
         self.started = time.monotonic()
         self.ended: float | None = None
         self.state = "running"  # running | done | cancelled | error
@@ -69,6 +70,7 @@ class Job:
                 "id": self.id,
                 "key": self.key,
                 "label": self.label,
+                "auto": self.auto,
                 "running": self.running,
                 "state": self.state,
                 "cancel_requested": self.cancel_event.is_set(),
@@ -136,14 +138,16 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
 
-    def start(self, key: str, label: str, work: Work, *, background: bool = True) -> dict[str, Any]:
+    def start(
+        self, key: str, label: str, work: Work, *, background: bool = True, auto: bool = False
+    ) -> dict[str, Any]:
         """Start ``work`` (raises :class:`JobBusy` while a job of ``key`` runs). Without
         ``background`` the job runs to the end in the caller's thread."""
         with self._lock:
             for j in self._jobs.values():
                 if j.key == key and j.running:
                     raise JobBusy(j.status())
-            job = Job(key, label)
+            job = Job(key, label, auto)
             self._jobs[job.id] = job
             self._prune()
         if background:
@@ -209,6 +213,15 @@ class JobManager:
             return None
         running = [j for j in jobs if j.running]
         return (running or sorted(jobs, key=lambda j: j.started))[-1].status()
+
+    def latest_running(self) -> dict[str, Any] | None:
+        """The running job to follow on a page about every repository: the latest one
+        somebody asked for, else the latest automatic one."""
+        with self._lock:
+            running = [j for j in self._jobs.values() if j.running]
+        if not running:
+            return None
+        return max(running, key=lambda j: (not j.auto, j.started)).status()
 
     def cancel(self, job_id: str, key: str | None = None) -> bool:
         job = self.get(job_id, key)

@@ -394,7 +394,8 @@ def test_environments_are_detected_and_edits_are_kept(client, tmp_path):
     assert envs[("uat", "stacks/shared")]["var_files"] == ["stacks/shared/vars/uat.tfvars"]
     assert envs[("uat", "stacks/shared")]["confirmed"] == 1
     assert envs[("prod", "stacks/shared")]["present"] == 0
-    assert "no longer found" in client.get(f"/repos/{repo_id}").data.decode()
+    page = client.get(f"/repos/{repo_id}").data.decode()
+    assert "stacks/shared/vars/prod.tfvars" not in page  # no real file: not shown any more
 
 
 def test_failed_runs_are_listed_with_their_reason(client, tmp_path):

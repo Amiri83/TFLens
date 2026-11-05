@@ -525,8 +525,8 @@ def column_order(name: str) -> tuple[int, str]:
 
 
 def scope_counts(model: dict[str, Any]) -> dict[str, int]:
-    """The one count of stacks and environments every view shows (header, tables, debug
-    sections). ``stacks``: the model's stacks, without the reusable modules nothing calls
+    """The one count of stacks and environments every view shows (header and tables).
+    ``stacks``: the model's stacks, without the reusable modules nothing calls
     (``library_stacks``); ``environments``: the confirmed environment names (``dev`` in two
     stacks is one); ``stack_environments``: one per stack that has one (table rows)."""
     every = model.get("stacks") or []

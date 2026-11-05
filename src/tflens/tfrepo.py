@@ -1,8 +1,9 @@
 """Terraform repositories, their environments, git sync and analysis runs.
 
 A repository is a local directory or a git URL (+ branch, + sub-directory). **Sync** of a
-git repository is the only network operation TFLens performs, and only on an explicit
-Sync: a shallow ``git clone --depth 1`` into ``repos/<id>`` of the data directory, run
+git repository is the only network operation TFLens performs, on an explicit Sync or when
+the first run of a repository needs its clone: a shallow ``git clone --depth 1`` into
+``repos/<id>`` of the data directory, run
 with an explicit argv (no shell), no terminal prompt and no askpass helper. Git
 authentication is the SSH agent, an SSH key file, or a token: the token is stored
 Fernet-encrypted, decrypted only into the child process's environment
@@ -18,6 +19,7 @@ repository and writes ``model.json`` / ``report.md`` under ``out/<repo>/<run>/``
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -30,9 +32,11 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from . import __version__
 from .logging_setup import redact
 
 UTC = timezone.utc
@@ -396,7 +400,7 @@ def list_repos(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [
         public_repo(dict(r))
         for r in conn.execute(
-            "SELECT p.*, (SELECT COUNT(*) FROM tf_repo_envs e WHERE e.repo_id = p.id) AS envs, "
+            "SELECT p.*, (SELECT COUNT(*) FROM tf_repo_envs e WHERE e.repo_id = p.id AND e.present) AS envs, "
             "(SELECT COUNT(*) FROM runs r WHERE r.repo_id = p.id) AS runs, "
             "(SELECT MAX(r.ts) FROM runs r WHERE r.repo_id = p.id) AS last_run "
             "FROM tf_repos p ORDER BY p.name, p.id"
@@ -824,6 +828,32 @@ def env_scope(env: dict[str, Any] | None) -> str | None:
     return None if scope == "." else scope
 
 
+@cache
+def code_version() -> str:
+    """The TFLens code running now: its version and a hash of its Python sources (the
+    version alone does not change with every commit). Read once: code changes need a restart."""
+    digest = hashlib.sha256()
+    package = Path(__file__).parent
+    for path in sorted(package.rglob("*.py")):
+        digest.update(path.relative_to(package).as_posix().encode())
+        digest.update(path.read_bytes())
+    return f"{__version__}+{digest.hexdigest()[:16]}"
+
+
+def stale_repos(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """The repositories whose latest run was made by other TFLens code. A repository never
+    run stays untouched: its first run is asked for."""
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT p.* FROM tf_repos p JOIN runs r ON r.id = "
+            "(SELECT MAX(id) FROM runs WHERE repo_id = p.id) "
+            "WHERE r.code_version != ? ORDER BY p.name, p.id",
+            (code_version(),),
+        )
+    ]
+
+
 def create_run(
     conn: sqlite3.Connection,
     repo: dict[str, Any],
@@ -983,7 +1013,7 @@ def _insert_run(
         commit = head_commit(Path(repo["path"])) if Path(repo["path"]).is_dir() else ""
     cur = conn.execute(
         "INSERT INTO runs(ts, repo_id, repo, env_id, env, commit_sha, summary, model_path, "
-        "root_path, status, error) VALUES(?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?)",
+        "root_path, status, error, code_version) VALUES(?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)",
         (
             _now(),
             repo["id"],
@@ -995,6 +1025,7 @@ def _insert_run(
             str(root) if root else "",
             status,
             error,
+            code_version(),
         ),
     )
     return int(cur.lastrowid or 0)

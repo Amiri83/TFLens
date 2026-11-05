@@ -385,6 +385,5 @@ def test_front_end_renders_the_new_sections():
         "selectStackEnv(",
         "api/env?stack=",
         "nodeExtras(",
-        "ov.docs_diff",
     ):
         assert needed in js

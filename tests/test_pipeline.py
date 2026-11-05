@@ -26,7 +26,7 @@ from tflens.pipeline import (
     tree_lines,
 )
 from tflens.web import create_app
-from tflens.webapi import Api, ModelStore, env_debug
+from tflens.webapi import Api, ModelStore
 
 ENV_NAMES = ("dev", "intg", "uat", "prod")
 _ENV_MENTION = re.compile(r"\b(dev|intg|uat|prod|qa|staging|sandbox|perf|demo|dr|test)\b")
@@ -163,25 +163,23 @@ def test_stack_and_link_hints_are_validated(tmp_path):
     assert links["network -> app"]["status"] == HINT_ONLY
 
 
-# -- item 6: environment debug list grouped by environment with an evidence count ----------
+# -- item 6: one validation item per environment, with an evidence count ---------------------
 
 
-def test_env_debug_is_grouped_by_environment(model):
-    dbg = env_debug(model)
-    names = [g["env"] for g in dbg["groups"]]
-    assert len(names) == len(set(names))  # one line per environment, not per mention
-    assert dbg["confirmed"] == 4
-    dev = next(g for g in dbg["groups"] if g["env"] == "dev")
+def test_validation_has_one_item_per_environment(model):
+    items = model["pipeline"]["validation"]["envs"]
+    names = [e["name"] for e in items]
+    assert len(names) == len(set(names))  # one per environment, not per mention
+    dev = next(e for e in items if e["name"] == "dev")
     assert dev["status"] == CONFIRMED and dev["evidence_count"] == 2
-    assert dev["hint_mentions"] > 5 and len(dev["hint_sources"]) <= 10
-    assert names[:4] == sorted(ENV_NAMES)  # confirmed first
+    assert dev["hint_mentions"] > 5
 
 
-def test_environments_view_has_the_grouped_list(noise):
+def test_environments_view_lists_the_confirmed_ones_only(noise):
     api = Api(ModelStore(noise))
     envs = json.loads(api.handle("GET", "/api/environments").body)
-    assert envs["env_debug"]["confirmed"] == 4
-    assert len(envs["environments"]) == 4
+    assert "env_debug" not in envs
+    assert sorted(r["id"] for r in envs["environments"]) == sorted(ENV_NAMES)
 
 
 # -- item 5: render from confirmed data only -----------------------------------------------
@@ -325,7 +323,7 @@ def test_job_progress_and_clean_cancel(noise, tmp_path):
     gate, release = threading.Event(), threading.Event()
 
     def work(ctx):
-        ctx.phase("crawl", "Crawl + hypothesis")
+        ctx.phase("crawl", "Crawl")
         gate.set()
         release.wait(5)
         store.discover(ctx)  # stops at its first step: cancel was requested
@@ -359,8 +357,8 @@ def test_standalone_discover_api(noise, tmp_path):
     assert final["state"] == "done", final
     assert all(p["status"] in ("done", "off") for p in final["phases"])
     assert out.is_file() and json.loads(out.read_text())["pipeline"]["validation"]
-    disc = json.loads(api.handle("GET", "/api/discovery").body)
-    assert disc["available"] and disc["aws"]["status"] == "off"
+    assert api.handle("GET", "/api/discovery").status == 404
+    assert json.loads(api.handle("GET", "/api/overview").body)["aws"] is None  # it was off
     job = json.loads(api.handle("GET", "/api/job").body)
     assert job["aws"]["available"] is False and "no AWS account" in job["aws"]["reason"]
     # a recorded run is read-only
@@ -376,9 +374,9 @@ def test_index_has_one_discover_entry_point_with_progress(noise):
         'id="discover-cancel"',
         'id="discover-log"',
         'id="discover-phases"',
-        'data-view="discovery"',
     ):
         assert part in index
+    assert 'data-view="discovery"' not in index
     assert 'id="regenerate"' not in index
 
 
@@ -422,7 +420,7 @@ def test_managed_discover_job(client, noise):
     assert client.get(f"/repos/{repo_id + 1}/jobs/{job_id}").status_code == 404
     run_url = status["result"]["url"]
     envs = client.get(run_url + "api/environments").get_json()
-    assert len(envs["environments"]) == 4 and envs["env_debug"]["confirmed"] == 4
+    assert len(envs["environments"]) == 4 and envs["counts"]["environments"] == 4
     db = client.application.extensions["tflens"]["paths"].db_path
     with closing(db) as conn:
         names = sorted(e["env"] for e in tfrepo.list_envs(conn, repo_id))

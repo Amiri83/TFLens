@@ -168,6 +168,20 @@ def build_overview(
     return out
 
 
+def confirmed_overview(ov: dict[str, Any]) -> dict[str, Any]:
+    """The overview the UI shows: what the code says. The sections read from docs, CI and
+    the git log (and the guess built on them) stay in the Markdown reports only."""
+    return {
+        **ov,
+        "purpose": [],
+        "structure": [],
+        "docs": [],
+        "docs_diff": [],
+        "ci": [],
+        "history": None,
+    }
+
+
 def _label(n: dict[str, Any]) -> str:
     props = n["properties"]
     for key in ("function_name", "bucket", "name"):

@@ -87,7 +87,7 @@
   }
 
   // ------------------------------------------------------------ views
-  const VIEWS = ["environments", "roots", "flow", "overview", "graph", "repo", "diagrams", "discovery"];
+  const VIEWS = ["environments", "roots", "flow", "overview", "graph", "repo", "diagrams"];
   let graphFitted = false; // the graph is laid out while hidden: fit it when first shown
 
   function setView(view) {
@@ -248,45 +248,6 @@
     return el("table", { class: "env-stacks" }, el("thead", {}, head), el("tbody", {}, ...rows));
   }
 
-  // Debug, grouped by environment: one line per environment with its status, the number
-  // of real files that are its evidence and how many times docs / CI / git mention it
-  // (hints, never evidence); its files and a few hint sources inside. The rejected
-  // candidate files are one group of their own. Never one line per doc mention.
-  function envFilesDebug(envs) {
-    const dbg = envs.env_debug || { groups: [], rejected: [] };
-    const groups = dbg.groups.map((g) => {
-      const cls = g.status === "confirmed" ? "ov-line" : "ov-line st-unknown";
-      const mentions = g.hint_mentions ? ` · ${g.hint_mentions} mention(s) in ${g.hint_via.join(", ")} (hints)` : " · not mentioned in docs / CI";
-      const where = g.stacks.length ? ` · ${g.stacks.length} stack(s): ${g.stacks.join(", ")}` : "";
-      const head = `${g.env} — ${g.status} · ${g.evidence_count} evidence file(s)${where}${mentions}`;
-      const items = g.files.map((t) => el("li", { class: "ov-line" },
-        locLink({ file: t.file, start_line: 1, end_line: 1 }), ` — ${t.kind} (stack ${t.stack}): ${t.reason}`));
-      for (const f of g.evidence.filter((f) => !g.files.some((t) => t.file === f))) {
-        items.push(el("li", { class: "ov-line" }, locLink({ file: f, start_line: 1, end_line: 1 })));
-      }
-      if (g.reason && g.status !== "confirmed") items.push(el("li", { class: "ov-line st-unknown" }, g.reason));
-      if (g.hint_sources.length) {
-        items.push(el("li", { class: "ov-line muted" }, `hint sources (first ${g.hint_sources.length} of ${g.hint_mentions}): ` +
-          g.hint_sources.map((h) => (h.line ? `${h.file}:${h.line}` : h.file)).join(", ")));
-      }
-      return el("details", { class: "drilldown env-group", "data-env": g.env, "data-status": g.status },
-        el("summary", { class: `mono ${cls}` }, head), el("ul", { class: "overview-lines" }, ...items));
-    });
-    if (dbg.rejected.length) {
-      groups.push(el("details", { class: "drilldown env-group", "data-env": "" },
-        el("summary", { class: "mono" }, `rejected candidate files — ${dbg.rejected.length}`),
-        el("ul", { class: "overview-lines" }, ...dbg.rejected.map((r) => el("li", { class: "ov-line st-unknown" },
-          locLink({ file: r.file, start_line: 1, end_line: 1 }), ` (stack ${r.stack}): ${r.reason}`)))));
-    }
-    const noEnv = (envs.stacks || []).filter((s) => s.no_env_reason && !s.library);
-    if (noEnv.length) {
-      groups.push(el("ul", { class: "overview-lines" }, ...noEnv.map((s) =>
-        el("li", { class: "ov-line st-unknown" }, `${s.id}: no environment — ${s.no_env_reason}`))));
-    }
-    if (!groups.length) groups.push(el("p", { class: "muted" }, "no environment files"));
-    return el("div", { class: "env-debug" }, ...groups);
-  }
-
   function stackLinksList(envs) {
     return el("ul", { class: "overview-lines" }, ...envs.stack_links.map((l) => {
       const target = l.to_stack ? `stack ${l.to_stack}${l.env ? ` (${l.env})` : ""}` : `${l.backend} state outside this repository`;
@@ -311,16 +272,14 @@
   function envFilesTable(envs) {
     const stacked = multiStack(envs);
     const head = el("tr", {}, el("th", {}, "Environment"), stacked ? el("th", {}, "Stack") : null, el("th", {}, "Wired"),
-      el("th", {}, "tfvars"), el("th", {}, "Backend config"), el("th", {}, "CI / script lines"));
+      el("th", {}, "tfvars"), el("th", {}, "Backend config"));
     const rows = envs.environments.map((r) => {
-      const ci = r.var_file_cli.map((u) => el("div", {}, `${u.flag}=${u.value} `, locLink(u.location)));
       const wired = r.wired
         ? el("td", { title: r.wiring.join("; ") }, "yes")
         : el("td", { class: "st-unknown", title: r.not_wired_reason || "" }, "not wired");
       return el("tr", { class: `env-row${isShown(envs, r.id) ? " active" : ""}${r.wired ? "" : " not-wired"}`, "data-env": r.id },
         el("td", {}, envButton(envs, r.id)), stacked ? el("td", { class: "mono" }, r.stack || "—") : null, wired,
-        el("td", {}, ...fileLinks(r.var_files)), el("td", {}, ...fileLinks(r.backend_hcl)),
-        el("td", {}, ...(ci.length ? ci : [el("span", { class: "muted" }, "—")])));
+        el("td", {}, ...fileLinks(r.var_files)), el("td", {}, ...fileLinks(r.backend_hcl)));
     });
     return el("table", { class: "env-files" }, el("thead", {}, head), el("tbody", {}, ...rows));
   }
@@ -459,18 +418,13 @@
         el("p", { class: "muted" }, `Each root with its own state is a stack; its environments are the tfvars / backend configurations bound to it (the nearest root above them).${library}`),
         stacksTable(envs));
     }
-    if ((envs.stacks || []).length) {
-      section("env-debug", `Environments (debug): ${counts.environments} confirmed`,
-        el("p", { class: "muted" }, "Grouped by environment. Evidence = real tfvars / backend-<env>.hcl / environment directory files in a stack's tree; docs, CI and git mentions are hints and never create an environment."),
-        envFilesDebug(envs));
-    }
     if ((envs.stack_links || []).length) {
       section("env-links", "Links between stacks (remote state)", stackLinksList(envs));
     }
     if (envs.environments.length) {
       if (envs.not_wired.length) {
         parts.push(el("p", { class: "st-unknown" },
-          `Not wired: ${envs.not_wired.join(", ")} — tfvars only (no backend configuration, no CI / script line uses it); still analyzed.`));
+          `Not wired: ${envs.not_wired.join(", ")} — tfvars only; still analyzed.`));
       }
       section("env-files", `Detected environments (${counts.environments})`,
         counts.stack_environments !== counts.environments
@@ -524,21 +478,11 @@
     select.disabled = !envs.switchable;
   }
 
-  // The validation status of an environment name (confirmed / hint-only / contradicted).
-  function envStatus(envs, name) {
-    const g = ((envs.env_debug || {}).groups || []).find((x) => x.env === name);
-    return g ? g.status : "confirmed";
-  }
-
-  function confirmedColumns(envs) {
-    return envColumns(envs).filter((c) => envStatus(envs, c.name || c.id) === "confirmed");
-  }
-
   function sumCounts(counts) {
     return Object.values(counts || {}).reduce((a, b) => a + b, 0);
   }
 
-  // One row per stack, one column per confirmed environment: the instances that stack
+  // One row per stack, one column per environment: the instances that stack
   // creates there with its own tfvars (hover a number for the types).
   function stackCountsTable(envs, columns) {
     const names = columns.map((c) => c.name || c.id);
@@ -565,11 +509,9 @@
     // the default view: only the final, validated results
     toc.push(["ov-confirmed", "Confirmed results"]);
     parts.push(el("h2", { id: "ov-confirmed", class: "rv-section" }, "Confirmed results"));
-    const cols = envs ? confirmedColumns(envs) : [];
+    const cols = envs ? envColumns(envs) : [];
     if (envs && cols.length) {
-      const dropped = envColumns(envs).length - cols.length;
-      parts.push(el("p", { class: "muted" }, `${cols.length} confirmed environment(s), each analyzed with its own tfvars: only what its count / for_each / conditionals create is counted.` +
-        (dropped ? ` ${dropped} unconfirmed environment(s) left out (see Details).` : "")));
+      parts.push(el("p", { class: "muted" }, `${cols.length} confirmed environment(s), each analyzed with its own tfvars: only what its count / for_each / conditionals create is counted.`));
       toc.push(["ov-env-counts", "Counts per environment"]);
       parts.push(el("h3", { id: "ov-env-counts" }, "Counts per environment"), envCountsTable(envs, cols));
       if ((envs.stacks || []).filter((s) => !s.library && s.environments.length).length) {
@@ -583,20 +525,14 @@
           el("tbody", {}, el("tr", {}, ...(envs.types || []).map((t) => el("td", { class: "num" },
             countText((cur.counts || {})[t.type] || 0, (cur.uncertain || {})[t.type] || 0))), el("td", { class: "num" }, String(cur.unknown_count || 0))))));
     }
-    // everything else (guesses, why-chains, per-root explanations) behind one toggle
+    // everything else (why-chains, per-root explanations) behind one toggle
     const details = [];
     const dsec = (id, title, ...content) => {
       toc.push([id, title]);
       details.push(el("h2", { id, class: "rv-section" }, title), ...content);
     };
-    if (ov.purpose && ov.purpose.length) dsec("ov-purpose", "Purpose (guess)", overviewList(ov.purpose));
     dsec("ov-top", "What this repository deploys", overviewList(ov.summary));
-    if (envs && envs.environments.length) {
-      details.push(...envUnknowns(envs));
-      if (cols.length < envColumns(envs).length) {
-        dsec("ov-env-all", "All detected environments (confirmed or not)", envCountsTable(envs));
-      }
-    }
+    if (envs && envs.environments.length) details.push(...envUnknowns(envs));
     if (ov.inventory) {
       // a failed analysis: what is in the repository is the result worth showing
       parts.push(el("h3", {}, "What is in the repository"), inventoryTable(ov.inventory));
@@ -615,28 +551,23 @@
       details.push(allResources(ov, "all-resources-ov", "ov-res", false));
     }
     if (ov.environments.length) dsec("ov-envs", "Environments", overviewList(ov.environments));
-    if (ov.docs && ov.docs.length) dsec("ov-docs", "Documentation", overviewList(ov.docs));
-    if (ov.docs_diff && ov.docs_diff.length) {
-      dsec("ov-docs-diff", "Docs vs code",
-        el("p", { class: "muted" }, "Resources the Markdown files name that the code does not declare, and resources the code declares that no Markdown file mentions (by address or type)."),
-        overviewList(ov.docs_diff));
-    }
-    if (ov.ci && ov.ci.length) dsec("ov-ci", "CI / CD and lock files", overviewList(ov.ci));
-    if (ov.history) {
-      dsec("ov-hist", "History", overviewList(ov.history.summary));
-      if (ov.history.hot_files.length) {
-        details.push(el("h3", {}, "Most-changed files"), overviewList(ov.history.hot_files));
-      }
-      if (ov.history.commits.length) {
-        details.push(el("h3", {}, "Recent commits"), overviewList(ov.history.commits));
-      }
-    }
-    dsec("ov-disc", "Discovery", overviewList(ov.discovery));
+    if (ov.aws) dsec("ov-aws", "AWS check", ...awsCheck(ov.aws));
+    dsec("ov-files", "Files read", overviewList(ov.discovery));
     parts.push(el("details", { class: "ov-details", id: "ov-details" },
-      el("summary", {}, "Details — purpose (guess), what it deploys, per-root explanations, resources, docs, CI, history"),
+      el("summary", {}, "Details — what it deploys, per-root explanations, resources, files read"),
       ...details));
     box.replaceChildren(...parts);
     document.getElementById("toc").replaceChildren(...tocLinks(toc));
+  }
+
+  // The optional read-only check of a run in AWS: what it found, never a guess.
+  function awsCheck(aws) {
+    const parts = [el("p", { class: aws.status === "done" ? "" : "muted" }, `${aws.status}: ${aws.message}`)];
+    if (aws.checks.length) {
+      parts.push(el("ul", { class: "overview-lines" }, ...aws.checks.map((c) => el("li", { class: c.status === "exists" ? "ov-line" : "ov-line st-unknown" },
+        link(c.id, () => showDetail("node", c.id)), ` ${c.name}: ${c.status}${c.detail ? ` (${c.detail})` : ""}`))));
+    }
+    return parts;
   }
 
   // The resource inventory, collapsed: the flows come first.
@@ -792,12 +723,8 @@
   }
 
   function stackCard(c) {
-    const p = c.purpose || {};
-    const purpose = p.text
-      ? el("p", { class: "card-purpose" }, p.text, " ", el("span", { class: "tag" }, "from ", locLink(p.location)))
-      : el("p", { class: "muted card-purpose" }, `Purpose not shown: ${p.note || "not confirmed"}.`);
     const envs = c.environments.length
-      ? c.environments.map((e) => chip(e.name, `env st-${e.status}`, { title: e.status }))
+      ? c.environments.map((e) => chip(e.name, "env"))
       : [el("span", { class: "muted" }, "none (variable defaults)")];
     const perEnv = Object.entries(c.backend.per_env || {});
     const backend = perEnv.length
@@ -825,9 +752,7 @@
     return el("article", { class: "stack-card", "data-stack": c.id },
       el("div", { class: "card-head" },
         el("h3", {}, link(c.id, () => c.node && showDetail("node", c.node))),
-        c.status !== "confirmed" ? chip(c.status, `st-${c.status}`) : null,
         c.layout ? el("span", { class: "tag" }, c.layout) : null),
-      purpose,
       el("dl", { class: "card-facts" },
         el("dt", {}, "Environments"), el("dd", { class: "chips" }, ...envs),
         el("dt", {}, "Backend"), el("dd", {}, backend),
@@ -844,7 +769,7 @@
   function stackCards() {
     if (!cardsData.length) return [];
     return [el("h2", { id: "rv-stacks", class: "rv-section first" }, `Stacks (${cardsData.length})`),
-      el("p", { class: "muted" }, "Resources are the blocks each stack declares, by type. The purpose comes from the stack's own README, and only once the stack is confirmed."),
+      el("p", { class: "muted" }, "Resources are the blocks each stack declares, by type."),
       el("div", { class: "stack-cards" }, ...cardsData.map(stackCard))];
   }
 
@@ -1549,9 +1474,7 @@
 
   function renderDiagrams() {
     const box = document.getElementById("diagrams");
-    const parts = [el("p", {},
-      el("a", { class: "link", href: "api/handoff?download=1", download: "handoff.md" }, "Download handoff.md"),
-      " — the overview and these diagrams (Mermaid) in one file, for Claude Code.")];
+    const parts = [];
     for (const [name, title, note] of DIAGRAMS) {
       let body;
       if (name === "env-matrix") body = envMatrixBox();
@@ -1664,7 +1587,7 @@
       // stacks without that environment always last, whatever the direction
       rows.sort((a, b) => (!keyOf(a) - !keyOf(b)) || state.dir * keyOf(a).localeCompare(keyOf(b)));
       const head = el("tr", {}, header("Stack", "stack"),
-        ...cols.map((c) => header(c.name, c.name, `${c.name} (${c.status}) — sort by its backend`)));
+        ...cols.map((c) => header(c.name, c.name, `${c.name} — sort by its backend`)));
       if (!cols.length) head.append(el("th", {}, "Backend (no environment)"));
       const body = rows.map((r) => el("tr", { "data-stack": r.stack },
         el("th", { scope: "row", class: "matrix-stack" },
@@ -1815,95 +1738,15 @@
     return el("div", { class: "diagram-panel" }, bar, view);
   }
 
-  // ------------------------------------------------------------ discovery
-  function statusTag(status) {
-    return el("span", { class: `tag st-${status}` }, status);
-  }
-
-  function hintSources(it) {
-    if (!it.hint_sources || !it.hint_sources.length) return null;
-    return el("details", { class: "small" }, el("summary", {}, `${it.hint_mentions} mention(s) in ${it.via.join(", ")}`),
-      el("ul", { class: "overview-lines" }, ...it.hint_sources.map((h) => el("li", { class: "ov-line" },
-        h.line ? locLink({ file: h.file, start_line: h.line, end_line: h.line }) : h.file, ` — ${h.text}`))));
-  }
-
-  function validationRows(items, label) {
-    const head = el("tr", {}, el("th", {}, label), el("th", {}, "Status"), el("th", {}, "Evidence (code)"), el("th", {}, "Hints (docs / CI / git)"));
-    const rows = items.map((it) => el("tr", { class: `val-row val-${it.status}`, "data-name": it.name },
-      el("td", { class: "mono" }, it.name), el("td", {}, statusTag(it.status)),
-      el("td", {}, it.reason || ""), el("td", {}, hintSources(it) || el("span", { class: "muted" }, "none"))));
-    return el("table", { class: "validation" }, el("thead", {}, head), el("tbody", {}, ...rows));
-  }
-
-  // Contradicted items, collapsed behind their count: they are noise until asked for.
-  function contradictedGroup(items, content) {
-    return items.length
-      ? el("details", { class: "contradicted-group" }, el("summary", {}, `${items.length} contradicted`), content(items))
-      : null;
-  }
-
-  function validationTable(items, label) {
-    const shown = items.filter((it) => it.status !== "contradicted");
-    const hidden = items.filter((it) => it.status === "contradicted");
-    return el("div", {}, shown.length || !hidden.length ? validationRows(shown, label) : null,
-      contradictedGroup(hidden, (group) => validationRows(group, label)));
-  }
-
-  function mismatchLines(items) {
-    return el("ul", { class: "overview-lines" }, ...items.map((m) => el("li", { class: "ov-line st-unknown" },
-      statusTag(m.status), ` ${m.kind} `, el("span", { class: "mono" }, m.name), `: ${m.text} `, m.location ? locLink(m.location) : null)));
-  }
-
-  function renderDiscovery(d) {
-    const box = document.getElementById("discovery");
-    if (!d.available) {
-      box.replaceChildren(el("p", { class: "muted" }, d.note));
-      document.getElementById("discovery-toc").replaceChildren();
-      return;
-    }
-    const toc = [];
-    const parts = [];
-    const section = (id, title, ...content) => {
-      toc.push([id, title]);
-      parts.push(el("h2", { id, class: "rv-section" }, title), ...content.filter(Boolean));
-    };
-    section("dc-phases", "Phases", el("ol", { class: "overview-lines" }, ...d.phases.map((p) =>
-      el("li", { class: "ov-line" }, el("b", {}, p.label), ` — ${p.status}${p.detail ? `: ${p.detail}` : ""}`))));
-    const v = d.validation;
-    const openMismatches = v.mismatches.filter((m) => m.status !== "contradicted");
-    section("dc-mismatch", `Docs vs code (${v.mismatches.length})`, v.mismatches.length
-      ? el("div", {}, openMismatches.length ? mismatchLines(openMismatches) : null,
-        contradictedGroup(v.mismatches.filter((m) => m.status === "contradicted"), mismatchLines))
-      : el("p", { class: "muted" }, "None: docs, CI and the code agree."));
-    section("dc-envs", `Environments (${d.counts.environments} confirmed)`, validationTable(v.envs, "Environment"));
-    // directories the docs name that hold stacks are not stacks of their own
-    const dirs = v.stacks.filter((s) => s.role === "directory");
-    section("dc-stacks", `Stacks (${d.counts.stacks})`, validationTable(v.stacks.filter((s) => s.role !== "directory"), "Stack"),
-      dirs.length ? el("h3", {}, "Directories named in docs / CI, holding stacks") : null,
-      dirs.length ? validationRows(dirs, "Directory") : null);
-    section("dc-links", "Links between stacks", v.links.length ? validationTable(v.links, "Link") : el("p", { class: "muted" }, "None."));
-    const aws = d.aws;
-    section("dc-aws", "AWS check", el("p", { class: aws.status === "done" ? "" : "muted" }, `${aws.status}: ${aws.message}`),
-      aws.checks.length ? el("ul", { class: "overview-lines" }, ...aws.checks.map((c) => el("li", { class: c.status === "exists" ? "ov-line" : "ov-line st-unknown" },
-        link(c.id, () => showDetail("node", c.id)), ` ${c.name}: ${c.status}${c.detail ? ` (${c.detail})` : ""}`))) : null);
-    section("dc-hints", `Hint files read (${d.crawl.hint_files.length})`, el("ul", { class: "overview-lines" },
-      ...d.crawl.hint_files.map((h) => el("li", { class: "ov-line" }, `${h.via}: `, locLink({ file: h.file, start_line: 1, end_line: 1 })))));
-    section("dc-tree", `Files (${d.crawl.files}${d.crawl.truncated ? ", truncated" : ""}; ${d.crawl.skipped.length} director(ies) skipped)`,
-      el("pre", { class: "listing discovery-tree" }, d.crawl.tree.join("\n")));
-    box.replaceChildren(...parts);
-    document.getElementById("discovery-toc").replaceChildren(...tocLinks(toc));
-  }
-
   // ------------------------------------------------------------ boot
   async function loadAll() {
-    const [summary, graph, tree, ov, fl, shapes, envs, disc, cards, icons] = await Promise.all(
+    const [summary, graph, tree, ov, fl, shapes, envs, cards, icons] = await Promise.all(
       [api("api/summary"), api("api/graph"), api("api/tree"), api("api/overview"), api("api/flow"),
-        api("api/shapes"), api("api/environments"), api("api/discovery"),
+        api("api/shapes"), api("api/environments"),
         api("api/stack-cards").catch(() => []), api("api/icons").catch(() => null)]);
     // one set of service icons and colours for the Graph, every diagram and the tables
     iconsData = icons;
     if (window.TFDiagram && icons) window.TFDiagram.setIcons(icons.icons);
-    renderDiscovery(disc);
     renderEnvSwitch(envs);
     renderEnvironments(envs);
     renderOverview(ov, envs);
@@ -1927,7 +1770,7 @@
     const s = summary.summary;
     const nodes = Object.values(s.nodes).reduce((a, b) => a + b, 0);
     const f = summary.flow;
-    // the same numbers as the tables and the debug sections (envs.scope_counts)
+    // the same numbers as the tables (envs.scope_counts)
     const { environments: envCount, stacks } = envs.counts;
     const resources = s.nodes.resource || 0;
     const stat = (n, label, cls) => el("span", { class: `sum-stat ${cls || ""}`.trim() }, el("b", {}, String(n)), ` ${label}`);

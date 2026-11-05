@@ -4,7 +4,7 @@
   {% for view, label in [
       ('environments', 'Environments'), ('roots', 'Root view'), ('flow', 'Flow'),
       ('overview', 'Overview'), ('graph', 'Graph'), ('diagrams', 'Diagrams'),
-      ('repo', 'Repository'), ('discovery', 'Discovery')] %}
+      ('repo', 'Repository')] %}
     {% if as_links %}<a class="tab" href="{{ url_for('run_view', run_id=run_id, view=view) }}">{{ label }}</a>
     {% else %}<button type="button" class="tab{{ ' active' if loop.first }}" data-view="{{ view }}">{{ label }}</button>
     {% endif %}

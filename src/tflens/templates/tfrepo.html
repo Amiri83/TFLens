@@ -9,24 +9,23 @@
     {{ repo.synced_at | localtime }}{% if repo.sync_detail %} · <span class="muted">{{ repo.sync_detail }}</span>{% endif %}
     {% if repo.commit_sha %} · commit <span class="mono">{{ repo.commit_sha[:12] }}</span>{% endif %}
   {% else %}<span class="muted">Never synced.</span>{% endif %}
-  {% if repo.source == 'git' and not root_exists %}<span class="badge warn">not cloned yet: Sync first</span>{% endif %}
+  {% if repo.source == 'git' and not root_exists %}<span class="badge warn">not cloned yet: the first run clones it</span>{% endif %}
 </p>
 <form class="inline" method="post" action="{{ url_for('tfrepo_sync', repo_id=repo.id) }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-  <button type="submit">Sync</button>
+  <button type="submit" class="secondary">Sync</button>
   <span class="muted small">{% if repo.source == 'git' %}shallow <span class="mono">git clone --depth 1</span> into
-    <span class="mono">{{ repo.path }}</span> (the only network call TFLens makes){% else %}checks the directory and reads its
-    git commit; nothing is written{% endif %}</span>
+    <span class="mono">{{ repo.path }}</span> (the only network call TFLens makes), needed only for the repository's new
+    commits{% else %}checks the directory and reads its git commit; nothing is written; a run does not need it{% endif %}</span>
 </form>
 
 <section class="card discover-card" id="discover">
-  <h2 style="margin-top: 0">Discover</h2>
+  <h2 style="margin-top: 0">New run</h2>
   <form method="post" action="{{ url_for('tfrepo_discover', repo_id=repo.id) }}" data-discover>
     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-    <p class="muted small">One run, four phases: <b>1. Crawl + hypothesis</b> (every file listed; docs, CI and the
-      git log read as hints only) → <b>2. Validate</b> (each hint confirmed against .tf / .tfvars / backend files;
-      docs and CI never create an environment) → <b>3. AWS</b> (optional, read-only) → <b>4. Render</b> (inventory per
-      environment, diagrams, graph from confirmed data only). The run is recorded and opens in the analyzer.</p>
+    <p class="muted small">One run, four phases: <b>1. Crawl</b> (every file listed) → <b>2. Validate</b> (against .tf /
+      .tfvars / backend files) → <b>3. AWS</b> (optional, read-only) → <b>4. Render</b> (inventory per environment,
+      diagrams, graph from confirmed data only). The run is recorded and opens in the analyzer.</p>
     <p>
       {% set usable = accounts | rejectattr('problem') | list %}
       <label class="check"><input type="checkbox" name="aws" value="1" id="discover-aws" {{ 'disabled' if not usable }}>
@@ -39,21 +38,21 @@
         <span class="muted small">no usable AWS account: <a href="{{ url_for('accounts_page') }}">add one under Accounts</a> to enable it</span>
       {% endif %}
     </p>
-    <p><button type="submit" class="primary">Discover</button>
+    <p><button type="submit" class="primary">New run</button>
       {% if repo.discovered_at %}<span class="muted small">last discovered {{ repo.discovered_at | localtime }}</span>{% endif %}</p>
   </form>
 </section>
 
 <h2>Environments</h2>
-<p class="muted small">Found by Discover from real tfvars / backend files / environment directories in each stack's tree.
+<p class="muted small">Found by a run from real tfvars / backend files / environment directories in each stack's tree.
   Detected environments can be edited; edited ones are never overwritten.</p>
 <table class="envs">
   <thead><tr><th>Environment</th><th>Root</th><th>Found by</th><th>tfvars files</th><th>Extra variables</th><th></th></tr></thead>
   <tbody>
-  {% if not envs %}<tr><td colspan="6" class="muted">None yet: run Discover.</td></tr>{% endif %}
+  {% if not envs %}<tr><td colspan="6" class="muted">None yet: click New run.</td></tr>{% endif %}
   {% for e in envs %}
     <tr>
-      <td><b class="mono">{{ e.env }}</b>{% if not e.present %} <span class="badge warn">no longer found</span>{% endif %}</td>
+      <td><b class="mono">{{ e.env }}</b></td>
       <td class="mono small">{% if e.kinds and e.kinds != 'manual' and e.root_rel != '.' %}{{ e.root_rel }}/{% else %}<span class="muted">all roots</span>{% endif %}</td>
       <td class="small">{% if e.kinds and e.kinds != 'manual' %}{{ e.kinds | replace(',', ', ') }}{% if e.confirmed %} <span class="muted">(edited)</span>{% endif %}{% else %}<span class="muted">added by hand</span>{% endif %}</td>
       <td class="mono small">{% for f in e.var_files %}<div>{{ f }}</div>{% else %}<span class="muted">none</span>{% endfor %}</td>

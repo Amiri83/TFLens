@@ -217,7 +217,7 @@ def stack_env_debug(
         why = (
             f"no candidates: no *.tfvars (other than terraform.tfvars / *.auto.tfvars), "
             f"backend-<env>.hcl / <env>.tfbackend or environment directory at or below "
-            f"{where} (CI / doc lines are hints only)"
+            f"{where}"
         )
     out["no_env_reason"] = why
     return out

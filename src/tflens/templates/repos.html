@@ -4,8 +4,9 @@
 <h1>Terraform repositories</h1>
 <p class="muted">A repository is a local directory (analyzed in place, never written to) or a git URL
   that <b>Sync</b> shallow-clones into the data directory. Each one has environments (tfvars files and
-  extra <span class="mono">-var</span> values); <b>Discover</b> (on the repository's page) crawls it, validates
-  what docs and CI suggest against the code, and records a run you can open in the analyzer.</p>
+  extra <span class="mono">-var</span> values). <b>New run</b> analyzes it (a git repository is cloned on its
+  first run) and opens the run in the analyzer, with only what its .tf, .tfvars and backend files confirm.
+  <b>Sync</b> is only needed to bring in a git repository's new commits.</p>
 <table class="tf-repos">
   <thead><tr><th>Repository</th><th>Source</th><th>Environments</th><th>Last sync</th><th>Runs</th><th></th></tr></thead>
   <tbody>
@@ -22,6 +23,11 @@
       <td>{% if p.runs %}<a href="{{ url_for('runs_page', repo=p.id) }}">{{ p.runs }}</a>
           <div class="small">{{ p.last_run | localtime }}</div>{% else %}<span class="muted">none</span>{% endif %}</td>
       <td class="actions">
+        <form class="inline" method="post" action="{{ url_for('run_new') }}" data-discover>
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <input type="hidden" name="repo_id" value="{{ p.id }}">
+          <button type="submit" class="primary">New run</button>
+        </form>
         <form class="inline" method="post" action="{{ url_for('tfrepo_sync', repo_id=p.id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <input type="hidden" name="next" value="{{ url_for('tfrepos_page') }}">
@@ -60,4 +66,9 @@
     <p><button type="submit">Add</button></p>
   </form>
 </section>
+{% with current_url=url_for('jobs_current'),
+        status_url=url_for('jobs_status', job_id='__ID__'),
+        cancel_url=url_for('jobs_cancel', job_id='__ID__') %}
+  {% include "_discover_modal.html" %}
+{% endwith %}
 {% endblock %}

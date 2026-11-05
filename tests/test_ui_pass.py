@@ -332,9 +332,9 @@ def test_overview_default_view_is_confirmed_counts_only():
     js = (STATIC / "app.js").read_text()
     body = js.split("function renderOverview(ov, envs) {", 1)[1].split("\n  }\n", 1)[0]
     default, details = body.split("const details = [];", 1)
-    assert "confirmedColumns(envs)" in default and "stackCountsTable(envs, cols)" in default
-    assert "Purpose (guess)" not in default and "ov.roots" not in default
-    assert 'dsec("ov-purpose", "Purpose (guess)"' in details
+    assert "envColumns(envs)" in default and "stackCountsTable(envs, cols)" in default
+    assert "ov.roots" not in default
+    assert "Purpose (guess)" not in body and "ov.purpose" not in body
     assert 'el("details", { class: "ov-details", id: "ov-details" }' in details
 
 
@@ -348,28 +348,19 @@ def test_stack_cards_carry_envs_backend_resources_and_modules():
     api_card = cards["stacks/api"]
     assert [e["name"] for e in api_card["environments"]] == ["dev", "prod", "uat"]
     assert api_card["backend"]["per_env"]["prod"]["bucket"] == "example-tfstate-prod"
-    assert api_card["purpose"]["text"] is None  # no README of its own: nothing guessed
+    assert "purpose" not in api_card and "status" not in api_card  # all confirmed, no README
     assert {"address": "module.handlers"}.items() <= api_card["modules"][0].items()
     assert api_card["resource_total"] == sum(r["count"] for r in api_card["resources"])
 
 
-def test_stack_card_purpose_only_from_its_own_readme(tmp_path):
+def test_stack_cards_do_not_quote_a_readme(tmp_path):
     repo = tmp_path / "repo"
     shutil.copytree(FIXTURES / "multi_stack_envs", repo)
     (repo / "stacks" / "worker" / "README.md").write_text(
         "# Worker\n\nProcesses the example job queue for the platform.\n"
     )
     m = run_analysis(repo, git=False).model
-    cards = {c["id"]: c for c in stack_cards(m)}
-    p = cards["stacks/worker"]["purpose"]
-    assert p["text"] == "Processes the example job queue for the platform."
-    assert p["status"] == "confirmed" and p["location"]["file"] == "stacks/worker/README.md"
-    assert cards["stacks/edge"]["purpose"]["text"] is None  # the top README is not its own
-    m["pipeline"] = {
-        "validation": {"stacks": [{"name": "stacks/worker", "status": "hint-only"}], "envs": []}
-    }
-    cards = {c["id"]: c for c in stack_cards(m)}
-    assert cards["stacks/worker"]["purpose"]["text"] is None  # not confirmed: not shown
+    assert "Processes the example job queue" not in json.dumps(stack_cards(m))
 
 
 def test_stack_cards_remote_state_inbound_and_outbound():
@@ -392,7 +383,6 @@ def test_root_view_renders_the_cards():
         "c.modules",
         "c.outbound",
         "c.inbound",
-        "p.text",
     ):
         assert field in js, field
 

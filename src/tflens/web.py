@@ -78,6 +78,8 @@ MAX_FORM_BYTES = 1024 * 1024
 # Recorded runs whose model is kept in memory (LRU).
 RUN_CACHE = 8
 LOG_LIMIT_DEFAULT, LOG_LIMIT_MAX = 500, 5000
+# The Logs page starts at INFO: DEBUG (the unconfirmed items of a run) stays in the file.
+LOG_PAGE_LEVELS = LEVELS[1:]
 # The analyzer's JSON API routes (X-TFLens header instead of the form CSRF token).
 API_ENDPOINTS = frozenset({"api", "run_api"})
 
@@ -207,6 +209,9 @@ def create_app(
         git_protocols=git_protocols,
         runs=OrderedDict(),
         runs_lock=threading.Lock(),
+        auto_lock=threading.Lock(),
+        auto_checked=False,
+        auto_gate=threading.Semaphore(1),  # automatic runs go one at a time
     )
     apply_log_dir(app, settings_store.load())
     log.info("TFLens %s started (data dir %s)", __version__, paths.home)
@@ -230,7 +235,7 @@ def log_dir_for(paths: AppPaths, settings: Settings) -> Path:
 def apply_log_dir(app: Flask, settings: Settings) -> Path:
     paths: AppPaths = app.extensions["tflens"]["paths"]
     log_dir = log_dir_for(paths, settings)
-    configure_logging(log_dir)
+    configure_logging(log_dir, logging.DEBUG)
     app.extensions["tflens"]["log_dir"] = log_dir
     return log_dir
 
@@ -377,7 +382,7 @@ CHANGE_SECTIONS = (
 )
 # Files of a run directory that can be downloaded.
 RUN_FILES = frozenset(
-    {"handoff.md", "overview.md", "report.md", "model.json"}
+    {"overview.md", "report.md", "model.json"}
     | {f"diagrams/{n}.{ext}" for n in DIAGRAMS for ext in ("mmd", "svg", "png")}
 )
 
@@ -469,10 +474,30 @@ def _discover_work(repo: dict[str, Any], aws_requested: bool, aws_target: Any):
     keep = _store().load().retention_runs
     runs_cache, runs_lock = _ext()["runs"], _ext()["runs_lock"]
     run_url = url_for("run_view", run_id=0).replace("/0/", "/{}/")
+    repos_dir = _paths().repos_dir
+    git_kwargs = _git_kwargs()
+
+    def clone(repo: dict[str, Any]) -> dict[str, Any]:
+        """The first run of a git repository clones it: a sync is only ever asked for to
+        bring in the repository's new commits."""
+        result = tfrepo.sync_repo(repo, repos_dir, decrypt, **git_kwargs)
+        with writing(db_path) as conn:
+            tfrepo.record_sync(conn, repo["id"], result)
+            if not result.ok:
+                tfrepo.record_failed_run(conn, repo, None, f"clone failed: {result.detail}")
+            fresh = tfrepo.get_repo(conn, repo["id"])
+        if not result.ok:
+            raise JobFailed(f"Clone of {repo['name']} failed: {result.detail}")
+        log.info("repo=%s cloned for its first run: commit %s", repo["id"], result.commit[:12])
+        return fresh or repo
 
     def work(ctx: JobContext) -> dict[str, Any]:
         from .pipeline import discover
 
+        nonlocal repo
+        if repo["source"] == "git" and not Path(repo["path"]).is_dir():
+            ctx.step("cloning the repository (first run)")
+            repo = clone(repo)
         try:
             opts = tfrepo.discover_options(repo, None, decrypt)
         except ValueError as exc:  # kept in the history with its reason
@@ -531,6 +556,45 @@ def _start_discover(repo: dict[str, Any], *, background: bool, aws: bool, accoun
     )
 
 
+def _one_at_a_time(work, gate: threading.Semaphore):
+    """``work`` once the gate is free (still cancellable while it waits)."""
+
+    def queued(ctx: JobContext) -> dict[str, Any]:
+        ctx.step("waiting for the other automatic runs")
+        while not gate.acquire(timeout=0.2):
+            ctx.check()
+        try:
+            return work(ctx)
+        finally:
+            gate.release()
+
+    return queued
+
+
+def _auto_run_new_code() -> None:
+    """Once per server start: a new run of every repository whose latest run was made by
+    other TFLens code. No sync and no clone: it reads what is on disk, and a repository
+    whose directory is not there waits for its New run."""
+    ext = _ext()
+    with ext["auto_lock"]:
+        if ext["auto_checked"]:
+            return
+        ext["auto_checked"] = True
+    with _read() as conn:
+        stale = tfrepo.stale_repos(conn) if conn is not None else []
+    for repo in stale:
+        try:
+            if not tfrepo.analysis_root(repo).is_dir():
+                log.info("repo=%s: not on disk, no automatic run", repo["id"])
+                continue
+            work = _one_at_a_time(_discover_work(repo, False, None), ext["auto_gate"])
+            _jobs().start(_job_key(repo["id"]), f"Discover {repo['name']}", work, auto=True)
+        except (JobBusy, ValueError) as exc:
+            log.info("repo=%s: no automatic run: %s", repo["id"], exc)
+            continue
+        log.info("repo=%s: the TFLens code changed since its last run: new run", repo["id"])
+
+
 def _flash_job(job: dict[str, Any]) -> None:
     for m in job.get("messages", []):
         category = "ok" if m["category"] == "ok" else "error"
@@ -545,13 +609,18 @@ def _flash_job(job: dict[str, Any]) -> None:
             flash(m["text"], category)
 
 
-def _sync(repo: dict[str, Any]) -> bool:
+def _git_kwargs() -> dict[str, Any]:
     ext = _ext()
     kwargs: dict[str, Any] = {"allowed_protocols": ext["git_protocols"]}
     if ext["git_runner"] is not None:
         kwargs["runner"] = ext["git_runner"]
+    return kwargs
+
+
+def _sync(repo: dict[str, Any]) -> bool:
+    ext = _ext()
     log.info("sync of repo=%s (%s) started", repo["id"], repo["source"])
-    result = tfrepo.sync_repo(repo, _paths().repos_dir, ext["box"].decrypt, **kwargs)
+    result = tfrepo.sync_repo(repo, _paths().repos_dir, ext["box"].decrypt, **_git_kwargs())
     with _write() as conn:
         tfrepo.record_sync(conn, repo["id"], result)
     if not result.ok:
@@ -577,7 +646,39 @@ def _repo_form_fields(f) -> dict[str, Any]:
     }
 
 
+def _start_run(repo: dict[str, Any], back_url: str):
+    """Start a run of ``repo``. Pages with JavaScript post ``background=1`` and follow the
+    job on the progress screen; a plain form post runs it to the end and opens the run."""
+    background = request.form.get("background") == "1"
+    try:
+        job = _start_discover(
+            repo,
+            background=background,
+            aws=request.form.get("aws") == "1",
+            account=request.form.get("account_id", ""),
+        )
+    except JobBusy as exc:
+        if background:
+            return jsonify({"ok": False, "error": str(exc), "job": exc.job}), 409
+        flash(str(exc), "error")
+        return redirect(back_url)
+    if background:
+        return jsonify({"ok": True, "job": job})
+    _flash_job(job)
+    if job["state"] == "done" and job["result"].get("run_id"):
+        return redirect(url_for("run_view", run_id=job["result"]["run_id"]))
+    return redirect(back_url)
+
+
 def _register_managed(app: Flask) -> None:
+    @app.before_request
+    def _new_code_check() -> None:
+        if request.endpoint != "static":
+            try:
+                _auto_run_new_code()
+            except Exception:  # never in the way of the page asked for
+                log.exception("the check for runs made by other TFLens code failed")
+
     @app.get("/")
     def overview():
         return redirect(url_for("tfrepos_page"))
@@ -634,7 +735,8 @@ def _register_managed(app: Flask) -> None:
         q = request.args.get("q", "")
         limit = min(max(request.args.get("limit", LOG_LIMIT_DEFAULT, type=int), 1), LOG_LIMIT_MAX)
         log_dir = _ext()["log_dir"]
-        entries = read_log(log_dir, min_level=level, q=q, limit=limit)
+        floor = level if level in LOG_PAGE_LEVELS else LOG_PAGE_LEVELS[0]
+        entries = read_log(log_dir, min_level=floor, q=q, limit=limit)
         return render_template(
             "logs.html",
             entries=entries,
@@ -642,7 +744,7 @@ def _register_managed(app: Flask) -> None:
             q=q,
             limit=limit,
             limit_max=LOG_LIMIT_MAX,
-            levels=LEVELS,
+            levels=LOG_PAGE_LEVELS,
             log_path=log_dir / LOG_FILE,
         )
 
@@ -770,6 +872,7 @@ def _register_managed(app: Flask) -> None:
         with _read() as conn:
             envs = tfrepo.list_envs(conn, repo_id) if conn is not None else []
             runs = tfrepo.list_runs(conn, repo_id, limit=20) if conn is not None else []
+        envs = [e for e in envs if e["present"]]  # a real file (or the user) stands behind it
         accounts = [a.public_dict() for a in _accounts().list()]
         return render_template(
             "tfrepo.html",
@@ -830,28 +933,35 @@ def _register_managed(app: Flask) -> None:
 
     @app.post("/repos/<int:repo_id>/discover")
     def tfrepo_discover(repo_id: int):
-        """Pages with JavaScript post ``background=1`` and follow the job on the progress
-        screen; a plain form post runs it to the end and opens the run."""
-        repo = _repo_or_404(repo_id)
-        background = request.form.get("background") == "1"
-        try:
-            job = _start_discover(
-                repo,
-                background=background,
-                aws=request.form.get("aws") == "1",
-                account=request.form.get("account_id", ""),
-            )
-        except JobBusy as exc:
-            if background:
-                return jsonify({"ok": False, "error": str(exc), "job": exc.job}), 409
-            flash(str(exc), "error")
-            return redirect(url_for("settings_tfrepo", repo_id=repo_id))
-        if background:
-            return jsonify({"ok": True, "job": job})
-        _flash_job(job)
-        if job["state"] == "done" and job["result"].get("run_id"):
-            return redirect(url_for("run_view", run_id=job["result"]["run_id"]))
-        return redirect(url_for("settings_tfrepo", repo_id=repo_id))
+        return _start_run(_repo_or_404(repo_id), url_for("settings_tfrepo", repo_id=repo_id))
+
+    @app.post("/runs/new")
+    def run_new():
+        """The New run button of the Runs page and of each repository row."""
+        raw = request.form.get("repo_id", "")
+        if not raw.isdigit():
+            if request.form.get("background") == "1":
+                return jsonify({"ok": False, "error": "Pick a repository first"}), 400
+            flash("Pick a repository first", "error")
+            return redirect(url_for("runs_page"))
+        return _start_run(_repo_or_404(int(raw)), url_for("runs_page"))
+
+    # The progress screen of the pages about every repository (Runs, Repos).
+    @app.get("/jobs/current")
+    def jobs_current():
+        return jsonify({"job": _jobs().latest_running()})
+
+    @app.get("/jobs/<job_id>")
+    def jobs_status(job_id: str):
+        job = _jobs().status(job_id[:64])
+        if job is None:
+            abort(404)
+        return jsonify({"job": job})
+
+    @app.post("/jobs/<job_id>/cancel")
+    def jobs_cancel(job_id: str):
+        ok = _jobs().cancel(job_id[:64])
+        return jsonify({"ok": ok, "job": _jobs().status(job_id[:64])})
 
     @app.get("/repos/<int:repo_id>/jobs/current")
     def job_current(repo_id: int):
