@@ -200,7 +200,8 @@
     return el("li", { class: "unknown-item" },
       link(`${u.subject}.${u.attribute}`, () => showDetail("node", u.subject)), ` — ${u.reason} `,
       locLink(u.location),
-      u.defined_at ? el("span", { class: "tag" }, " · defined at ", locLink(u.defined_at)) : null);
+      u.defined_at ? el("span", { class: "tag" }, " · defined at ", locLink(u.defined_at)) : null,
+      u.searched ? el("div", { class: "tag" }, u.searched) : null);
   }
 
   function unknownsPanel(groups) {
@@ -223,10 +224,18 @@
   function envUnknowns(envs) {
     const shown = envs.current;
     const name = (envs.selected || []).join(", ") || envs.active;
-    const title = name ? `Unknowns in ${name}, after applying its variables` : "Unknowns (no environment applied)";
-    if (!shown.unknown_count) return [el("p", { class: "muted" }, `${title}: none.`)];
-    const parts = [el("h3", {}, `${title} (${shown.unknown_count})`),
+    const title = name ? `Unresolved in ${name}, after the resolution pass` : "Unresolved (no environment applied)";
+    const backends = envs.unresolved_backends || [];
+    const total = shown.unknown_count + backends.length;
+    if (!total) return [el("p", { class: "muted" }, `${title}: none.`)];
+    const parts = [el("h3", {}, `${title} (${total})`),
       unknownsPanel(shown.unknown_groups || groupUnknowns(shown.unknowns))];
+    if (backends.length) {
+      parts.push(el("details", { class: "unknown-group", open: "" },
+        el("summary", {}, "backend setting ", el("span", { class: "tag" }, `(${backends.length})`)),
+        el("ul", { class: "unknown-items" }, ...backends.map((b) => el("li", { class: "unknown-item" },
+          `${b.env} ${b.key} — ${b.reason} `, locLink(b.location))))));
+    }
     if (shown.unknown_count > shown.unknowns.length) {
       parts.push(el("p", { class: "muted" }, `… ${shown.unknown_count - shown.unknowns.length} more`));
     }
@@ -382,8 +391,7 @@
         el("td", {}, r.id), el("td", { title: st.origin || st.note || "" }, st.type),
         ...keys.map((k) => {
           const s = by.get(k);
-          if (!s) return el("td", { class: "muted" }, "—");
-          if (!s.known) return el("td", { class: "st-unknown", title: s.reason || "" }, "UNKNOWN");
+          if (!s || !s.known) return el("td", { class: "muted" }, "—");
           return el("td", { class: "mono" }, s.value, " ", locLink(s.location));
         }));
     });
@@ -957,7 +965,7 @@
       out.push(el("h3", {}, "Remote state"),
         el("p", { class: rs.status === "unresolved" ? "st-unknown" : "" }, `Reads ${target} — ${rs.reason}`),
         el("dl", {}, ...Object.entries(rs.config || {}).flatMap(([k, v]) =>
-          [el("dt", {}, k), el("dd", { class: "mono" }, v === null ? "UNKNOWN" : String(v))])));
+          [el("dt", {}, k), el("dd", { class: "mono" }, v === null ? "—" : String(v))])));
     }
     return out;
   }
@@ -1666,7 +1674,7 @@
 
   function matrixCell(row, env, cell) {
     if (!cell) return el("td", { class: "matrix-cell empty", title: `${row.stack} has no ${env} environment` }, "—");
-    const unknown = (cell.settings || []).some((s) => !s.known);
+    const open = (cell.unresolved || []).length;
     return el("td", { class: `matrix-cell${cell.wired === false ? " not-wired" : ""}` },
       el("button", { type: "button", class: "cell-btn", "data-env": env, title: "Open the backend file",
         onclick: (e) => {
@@ -1678,7 +1686,7 @@
         cell.bucket ? el("span", { class: "bk-bucket" }, cell.bucket) : null,
         cell.key ? el("span", { class: "bk-key" }, cell.key) : null,
         !cell.bucket && !cell.key ? el("span", { class: "muted" }, cell.origin || "no bucket / key") : null,
-        unknown ? el("span", { class: "tag st-unknown" }, "some settings set at init time") : null));
+        open ? el("span", { class: "tag st-unknown" }, `${open} not resolved`) : null));
   }
 
   async function showBackendCell(row, env, cell) {
@@ -1692,9 +1700,12 @@
         el("dt", {}, "From"), el("dd", {}, cell.origin || "—"))];
     if ((cell.settings || []).length) {
       parts.push(el("h3", {}, "Settings"), el("table", { class: "tags" }, el("tbody", {}, ...cell.settings.map((s) =>
-        el("tr", { class: s.known ? "" : "st-unknown" }, el("td", { class: "mono" }, s.key),
-          el("td", { class: "mono" }, s.known ? String(s.value) : "UNKNOWN"),
-          el("td", {}, s.location ? locLink(s.location) : el("span", { class: "tag" }, s.reason || "")))))));
+        el("tr", {}, el("td", { class: "mono" }, s.key), el("td", { class: "mono" }, String(s.value)),
+          el("td", {}, s.location ? locLink(s.location) : ""))))));
+    }
+    if ((cell.unresolved || []).length) {
+      parts.push(el("h3", {}, "Not resolved"), el("ul", { class: "unknown-items" }, ...cell.unresolved.map((u) =>
+        el("li", { class: "unknown-item" }, `${u.key} — ${u.reason} `, locLink(u.location)))));
     }
     if ((cell.files || []).length || (cell.var_files || []).length) {
       parts.push(el("h3", {}, "Files"), el("p", {}, ...fileLinks([...(cell.files || []), ...(cell.var_files || [])])));
@@ -1819,6 +1830,19 @@
   }
 
   // ------------------------------------------------------------ header summary
+  // The run's AWS phase in the header: how many resources it validated, or why it did not.
+  function awsStat(run, stat) {
+    if (!run || run.aws_status === "off") return [];
+    if (run.aws_status === "done") {
+      const badge = stat(run.aws_validated, "AWS-validated");
+      badge.title = run.aws_message;
+      return [badge];
+    }
+    const badge = stat("AWS", `skipped${run.aws_reason ? `: ${run.aws_reason}` : ""}`, "warn");
+    badge.title = run.aws_message;
+    return [badge];
+  }
+
   // Four numbers in the header (environments, stacks, resources, unknowns); a click
   // expands everything else (flows, files, modules, nodes, edges, parse errors).
   function renderSummaryBar(summary, envs) {
@@ -1847,8 +1871,11 @@
         setView("environments");
         const target = document.getElementById("env-unknowns");
         if (target) target.scrollIntoView();
-      } }, stat(s.unknowns, "unknowns", s.unknowns ? "warn" : ""));
-    bar.replaceChildren(toggle, unknowns);
+      } }, summary.run && summary.run.unknowns_before !== s.unknowns
+      ? el("span", { class: `sum-stat ${s.unknowns ? "warn" : ""}`.trim(), title: "Before and after the resolution pass" },
+        `${summary.run.unknowns_before} → `, el("b", {}, String(s.unknowns)), " unknowns")
+      : stat(s.unknowns, "unknowns", s.unknowns ? "warn" : ""));
+    bar.replaceChildren(toggle, unknowns, ...awsStat(summary.run, stat));
     const item = (label, value, cls) => [el("dt", {}, label), el("dd", { class: cls || "" }, value)];
     const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
     panel.replaceChildren(el("dl", { class: "summary-grid" },
@@ -1863,7 +1890,9 @@
       ...item("Modules", String(s.modules)),
       ...item("Nodes", String(nodes)),
       ...item("Edges", edges),
-      ...item("Unknowns", String(s.unknowns), s.unknowns ? "st-unknown" : ""),
+      ...item("Unknowns", summary.run ? `${summary.run.unknowns_before} before resolution, ${s.unknowns} after` : String(s.unknowns), s.unknowns ? "st-unknown" : ""),
+      ...(summary.run && summary.run.aws_status !== "off"
+        ? item("AWS check", summary.run.aws_message, summary.run.aws_status === "done" ? "" : "st-unknown") : []),
       ...item("Parse errors", String(s.parse_errors), s.parse_errors ? "st-failed" : "")));
   }
 

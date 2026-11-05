@@ -43,7 +43,67 @@ MISSING_CODES = frozenset(
         "RepositoryNotFoundException",
     }
 )
-NO_BOTO = "boto3 is not installed (pip install 'tflens[aws]'): AWS check skipped"
+# found under another name when the bucket lives in another region: it exists
+EXISTS_CODES = frozenset({"301", "PermanentRedirect"})
+NO_BOTO = "boto3 is not installed (pip install boto3): AWS check skipped"
+# Why the phase could not run: a category, never a value (no key, no token, no account id).
+MISSING_CREDENTIALS = "missing credentials"
+INVALID_CREDENTIALS = "invalid credentials"
+MISSING_PERMISSION = "missing permission"
+MISSING_REGION = "missing region"
+NO_NETWORK = "AWS not reachable"
+NOT_INSTALLED = "boto3 not installed"
+NO_ACCOUNT = "no account"
+_REASONS: dict[str, frozenset[str]] = {
+    MISSING_CREDENTIALS: frozenset(
+        {
+            "NoCredentialsError",
+            "PartialCredentialsError",
+            "ProfileNotFound",
+            "CredentialRetrievalError",
+            "SSOTokenLoadError",
+        }
+    ),
+    INVALID_CREDENTIALS: frozenset(
+        {
+            "InvalidClientTokenId",
+            "UnrecognizedClientException",
+            "SignatureDoesNotMatch",
+            "InvalidSignatureException",
+            "ExpiredToken",
+            "ExpiredTokenException",
+            "RequestExpired",
+            "AuthFailure",
+            "InvalidToken",
+            "UnauthorizedSSOTokenError",
+            "TokenRetrievalError",
+        }
+    ),
+    MISSING_PERMISSION: frozenset(
+        {
+            "403",
+            "AccessDenied",
+            "AccessDeniedException",
+            "AuthorizationError",
+            "AuthorizationErrorException",
+            "UnauthorizedOperation",
+            "Forbidden",
+        }
+    ),
+    MISSING_REGION: frozenset({"NoRegionError", "InvalidRegionError"}),
+    NO_NETWORK: frozenset(
+        {
+            "EndpointConnectionError",
+            "ConnectTimeoutError",
+            "ConnectTimeout",
+            "ReadTimeoutError",
+            "ConnectionClosedError",
+            "ConnectionError",
+            "ProxyConnectionError",
+            "SSLError",
+        }
+    ),
+}
 OFF = "not requested for this run (off by default)"
 
 
@@ -120,6 +180,18 @@ def _code(exc: Exception) -> str:
     return ""
 
 
+def reason_of(code: str) -> str:
+    """The category of an AWS error code ('' for none of them)."""
+    return next((reason for reason, codes in _REASONS.items() if code in codes), "")
+
+
+def _problem_reason(problem: str) -> str:
+    """The category of why an account cannot be used (:meth:`accounts.Account.credential_problem`)."""
+    if problem == NO_BOTO:
+        return NOT_INSTALLED
+    return INVALID_CREDENTIALS if "expired" in problem else MISSING_CREDENTIALS
+
+
 def _name(node: dict[str, Any], attr: str) -> str | None:
     value = (node.get("attributes") or {}).get(attr)
     if isinstance(value, str) and value and "${" not in value:
@@ -163,35 +235,52 @@ def _result(status: str, message: str, **extra: Any) -> dict[str, Any]:
     return {"status": status, "message": message, "checks": [], **extra}
 
 
+def _skipped(reason: str, message: str) -> dict[str, Any]:
+    log.warning("AWS check skipped (%s): %s", reason, message)
+    return _result("skipped", message, reason=reason)
+
+
 def run_checks(
     model: dict[str, Any], target: AwsTarget | None, requested: bool, progress: Any
 ) -> dict[str, Any]:
     """The ``pipeline.aws`` section: ``off`` (not asked for), ``skipped`` (asked for, not
-    possible: why), ``done`` (each check: exists / missing / error with the error code)."""
+    possible: ``reason``, a category, and the message), ``done`` (each check: exists / missing /
+    denied / error with the error code). Error codes and categories only: an exception's text
+    can quote the request, so it is never kept or logged."""
     if not requested:
         return _result("off", OFF)
     if target is None:
-        return _result(
-            "skipped",
+        return _skipped(
+            NO_ACCOUNT,
             "no AWS account is configured for this run (add one under Accounts, or start "
             "with --aws-profile): AWS check skipped",
         )
     if target.problem or target.session is None:
-        return _result("skipped", f"{target.label}: {target.problem or 'not usable'}")
+        problem = target.problem or "not usable"
+        return _skipped(_problem_reason(problem), f"{target.label}: {problem}")
     items, unnamed = candidates(model)
     progress.step(f"connecting to AWS ({target.label}, read-only)")
     try:
         session = target.session()
+        region = target.region or getattr(session, "region_name", None)
+        if not region and hasattr(session, "region_name"):
+            return _skipped(
+                MISSING_REGION,
+                f"{target.label}: {MISSING_REGION} (set one on the account or in its AWS profile): "
+                "AWS check skipped",
+            )
         ident_raw = session.client("sts").get_caller_identity()
     except Exception as exc:  # no credentials, expired, network: say so, never fake
         code = _code(exc) or type(exc).__name__
-        log.warning("AWS check: cannot connect with %s: %s", target.label, code)
-        return _result("skipped", f"{target.label}: cannot connect ({code}): AWS check skipped")
+        reason = reason_of(code) or "cannot connect"
+        return _skipped(
+            reason, f"{target.label}: cannot connect: {reason} ({code}): AWS check skipped"
+        )
     arn = str(ident_raw.get("Arn", ""))
     ident = {
         "account": str(ident_raw.get("Account", "")),
         "partition": arn.split(":")[1] if arn.count(":") >= 2 else "aws",
-        "region": target.region or getattr(session, "region_name", "") or "us-east-1",
+        "region": region or "us-east-1",
     }
     checks = []
     clients: dict[str, Any] = {}
@@ -205,21 +294,40 @@ def run_checks(
             status, detail = "exists", ""
         except Exception as exc:
             code = _code(exc) or type(exc).__name__
-            status, detail = ("missing" if code in MISSING_CODES else "error"), code
+            if code in EXISTS_CODES:
+                status, detail = "exists", ""
+            elif code in MISSING_CODES:
+                status, detail = "missing", code
+            elif reason_of(code) == MISSING_PERMISSION:
+                status, detail = "denied", code
+            else:
+                status, detail = "error", code
+        progress.log(
+            f"   {item['type']} {item['name']}: {status}" + (f" ({detail})" if detail else "")
+        )
         checks.append({**item, "status": status, "detail": detail})
-    counts = {s: sum(1 for c in checks if c["status"] == s) for s in ("exists", "missing", "error")}
+    counts = {
+        s: sum(1 for c in checks if c["status"] == s)
+        for s in ("exists", "missing", "denied", "error")
+    }
     message = (
         f"{target.label}: {counts['exists']} exist, {counts['missing']} missing, "
-        f"{counts['error']} not checkable"
+        f"{counts['denied']} denied ({MISSING_PERMISSION}), {counts['error']} not checkable"
     )
+    if not items:
+        message += "; no confirmed resource to check"
     if unnamed:
         message += f"; {unnamed} resource(s) not checked (name not known statically)"
     if len(items) > MAX_CHECKS:
         message += f"; only the first {MAX_CHECKS} checked"
+    denied_all = bool(checks) and counts["denied"] == len(checks)
+    if denied_all:
+        log.warning("AWS check: %s: %s on every check", target.label, MISSING_PERMISSION)
     return {
         "status": "done",
         "message": message,
         "checks": checks,
         "counts": counts,
         "unnamed": unnamed,
+        "reason": MISSING_PERMISSION if denied_all else "",
     }

@@ -17,6 +17,7 @@ from .ciscan import ci_var_inputs, ci_workspace_use
 from .evaluate import Ops, apply_ops, evaluate
 from .expr import Call, ObjectExpr
 from .loader import Attr, Block, ModuleSource, RemoteModule, RepoSource
+from .sources import same_repo_subdir
 from .values import (
     JsonEncoded,
     Location,
@@ -405,8 +406,27 @@ class ModuleInstance:
             return apply_ops(self.policy_document(name), ops[1:])
         if dtype == "terraform_remote_state" and attr == "outputs":
             return self.remote_output(name, ops[1:])
+        if dtype == "aws_region" and attr in ("name", "region", "id") and self.engine.deep:
+            region = self.provider_region(self.src.data[(dtype, name)])
+            if region is not None:
+                return apply_ops(region, ops[1:])
         configured, value = self.data_attr(dtype, name, attr)
         return apply_ops(Ref(node_id, attr, value, configured and is_known(value)), ops[1:])
+
+    def provider_region(self, block: Block) -> str | None:
+        """``data.aws_region``: the ``region`` of the default ``aws`` provider configuration
+        it reads, when the code fixes one (this module's, else its callers')."""
+        if "provider" in block.attrs or "region" in block.attrs:
+            return None  # an aliased provider, or a region of its own (the argument)
+        inst: ModuleInstance | None = self
+        while inst is not None:
+            for p in inst.src.providers:
+                if p.labels and p.labels[0] == "aws" and "alias" not in p.attrs:
+                    attr = p.attrs.get("region")
+                    value = unwrap(inst.eval_attr(attr)) if attr is not None else None
+                    return value if isinstance(value, str) else None
+            inst = inst.parent
+        return None
 
     def remote_state(self, name: str) -> dict[str, Any]:
         """Where ``data.terraform_remote_state.<name>`` reads from: its backend, config and
@@ -768,6 +788,9 @@ class Engine:
         self._ci_vars: dict[str, tuple[str | None, Location]] | None = None
         # how many reads met a value still being evaluated (settle: re-evaluate those)
         self.cycle_hits = 0
+        # the resolution pass: follow a source naming this repository, read data.aws_region
+        # from the provider (False: the first, plain pass the run's summary compares with)
+        self.deep = True
 
     # ------------------------------------------------------------ discovery
     def referenced_dirs(self) -> set[str]:
@@ -778,6 +801,10 @@ class Engine:
                 src = _literal_source(call)
                 if src is not None and _is_local(src):
                     referenced.add(posixpath.normpath(posixpath.join(mod.dir, src)))
+                elif src is not None:
+                    here = same_repo_subdir(src, self.repo.root)
+                    if here is not None and here in self.repo.modules:
+                        referenced.add(here)
         for unit in self.repo.units:
             if unit.module_dir and unit.module_dir != unit.dir:
                 referenced.add(unit.module_dir)
@@ -985,14 +1012,18 @@ class Engine:
                 continue
             if not _is_local(source):
                 remote, reason = self._remote(root_dir, child_addr)
-                if remote is None:
+                here = same_repo_subdir(source, self.repo.root) if self.deep else None
+                if remote is not None:
+                    inst.child_remote[name] = remote
+                    child_dir = remote.dir
+                elif here is not None and here in self.repo.modules:
+                    child_dir = here  # the source names this repository: its code is here
+                else:
                     inst.children[name] = None
                     inst.child_status[name] = (
                         f"module.{name} uses non-local source {source!r}; {reason}"
                     )
                     continue
-                inst.child_remote[name] = remote
-                child_dir = remote.dir
             else:
                 child_dir = posixpath.normpath(posixpath.join(src.dir, source))
             child_src = self.repo.modules.get(child_dir)

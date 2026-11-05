@@ -133,6 +133,20 @@ class JobContext:
 Work = Callable[[JobContext], "dict[str, Any] | None"]
 
 
+def _after(others: list[Job], work: Work) -> Work:
+    """``work`` once these jobs' workers have stopped (still cancellable while it waits)."""
+
+    def waiting(ctx: JobContext) -> dict[str, Any] | None:
+        ctx.step("waiting for the automatic run to stop")
+        for other in others:
+            while other.running:
+                time.sleep(0.05)
+                ctx.check()
+        return work(ctx)
+
+    return waiting
+
+
 class JobManager:
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
@@ -141,12 +155,20 @@ class JobManager:
     def start(
         self, key: str, label: str, work: Work, *, background: bool = True, auto: bool = False
     ) -> dict[str, Any]:
-        """Start ``work`` (raises :class:`JobBusy` while a job of ``key`` runs). Without
-        ``background`` the job runs to the end in the caller's thread."""
+        """Start ``work`` (raises :class:`JobBusy` while a job of ``key`` somebody asked for
+        runs). An automatic run gives way to a run somebody asks for: it is cancelled and the new
+        job starts once it has stopped, so what was asked for (its AWS check) is what runs.
+        Without ``background`` the job runs to the end in the caller's thread."""
         with self._lock:
-            for j in self._jobs.values():
-                if j.key == key and j.running:
+            running = [j for j in self._jobs.values() if j.key == key and j.running]
+            for j in running:
+                if auto or not j.auto:
                     raise JobBusy(j.status())
+            for j in running:
+                j.cancel_event.set()
+                log.info("discover job %s (%s): automatic run gives way", j.id, j.key)
+            if running:
+                work = _after(running, work)
             job = Job(key, label, auto)
             self._jobs[job.id] = job
             self._prune()

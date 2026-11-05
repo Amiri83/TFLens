@@ -99,13 +99,17 @@ def stacks(environments: list[dict[str, Any]], roots: list[str]) -> list[dict[st
     ``envs/prod``) are one stack, ``envs/*``, with one root per environment."""
     out: dict[str, dict[str, Any]] = {}
     claimed: dict[str, str] = {}
-    for e in environments:
+    # first the environments bound to a root: one with no root of its own (the top directory's)
+    # covers only the roots no other environment has, it must not take them from their stacks
+    for e in sorted(environments, key=lambda e: not e["roots"]):
         layout = _layout_env(e)
         if layout:
             parent = posixpath.dirname(e["root"])
             sid = f"{parent}/*" if parent else "*"
         else:
             sid = e["root"]
+        if not e["roots"] and not [r for r in env_roots(e, roots) if r not in claimed]:
+            continue  # every root it would cover has environments of its own
         stack = out.setdefault(
             sid,
             {

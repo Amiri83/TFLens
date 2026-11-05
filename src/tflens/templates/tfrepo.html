@@ -26,18 +26,7 @@
     <p class="muted small">One run, four phases: <b>1. Crawl</b> (every file listed) → <b>2. Validate</b> (against .tf /
       .tfvars / backend files) → <b>3. AWS</b> (optional, read-only) → <b>4. Render</b> (inventory per environment,
       diagrams, graph from confirmed data only). The run is recorded and opens in the analyzer.</p>
-    <p>
-      {% set usable = accounts | rejectattr('problem') | list %}
-      <label class="check"><input type="checkbox" name="aws" value="1" id="discover-aws" {{ 'disabled' if not usable }}>
-        Check confirmed resources in AWS (read-only, this run only)</label>
-      {% if usable %}
-        <select name="account_id" aria-label="AWS account">
-          {% for a in usable %}<option value="{{ a.id }}">{{ a.display_name or ('account ' ~ a.id) }} · {{ a.region }}</option>{% endfor %}
-        </select>
-      {% else %}
-        <span class="muted small">no usable AWS account: <a href="{{ url_for('accounts_page') }}">add one under Accounts</a> to enable it</span>
-      {% endif %}
-    </p>
+    <p>{% include "_aws_toggle.html" %}</p>
     <p><button type="submit" class="primary">New run</button>
       {% if repo.discovered_at %}<span class="muted small">last discovered {{ repo.discovered_at | localtime }}</span>{% endif %}</p>
   </form>

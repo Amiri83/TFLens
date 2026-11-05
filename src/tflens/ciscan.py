@@ -108,6 +108,77 @@ def ci_var_inputs(repo: RepoSource) -> dict[str, tuple[str | None, Location]]:
     return out
 
 
+_ENV_EXPR_RE = re.compile(r"\b(env|environment|stage|tier|target_env)\b", re.I)
+
+
+def ci_backend_settings(
+    repo: RepoSource, root: str, env: str, names: list[str]
+) -> list[dict[str, Any]]:
+    """``-backend-config="key=value"`` of the ``init`` lines of CI / scripts run in the
+    directory ``root``, for environment ``env``: ``{key, value, location}``. A CI expression
+    standing for the environment (``${{ matrix.env }}``, ``$ENV``) is filled in; any other makes
+    the value None: set at run time, by that line. Values of secret settings are never read, and
+    a line tied to another environment (``names``: this stack's) does not count."""
+    out = []
+    others = [n for n in names if n != env]
+    for cand in _command_lines(repo):
+        if cand["step"] != "init" or "-backend-config" not in cand["text"]:
+            continue
+        exprs: list[str] = []
+
+        def hold(m: re.Match[str], found: list[str] = exprs) -> str:
+            found.append(m.group(0))
+            return f"\x00{len(found) - 1}\x00"
+
+        def restore(value: str, found: list[str] = exprs) -> str:
+            return re.sub(r"\x00(\d+)\x00", lambda m: found[int(m.group(1))], value)
+
+        held = CI_EXPR_RE.sub(hold, cand["text"])
+        chdir = CHDIR_RE.search(held)
+        directory = restore(chdir.group(1)) if chdir else cand["dir"]
+        binds: dict[str, str] = {}
+        if directory is not None:
+            if not _match_dir(directory, root, binds):
+                continue
+        elif root != "." and not _in_dir(posixpath.dirname(cand["file"]) or ".", root):
+            continue  # nothing ties it to this stack
+        for flag in CLI_FLAG_RE.finditer(held):
+            key, sep, raw = flag.group(2).partition("=")
+            if flag.group(1) != "backend-config" or not sep or SECRET_KEY_RE.search(key):
+                continue
+            value = _backend_value(restore(raw), binds, env)
+            listed = "\n".join(repo.lines(cand["file"]))
+            if value is not None and _for_another_env(restore(raw), listed, env, others):
+                continue
+            out.append(
+                {
+                    "key": key,
+                    "value": value,
+                    "location": Location(cand["file"], cand["line"], cand["line"]),
+                }
+            )
+    return out
+
+
+def _backend_value(raw: str, binds: dict[str, str], env: str) -> str | None:
+    """A ``-backend-config`` value with its CI expressions filled in (None: not all known)."""
+    value = raw
+    for expr in CI_EXPR_RE.findall(raw):
+        fill = binds.get(expr) or (env if _ENV_EXPR_RE.search(expr) else None)
+        if fill is None:
+            return None
+        value = value.replace(expr, fill)
+    return value
+
+
+def _for_another_env(raw: str, text: str, env: str, others: list[str]) -> bool:
+    """A literal value naming another environment only, or a CI expression in a file whose
+    list of environments does not hold this one."""
+    if CI_EXPR_RE.search(raw):
+        return not _mentions(text, env) and any(_mentions(text, o) for o in others)
+    return not _mentions(raw, env) and any(_mentions(raw, o) for o in others)
+
+
 def ci_workspace_use(repo: RepoSource) -> str:
     """``selects`` (CI runs ``terraform workspace select``), ``never`` (CI runs terraform and
     never selects one: the default workspace) or ``none`` (no CI running terraform)."""

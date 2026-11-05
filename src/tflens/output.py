@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -126,7 +127,11 @@ def run_analysis(
         engine.root_envs = dict(per_stack["root_envs"])
     elif selected is not None:
         engine.root_envs = {r: selected["name"] for r in env_roots(selected, all_roots)}
-    mark("evaluating the Terraform code")
+    first_pass = None if explicit else _first_pass_unknowns(repo, engine, environments, mark)
+    mark(
+        "resolution pass: module sources, tfvars per environment, locals, defaults, "
+        "data sources, remote state outputs"
+    )
     engine.run()
     mark("building the resource graph")
     graph = analyze(repo, engine)
@@ -175,7 +180,87 @@ def run_analysis(
         )
     )
     _scope_unknowns(model)
+    model["resolution"] = _resolution(model, first_pass)
+    _explain_unknowns(model, repo)
     return Analysis(repo, engine, graph, model)
+
+
+def _first_pass_unknowns(
+    repo: RepoSource,
+    engine: Engine,
+    environments: list[dict[str, Any]],
+    mark: Callable[[str], None],
+) -> list[dict[str, Any]]:
+    """The unknowns before the resolution pass: each environment's own tfvars only, no source
+    followed into this repository, no data source read from the provider."""
+    mark("first pass: each environment's own tfvars")
+    found = {f for e in environments for f in e.get("found_var_files", [])}
+    plain = Engine(
+        repo,
+        [f for f in engine.var_files if f not in found],
+        engine.cli_vars,
+        engine.scope,
+        root_var_files={
+            r: [f for f in files if f not in found] for r, files in engine.root_var_files.items()
+        },
+        exclude_roots=engine.exclude_roots,
+    )
+    plain.deep = False
+    plain.state_index = engine.state_index
+    plain.root_envs = dict(engine.root_envs)
+    plain.run()
+    return [u.to_dict() for u in analyze(repo, plain).unknowns]
+
+
+def _resolution(model: dict[str, Any], first_pass: list[dict[str, Any]] | None) -> dict[str, int]:
+    """``model["resolution"]``: the unknowns before and after the resolution pass, counted the
+    same way (a reusable module nothing calls has none)."""
+    after = len(model["unknowns"])
+    if first_pass is None:
+        return {"before": after, "after": after}
+    roots = list(model.get("roots") or [])
+    library = library_roots(model)
+    return {
+        "before": sum(1 for u in first_pass if _unknown_root(u, roots) not in library),
+        "after": after,
+    }
+
+
+_UNSET_VAR_RE = re.compile(r"variable var\.([\w-]+) has no default and no value in tfvars")
+
+
+def _explain_unknowns(model: dict[str, Any], repo: RepoSource) -> None:
+    """Where the resolution pass looked for a variable nothing sets (``searched``), so an
+    unresolved value says more than that it is unset: the tfvars read for its environment, and
+    those of other environments that do set it. Names files only, never a value."""
+
+    def explain(unknown: dict[str, Any], files: list[str]) -> None:
+        found = _UNSET_VAR_RE.search(unknown["reason"])
+        if found is None:
+            return
+        name = found.group(1)
+        elsewhere = [f for f in sorted(repo.tfvars) if name in repo.tfvars[f] and f not in files]
+        if not files and not elsewhere:
+            return  # the reason says it all
+        text = "looked in " + (", ".join(files) if files else "no tfvars of an environment")
+        if elsewhere:
+            text += "; set only in " + ", ".join(elsewhere) + ", not for this environment"
+        unknown["searched"] = text
+
+    environments = model["structure"]["environments"]
+    by_id = {env_id(e, environments): e for e in environments}
+    selected: dict[str, list[str]] = {}
+    for s in model.get("stacks", []):
+        env = by_id.get(s.get("selected") or "")
+        if env is not None:
+            for r in s["env_roots"].get(s["selected"], []):
+                selected[r] = list(env["var_files"])
+    roots = list(model.get("roots") or [])
+    for u in model["unknowns"]:
+        explain(u, selected.get(_unknown_root(u, roots) or "", []))
+    for row in (model.get("environment_analysis") or {}).get("environments", []):
+        for u in row["unknowns"]:
+            explain(u, list(row["var_files"]))
 
 
 def _scope_unknowns(model: dict[str, Any]) -> None:
