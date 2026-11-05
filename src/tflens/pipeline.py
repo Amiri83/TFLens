@@ -59,7 +59,7 @@ MAX_HINT_FILE_BYTES = 512 * 1024
 CODE_SUFFIXES = (".tf", ".tf.json", ".tfvars", ".tfvars.json", ".hcl", ".tfbackend")
 
 _SCRIPT_NAMES = frozenset({"Makefile", "makefile", "GNUmakefile", "Taskfile.yml", "justfile"})
-_HANDOFF_RE = re.compile(r"^handoff([._-][^/]*)?$", re.I)
+_HANDOFF_RE = re.compile(r"^(handoff|migration)([._-][^/]*)?$", re.I)
 _ENV_WORD_RE = re.compile(
     r"(?<![A-Za-z0-9_/.-])("
     + "|".join(sorted(map(re.escape, ENV_WORDS), key=len, reverse=True))

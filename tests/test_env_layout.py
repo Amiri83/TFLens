@@ -165,12 +165,12 @@ def test_counts_per_environment(model):
 def test_unresolved_count_is_not_assumed_to_be_one(model):
     # no environment applied: var.lambdas_enabled is unset, so both the base-module and the
     # legacy functions may exist; none is counted (was 8, one per block)
-    assert purpose_text(model).startswith("deploys 0 (+8 uncertain) Lambda functions")
+    assert purpose_text(model).startswith("deploys 0 Lambda functions")
     view = environments_view(model)
     assert view["current"]["counts"]["aws_lambda_function"] == 0
     assert view["current"]["uncertain"]["aws_lambda_function"] == 8
-    assert view["current"]["text"].startswith("0 (+8 uncertain) Lambda functions")
-    assert count_text(4, 3) == "4 (+3 uncertain)" and count_text(4) == "4"
+    assert view["current"]["text"].startswith("0 Lambda functions")
+    assert count_text(4) == "4"
 
 
 def test_why_counted_names_expression_value_and_source(model):
@@ -222,14 +222,14 @@ def test_why_counted_with_an_environment_names_the_tfvars():
 def test_overview_lines_explain_uncertain_counts(model):
     ov = build_overview(model, "env-layout")
     texts = [ln["text"] for ln in ov["purpose"]]
-    assert "0 (+1 uncertain) SNS topics: alerts" in texts
+    assert "0 SNS topics: alerts" in texts
     why = next(t for t in texts if t.startswith("why counted: aws_sns_topic.alerts"))
     assert "var.alerts_enabled is not set" in why
     lines = [ln["text"] for ln in ov["environment_counts"]]
     intg = next(t for t in lines if t.startswith("intg"))
     assert intg.startswith("intg (not wired): 4 Lambda functions")
-    assert "0 (+1 uncertain) SNS topics" in intg
-    assert "+1 SNS topic uncertain: count not known statically (not counted)" in lines
+    assert "0 SNS topics" in intg
+    assert "1 SNS topic not counted: count not known statically" in lines
     assert "differences between environments:" in lines
     assert "aws_s3_bucket.archive only in prod" in lines
 
@@ -284,7 +284,7 @@ def test_differences_between_environments_are_flagged(model):
     assert not by["lambda"]["differs"] and not by["ecs_service"]["differs"]
     # columns in promotion order (dev | intg | uat | prod), never summed
     assert view["differences"] == [
-        "SNS topics: dev 1, intg 0 (+1 uncertain), uat 1, prod 1",
+        "SNS topics: dev 1, intg 0, uat 1, prod 1",
         "S3 buckets: dev 0, intg 0, uat 0, prod 1",
         "  aws_s3_bucket.archive only in prod",
     ]
@@ -367,7 +367,6 @@ def test_ui_environments_tab_first(tmp_path):
     for hook in (
         "renderEnvironments(envs)",
         "function showInventoryCell(row, column, cell)",
-        "`${known} (+${uncertain} uncertain)`",
         '"State file per environment"',
         '"Differences between environments"',
         "link(ln.text, () => setView(ln.view))",

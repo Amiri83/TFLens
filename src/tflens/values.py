@@ -35,6 +35,8 @@ class Ref:
     attr: str
     value: Any = field(default=None, compare=False, hash=False)
     has_value: bool = field(default=False, compare=False, hash=False)
+    # instances the reference stands for (``aws_subnet.a[*].id``), when that is known
+    count: int | None = field(default=None, compare=False, hash=False)
 
     def expr(self) -> str:
         return f"{self.target}.{self.attr}" if self.attr else self.target
@@ -42,8 +44,15 @@ class Ref:
 
 @dataclass(frozen=True)
 class Unknown:
+    """A value that cannot be determined. ``after_apply``: it only exists once terraform has
+    applied and the code shows where it comes from (a transformation of an ARN or id, a
+    ``timestamp()``): that is a link, not an unknown, so it is never listed as one.
+    ``origin``: the file:line where the chain ends (the ``variable`` block with no value)."""
+
     reason: str
     refs: tuple[Ref, ...] = ()
+    after_apply: bool = field(default=False, compare=False, hash=False)
+    origin: Location | None = field(default=None, compare=False, hash=False)
 
 
 @dataclass(frozen=True)
@@ -63,10 +72,45 @@ class JsonEncoded:
 
 
 def unknown_from(reason: str, *values: Any) -> Unknown:
+    """An Unknown computed from ``values``. When something in them is really unknown its
+    reason is kept (and its origin); when all they lack are after-apply values the code links
+    to, the result is one too (``after_apply``)."""
     refs: list[Ref] = []
+    blocking: Unknown | None = None
+    deferred = False
     for v in values:
         refs.extend(collect_refs(v))
-    return Unknown(reason, tuple(dict.fromkeys(refs)))
+        found: list[tuple[str, Unknown]] = []
+        _walk_unknowns(v, "", found, True)
+        for _, u in found:
+            if u.after_apply:
+                deferred = True
+            elif blocking is None:
+                blocking = u
+    if blocking is not None and blocking.reason not in reason:
+        reason = f"{reason} ({blocking.reason})"
+    return Unknown(
+        reason,
+        tuple(dict.fromkeys(refs)),
+        after_apply=blocking is None and (deferred or bool(refs)),
+        origin=blocking.origin if blocking is not None else None,
+    )
+
+
+def shows_link(value: Any) -> bool:
+    """Whether a value that is not known statically only lacks what exists after apply: the
+    code shows the link, so it is not an unknown."""
+    if isinstance(value, Ref) and value.has_value:
+        value = value.value
+    if isinstance(value, Unknown):
+        return value.after_apply
+    return not collect_unknowns(value) and bool(collect_refs(value) or _has_deferred(value))
+
+
+def _has_deferred(value: Any) -> bool:
+    found: list[tuple[str, Unknown]] = []
+    _walk_unknowns(value, "", found, True)
+    return bool(found)
 
 
 def collect_refs(value: Any) -> list[Ref]:
@@ -94,25 +138,27 @@ def _walk_refs(value: Any, out: list[Ref]) -> None:
 
 
 def collect_unknowns(value: Any, path: str = "") -> list[tuple[str, Unknown]]:
+    """The real unknowns of a value (after-apply links are not unknowns)."""
     out: list[tuple[str, Unknown]] = []
-    _walk_unknowns(value, path, out)
+    _walk_unknowns(value, path, out, False)
     return out
 
 
-def _walk_unknowns(value: Any, path: str, out: list[tuple[str, Unknown]]) -> None:
+def _walk_unknowns(value: Any, path: str, out: list[tuple[str, Unknown]], deferred: bool) -> None:
     if isinstance(value, Unknown):
-        out.append((path, value))
+        if deferred or not value.after_apply:
+            out.append((path, value))
     elif isinstance(value, Interp):
         for p in value.parts:
-            _walk_unknowns(p, path, out)
+            _walk_unknowns(p, path, out, deferred)
     elif isinstance(value, JsonEncoded):
-        _walk_unknowns(value.value, path, out)
+        _walk_unknowns(value.value, path, out, deferred)
     elif isinstance(value, dict):
         for k, v in value.items():
-            _walk_unknowns(v, f"{path}.{k}" if path else str(k), out)
+            _walk_unknowns(v, f"{path}.{k}" if path else str(k), out, deferred)
     elif isinstance(value, list):
         for i, v in enumerate(value):
-            _walk_unknowns(v, f"{path}[{i}]", out)
+            _walk_unknowns(v, f"{path}[{i}]", out, deferred)
 
 
 def unwrap(value: Any) -> Any:
@@ -179,6 +225,8 @@ def display(value: Any) -> str:
             return display(value.value)
         return "${" + value.expr() + "}"
     if isinstance(value, Unknown):
+        if value.after_apply:
+            return _after_apply_text(value)
         return f"<unknown: {value.reason}>"
     if isinstance(value, Interp):
         return "".join(display(p) for p in value.parts)
@@ -190,6 +238,12 @@ def display(value: Any) -> str:
         return "null"
     s = scalar_str(value)
     return s if s is not None else repr(value)
+
+
+def _after_apply_text(value: Unknown) -> str:
+    """``${aws_x.y.arn}``: what an after-apply value is computed from."""
+    refs = [f"${{{r.expr()}}}" for r in value.refs]
+    return " ".join(refs) if refs else "(known after apply)"
 
 
 def to_plain(value: Any) -> Any:
@@ -215,6 +269,11 @@ def to_json(value: Any) -> Any:
             d["value"] = to_json(value.value)
         return d
     if isinstance(value, Unknown):
+        if value.after_apply:
+            return {
+                "$template": _after_apply_text(value),
+                "refs": sorted({r.target for r in value.refs}),
+            }
         return {"$unknown": value.reason}
     if isinstance(value, Interp):
         s = render(value)

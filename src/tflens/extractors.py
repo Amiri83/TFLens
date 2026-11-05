@@ -129,9 +129,10 @@ def lambda_function(a: Analyzer, it: Item) -> None:
             a.props(it.id, environment_variables=sorted(variables))
     if "runtime" in it.block.attrs:
         loc = a.attr_loc(it, "runtime")
-        rt = render(a.get(it, "runtime"))
+        runtime = a.get(it, "runtime")
+        rt = render(runtime)
         if rt is None:
-            a.unknown(it.id, "runtime", "runtime is not known statically", loc)
+            a.unresolved(it.id, "runtime", runtime, "runtime is not known statically", loc)
         else:
             a.edge("RUNS_ON", it.id, a.external("runtime", rt), "runtime", [a.ev(loc)])
     if "image_uri" in it.block.attrs:
@@ -156,7 +157,13 @@ def lambda_event_source_mapping(a: Analyzer, it: Item) -> None:
         # not known are named after their variable, else the cluster stands for them
         sources = [a.external("kafka_topic", t) for t in topics]
         if not topics:
-            a.unknown(it.id, "topics", "Kafka topics are not known statically", it.loc)
+            a.unresolved(
+                it.id,
+                "topics",
+                a.get(it, "topics"),
+                "Kafka topics are not known statically",
+                it.loc,
+            )
             named = a.named_external(it, "topics", "kafka_topic")
             sources = [named or a.external("kafka", "self-managed Kafka")]
     else:
@@ -221,8 +228,12 @@ def lambda_permission(a: Analyzer, it: Item) -> None:
         )
     if not sources:
         if principal is None:
-            a.unknown(
-                it.id, "principal", "principal is not known statically", a.attr_loc(it, "principal")
+            a.unresolved(
+                it.id,
+                "principal",
+                a.get(it, "principal"),
+                "principal is not known statically",
+                a.attr_loc(it, "principal"),
             )
             return
         kind = "aws_account" if principal.isdigit() else "aws_service"
@@ -314,7 +325,13 @@ def sns_subscription(a: Analyzer, it: Item) -> None:
     protocol = render(a.get(it, "protocol"))
     loc = a.attr_loc(it, "endpoint")
     if protocol is None:
-        a.unknown(it.id, "protocol", "protocol is not known statically", a.attr_loc(it, "protocol"))
+        a.unresolved(
+            it.id,
+            "protocol",
+            a.get(it, "protocol"),
+            "protocol is not known statically",
+            a.attr_loc(it, "protocol"),
+        )
         return
     if protocol in _ARN_PROTOCOLS:
         endpoints = a.resolve(it, a.get(it, "endpoint"), "endpoint", loc, None, protocol)
@@ -583,7 +600,13 @@ def security_group(a: Analyzer, it: Item) -> None:
 def security_group_rule(a: Analyzer, it: Item) -> None:
     direction = render(a.get(it, "type"))
     if direction not in ("ingress", "egress"):
-        a.unknown(it.id, "type", "rule type is not known statically", a.attr_loc(it, "type"))
+        a.unresolved(
+            it.id,
+            "type",
+            a.get(it, "type"),
+            "rule type is not known statically",
+            a.attr_loc(it, "type"),
+        )
         return
     rule = {name: a.get(it, name) for name in it.block.attrs}
     sgs = a.resolve(
@@ -795,8 +818,9 @@ def apigw_integration(a: Analyzer, it: Item) -> None:
         for r in collect_refs(a.get(it, uri_attr))
         if r.target in a.graph.nodes and r.target != it.id
     ]
-    if not targets:
-        a.unknown(it.id, uri_attr, "the integration target is not a resource here", loc)
+    uri = a.get(it, uri_attr)
+    if not targets and render(uri) is None:  # a literal URL is known: it just is not a resource
+        a.unresolved(it.id, uri_attr, uri, "the integration target is not a resource here", loc)
     for api in apis:
         for t in dict.fromkeys(targets):
             a.edge("TRIGGER", api, t, "API integration", [a.ev(it.loc)], {}, [it.id])

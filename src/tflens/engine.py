@@ -13,9 +13,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .ciscan import ci_var_inputs, ci_workspace_use
 from .evaluate import Ops, apply_ops, evaluate
+from .expr import Call, ObjectExpr
 from .loader import Attr, Block, ModuleSource, RemoteModule, RepoSource
-from .values import JsonEncoded, Location, Ref, Unknown, display, is_known, render, unwrap
+from .values import (
+    JsonEncoded,
+    Location,
+    Ref,
+    Unknown,
+    collect_unknowns,
+    display,
+    is_known,
+    render,
+    unwrap,
+)
 
 # Provider-documented identities: these computed attributes equal a configured argument.
 ATTR_ALIASES: dict[tuple[str, str], str] = {
@@ -98,6 +110,7 @@ class ModuleInstance:
         if key in self._memo:
             v = self._memo[key]
             if v is _CIRCULAR:
+                self.engine.cycle_hits += 1
                 return Unknown(f"circular reference while evaluating {'.'.join(map(str, key))}")
             return v
         self._memo[key] = _CIRCULAR
@@ -105,8 +118,14 @@ class ModuleInstance:
         self._memo[key] = v
         return v
 
-    def eval_attr(self, attr: Attr, self_id: str | None = None) -> Any:
-        return evaluate(attr.expr, AttrScope(self, attr.loc, self_id))
+    def eval_attr(
+        self, attr: Attr, self_id: str | None = None, bindings: dict[str, Any] | None = None
+    ) -> Any:
+        return evaluate(attr.expr, AttrScope(self, attr.loc, self_id), bindings)
+
+    def call_id(self, name: str) -> str:
+        """The id of a module call of this module (``<root>::module.a.module.b``)."""
+        return f"{self.prefix}{self.address + '.' if self.address else ''}module.{name}"
 
     # ---------------------------------------------------------------- resolution
     def resolve(self, name: str, ops: Ops, scope: AttrScope) -> tuple[Any, Ops]:
@@ -122,8 +141,13 @@ class ModuleInstance:
         if name == "module":
             if first is None:
                 return Unknown("invalid module reference"), []
-            if len(ops) > 1 and ops[1][0] == "attr":
-                return self.module_output(first, ops[1][1]), ops[2:]
+            # module.a[0].out / module.a["k"].out / module.a[*].out: one module's outputs
+            # (a node stands for all its instances)
+            i = 1
+            while i < len(ops) and ops[i][0] in ("index", "splat"):
+                i += 1
+            if i < len(ops) and ops[i][0] == "attr":
+                return self.module_output(first, ops[i][1]), ops[i + 1 :]
             return self.module_outputs(first), ops[1:]
         if name == "data":
             if first is None or len(ops) < 2 or ops[1][0] != "attr":
@@ -132,11 +156,11 @@ class ModuleInstance:
         if name == "path":
             if first == "module":
                 return self.src.dir, ops[1:]
-            if first == "root":
+            if first in ("root", "cwd"):  # terraform runs from the root module's directory
                 return self.root_dir, ops[1:]
             return Unknown(f"path.{first} depends on the working directory"), []
         if name == "terraform":
-            return Unknown("terraform.workspace is selected at runtime"), []
+            return self.engine.workspace(self.root_dir, scope.location), []
         if name == "count":
             only = self.only_instance(scope.self_id) or self.first_instance(scope.self_id)
             if only is not None and first == "index":
@@ -148,7 +172,7 @@ class ModuleInstance:
                 return only[0 if first == "key" else 1], ops[1:]
             return Unknown("each.key/each.value differ per resource instance"), []
         if name == "self":
-            return Unknown("self.* is only known after apply"), []
+            return Unknown("self.* is only known after apply", after_apply=True), []
         if first is not None and (name, first) in self.src.resources:
             return self.resource_ref(name, first, ops[1:]), []
         return Unknown(f"reference to undeclared object {name}{'.' + first if first else ''}"), []
@@ -168,24 +192,44 @@ class ModuleInstance:
             assert caller is not None
             inp = self.call.attrs.get(name)
             if inp is not None:
-                value = caller.eval_attr(inp)
-                self.var_info[name] = VarInfo(
-                    name, value, f"module input ({self.call.loc})", inp.loc, has_default, desc
-                )
-                return value
+                # each.* / count.index of the call: the instance its node stands for
+                value = caller.eval_attr(inp, caller.call_id(self.call.labels[0]))
+                # nullable = false: an explicit null input takes the default
+                if unwrap(value) is not None or has_default is False or _nullable(block):
+                    value = _apply_type(value, block)
+                    self.var_info[name] = VarInfo(
+                        name, value, f"module input ({self.call.loc})", inp.loc, has_default, desc
+                    )
+                    return value
         else:
             tv = self.engine.root_var(self.root_dir, name)
             if tv is not None:
                 value, src_label, loc = tv
+                value = _apply_type(value, block)
                 self.var_info[name] = VarInfo(name, value, src_label, loc, has_default, desc)
                 return value
         if has_default:
             attr = block.attrs["default"]
-            value = self.eval_attr(attr)
+            value = _apply_type(self.eval_attr(attr), block)
             self.var_info[name] = VarInfo(name, value, "default", attr.loc, True, desc)
             return value
+        if self.call is None:
+            found = self.engine.ci_var(name)
+            if found is not None:
+                raw, ci_loc = found
+                if raw is not None:
+                    self.var_info[name] = VarInfo(name, raw, str(ci_loc), ci_loc, False, desc)
+                    return raw
+                value = Unknown(
+                    f"variable var.{name} is set at run time by {ci_loc} (not in the repository)",
+                    origin=block.loc,
+                )
+                self.var_info[name] = VarInfo(name, value, "unset", block.loc, False, desc)
+                return value
         where = "module call" if self.call is not None else "tfvars/--var-file"
-        value = Unknown(f"variable var.{name} has no default and no value in {where}")
+        value = Unknown(
+            f"variable var.{name} has no default and no value in {where}", origin=block.loc
+        )
         self.var_info[name] = VarInfo(name, value, "unset", block.loc, False, desc)
         return value
 
@@ -206,14 +250,32 @@ class ModuleInstance:
             return Unknown(f"reference to undeclared module.{mname}")
         child = self.children.get(mname)
         if child is None:
-            return Unknown(self.child_status.get(mname, f"module.{mname} not analyzed"))
+            # a module whose code is not here (reported once, on the call): the reference
+            # to its output is still a link the code shows, not one unknown per consumer
+            return Ref(self.call_id(mname), out)
         return child.output(out)
 
     def module_outputs(self, mname: str) -> Any:
+        """``module.a`` as a whole: its outputs, per instance when it has count / for_each
+        (``values(module.a)[*].arn``): each stands for the instance the node shows."""
+        if mname not in self.src.module_calls:
+            return Unknown(f"reference to undeclared module.{mname}")
         child = self.children.get(mname)
         if child is None:
-            return Unknown(self.child_status.get(mname, f"module.{mname} not analyzed"))
-        return {name: child.output(name) for name in sorted(child.src.outputs)}
+            return Ref(self.call_id(mname), "")
+        outputs = {name: child.output(name) for name in sorted(child.src.outputs)}
+        call = self.src.module_calls[mname]
+        if "for_each" in call.attrs:
+            each = self._each_value(call.attrs["for_each"])
+            if isinstance(each, dict):
+                return {str(k): outputs for k in each}
+            if isinstance(each, list):
+                return {str(unwrap(k)): outputs for k in each}
+        elif "count" in call.attrs:
+            n = self.instances_of(call)[0]
+            if n is not None:
+                return [outputs] * n
+        return outputs
 
     def resource_attr(self, rtype: str, name: str, attr: str) -> tuple[bool, Any]:
         """Configured value of a resource argument: (configured?, value)."""
@@ -240,30 +302,95 @@ class ModuleInstance:
             return True, self.memo(
                 key, lambda: [self.eval_block(b, node_id) for b in block.blocks[attr]]
             )
+        if attr in block.dynamic:
+            return True, self.memo(key, lambda: self.eval_dynamic(block, attr, node_id))
         return False, None
 
-    def eval_block(self, block: Block, self_id: str | None = None) -> dict[str, Any]:
+    def eval_block(
+        self,
+        block: Block,
+        self_id: str | None = None,
+        bindings: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         out: dict[str, Any] = {}
         for name in block.attrs:
-            out[name] = self.eval_attr(block.attrs[name], self_id)
+            out[name] = self.eval_attr(block.attrs[name], self_id, bindings)
         for name, children in block.blocks.items():
-            out[name] = [self.eval_block(b, self_id) for b in children]
+            out[name] = [self.eval_block(b, self_id, bindings) for b in children]
         for name in block.dynamic:
-            out.setdefault(name, Unknown(f"dynamic block {name!r} is not expanded statically"))
+            value = self.eval_dynamic(block, name, self_id, bindings)
+            current = out.get(name)
+            if isinstance(current, list) and isinstance(value, list):
+                out[name] = current + value
+            else:
+                out.setdefault(name, value)
         return out
+
+    def expand_dynamic(
+        self,
+        block: Block,
+        name: str,
+        self_id: str | None = None,
+        bindings: dict[str, Any] | None = None,
+    ) -> tuple[list[tuple[Block, dict[str, Any]]] | None, Any]:
+        """The ``content`` of a ``dynamic`` block with the bindings of each element:
+        ``(items, for_each value)``; ``items`` is None when ``for_each`` is not known."""
+        dyn = block.dynamic_blocks.get(name)
+        if dyn is None or "for_each" not in dyn.attrs or not dyn.blocks.get("content"):
+            return None, None
+        value = unwrap(self.eval_attr(dyn.attrs["for_each"], self_id, bindings))
+        if isinstance(value, dict):
+            pairs = sorted(value.items(), key=lambda kv: str(kv[0]))
+        elif isinstance(value, list):
+            pairs = list(enumerate(value))
+        elif value is None:
+            pairs = []
+        else:
+            return None, value
+        iterator = name
+        if "iterator" in dyn.attrs:
+            iterator = str(dyn.attrs["iterator"].raw).removeprefix("${").removesuffix("}").strip()
+        content = dyn.blocks["content"][0]
+        return [
+            (content, {**(bindings or {}), iterator: {"key": k, "value": v}}) for k, v in pairs
+        ], value
+
+    def eval_dynamic(
+        self,
+        block: Block,
+        name: str,
+        self_id: str | None = None,
+        bindings: dict[str, Any] | None = None,
+    ) -> Any:
+        """A ``dynamic`` block's values: one per element of its ``for_each``, like the
+        blocks it generates; an Unknown (with why) when ``for_each`` is not known."""
+        items, value = self.expand_dynamic(block, name, self_id, bindings)
+        if items is None:
+            return unknown_dynamic(name, value)
+        return [self.eval_block(c, self_id, b) for c, b in items]
 
     def resource_ref(self, rtype: str, name: str, ops: Ops) -> Any:
         node_id = self.node_id(rtype, name)
+        indexed = False
         while ops and ops[0][0] in ("index", "splat"):
+            indexed = indexed or ops[0][0] == "index"
             ops = ops[1:]
+        count = None if indexed else self._ref_count(self.src.resources[(rtype, name)])
         if not ops:
-            return Ref(node_id, "")
+            return Ref(node_id, "", count=count)
         attr = ops[0][1]
         configured, value = self.resource_attr(rtype, name, attr)
-        ref = Ref(node_id, attr, value, configured and is_known(value))
+        ref = Ref(node_id, attr, value, configured and is_known(value), count)
         if configured and not is_known(value):
-            ref = Ref(node_id, attr, value, False)
+            ref = Ref(node_id, attr, value, False, count)
         return apply_ops(ref, ops[1:])
+
+    def _ref_count(self, block: Block) -> int | None:
+        """Instances a whole-resource reference stands for (None: not one with count /
+        for_each, or not known)."""
+        if "count" not in block.attrs and "for_each" not in block.attrs:
+            return None
+        return self.instances_of(block)[0]
 
     def data_value(self, dtype: str, name: str, ops: Ops) -> Any:
         if (dtype, name) not in self.src.data:
@@ -308,16 +435,34 @@ class ModuleInstance:
         reference to the remote state (an external link, never an unknown value)."""
         node_id = self.node_id("terraform_remote_state", name, data=True)
         fallback = apply_ops(Ref(node_id, "outputs"), ops)
-        if not ops or ops[0][0] != "attr":
+        output = None
+        if ops and ops[0][0] == "attr":
+            output = ops[0][1]
+        elif ops and ops[0][0] == "index":  # outputs["vpc_id"]
+            output = render(ops[0][1])
+        if output is None:
             return fallback
         link = self.remote_state(name)
-        target = self.engine.root_instance(link.get("stack"))
-        applied = self.engine.root_envs.get(link.get("stack") or "")
-        if applied and link.get("env") and applied != link["env"]:
-            target = None  # that stack is analyzed here with another environment's tfvars
-        if target is None or ops[0][1] not in target.src.outputs:
+        stack, env = link.get("stack"), link.get("env")
+        if stack is None:
             return fallback
-        value = target.output(ops[0][1])
+        reader_env = self.engine.root_envs.get(self.root_dir)
+        if reader_env and env and env != reader_env:
+            return fallback  # the producing stack has no state for this environment
+        applied = self.engine.root_envs.get(stack)
+        target = self.engine.root_instance(stack)
+        if target is None or (applied and env and applied != env):
+            # not analyzed here with this environment's tfvars: the producing stack's own
+            # code, with its files for this environment, gives what the code fixes; an id
+            # only known after that stack's apply stays a link to its remote state
+            producer = self.engine.producer(stack, env)
+            if producer is None or output not in producer.src.outputs:
+                return fallback
+            value = producer.output(output)
+            return apply_ops(value, ops[1:]) if is_known(value) else fallback
+        if output not in target.src.outputs:
+            return fallback
+        value = target.output(output)
         if isinstance(unwrap(value), Unknown):
             return fallback
         return apply_ops(value, ops[1:])
@@ -346,8 +491,14 @@ class ModuleInstance:
                         statements.append(Unknown(f"{key} entry is not a known policy document"))
                         locs.append(block.attrs[key].loc)
         if "statement" in block.dynamic:
-            statements.append(Unknown("dynamic statement block is not expanded statically"))
-            locs.append(block.loc)
+            items, _ = self.expand_dynamic(block, "statement", node_id)
+            if items is None:
+                statements.append(Unknown("dynamic statement block is not expanded statically"))
+                locs.append(block.loc)
+            else:
+                for content, bindings in items:
+                    statements.append(_iam_statement(self.eval_block(content, node_id, bindings)))
+                    locs.append(content.loc)
         for st_block in block.blocks.get("statement", []):
             st = self.eval_block(st_block, node_id)
             statements.append(_iam_statement(st))
@@ -363,11 +514,23 @@ class ModuleInstance:
         return out if isinstance(out, tuple) else (None, f"count is not known: {out.reason}")
 
     def _instances_of(self, block: Block) -> tuple[int | None, str]:
-        for meta in ("count", "for_each"):
-            attr = block.attrs.get(meta)
-            if attr is not None:
-                return _instance_count(meta, self.eval_attr(attr))
+        if "count" in block.attrs:
+            return _instance_count("count", self.eval_attr(block.attrs["count"]))
+        attr = block.attrs.get("for_each")
+        if attr is not None:
+            each = self._each_value(attr)
+            return _instance_count("for_each", self.eval_attr(attr) if each is None else each)
         return 1, ""
+
+    def _each_value(self, attr: Attr) -> Any:
+        """A ``for_each``'s collection, also when it is another resource with a known
+        ``for_each`` (``for_each = aws_x.y``: the same keys). None when not known."""
+        value = unwrap(self.eval_attr(attr))
+        if isinstance(value, Ref) and not value.attr:
+            source = self.blocks_by_id().get(value.target)
+            if source is not None and "for_each" in source.attrs:
+                return self._each_value(source.attrs["for_each"])
+        return value if isinstance(value, (dict, list)) else None
 
     def multiplicity(self) -> tuple[int | None, str]:
         """How many times this module instance is created (the product of the counts of
@@ -390,6 +553,7 @@ class ModuleInstance:
         if "_blocks" not in self._memo:
             blocks = {self.node_id(t, n): b for (t, n), b in self.src.resources.items()}
             blocks.update({self.node_id(t, n, True): b for (t, n), b in self.src.data.items()})
+            blocks.update({self.call_id(n): b for n, b in self.src.module_calls.items()})
             self._memo["_blocks"] = blocks
         return self._memo["_blocks"]
 
@@ -402,7 +566,7 @@ class ModuleInstance:
         if "count" in block.attrs:
             return (0, None) if self.instances_of(block)[0] == 1 else None
         attr = block.attrs.get("for_each")
-        value = unwrap(self.eval_attr(attr)) if attr is not None else None
+        value = self._each_value(attr) if attr is not None else None
         if isinstance(value, dict) and len(value) == 1:
             ((key, item),) = value.items()
             return key, item
@@ -422,7 +586,7 @@ class ModuleInstance:
             n = self.instances_of(block)[0]
             return (0, None) if n else None
         attr = block.attrs.get("for_each")
-        value = unwrap(self.eval_attr(attr)) if attr is not None else None
+        value = self._each_value(attr) if attr is not None else None
         if isinstance(value, dict) and value:
             key = min(value, key=str)
             return key, value[key]
@@ -450,6 +614,65 @@ class ModuleInstance:
         return [self.var_info[n] for n in sorted(self.var_info)]
 
 
+def unknown_dynamic(name: str, value: Any = None) -> Unknown:
+    """A ``dynamic`` block whose ``for_each`` is not known."""
+    base = f"dynamic block {name!r} is not expanded statically"
+    if isinstance(value, Unknown):
+        return Unknown(f"{base} ({value.reason})", value.refs, value.after_apply, value.origin)
+    if isinstance(value, Ref):
+        return Unknown(base, (value,), after_apply=True)
+    return Unknown(base)
+
+
+def _nullable(block: Block) -> bool:
+    attr = block.attrs.get("nullable")
+    return attr is None or getattr(attr.expr, "value", True) is not False
+
+
+def _apply_type(value: Any, block: Block) -> Any:
+    """A variable's value with its type's ``optional(type, default)`` attributes filled in,
+    as terraform does; values that are not plain objects / collections are left alone."""
+    attr = block.attrs.get("type")
+    return value if attr is None else _coerce(value, attr.expr)
+
+
+def _coerce(value: Any, type_expr: Any) -> Any:
+    if not isinstance(type_expr, Call) or not type_expr.args:
+        return value
+    name = type_expr.name
+    arg = type_expr.args[0]
+    if name == "optional":
+        return _coerce(value, arg)
+    if name == "object" and isinstance(arg, ObjectExpr) and isinstance(value, dict):
+        out = dict(value)
+        for key_expr, attr_type in arg.items:
+            key = getattr(key_expr, "value", None)
+            if not isinstance(key, str):
+                continue
+            if (
+                out.get(key) is None
+                and isinstance(attr_type, Call)
+                and (attr_type.name == "optional")
+            ):
+                out[key] = _optional_default(attr_type)
+            elif key in out:
+                out[key] = _coerce(out[key], attr_type)
+        return out
+    if name == "map" and isinstance(value, dict):
+        return {k: _coerce(v, arg) for k, v in value.items()}
+    if name in ("list", "set") and isinstance(value, list):
+        return [_coerce(v, arg) for v in value]
+    return value
+
+
+def _optional_default(opt: Call) -> Any:
+    """``optional(type, default)``: the default (null without one), of that type."""
+    if len(opt.args) < 2:
+        return None
+    default = evaluate(opt.args[1], _NoRefScope())
+    return _coerce(default, opt.args[0])
+
+
 def _instance_count(meta: str, value: Any) -> tuple[int | None, str]:
     """``count`` / ``for_each`` value -> number of instances, or (None, why not known)."""
     v = unwrap(value)
@@ -464,6 +687,8 @@ def _instance_count(meta: str, value: Any) -> tuple[int | None, str]:
     if isinstance(v, (dict, list)):
         return len(v), ""
     if isinstance(v, Ref):
+        if v.count is not None:
+            return v.count, ""
         return None, f"for_each = ${{{v.expr()}}} is only known after apply"
     return None, f"for_each = {display(v)} is not a map or set"
 
@@ -537,6 +762,12 @@ class Engine:
         self.root_modules: dict[str, str] = {}
         self.units: dict[str, Any] = {}  # root directory -> terragrunt.Unit
         self._root_vars: dict[str, dict[str, tuple[Any, str, Location]]] = {}
+        # (root, env) -> that stack evaluated with that environment's files, to read its
+        # outputs when it is not analyzed here (shared between the engines it creates)
+        self._producers: dict[tuple[str, str], ModuleInstance | None] = {}
+        self._ci_vars: dict[str, tuple[str | None, Location]] | None = None
+        # how many reads met a value still being evaluated (settle: re-evaluate those)
+        self.cycle_hits = 0
 
     # ------------------------------------------------------------ discovery
     def referenced_dirs(self) -> set[str]:
@@ -584,18 +815,25 @@ class Engine:
         with rendered values, None where not known) reads: ``{stack, env, status, reason}``.
         A state is matched when the backend type and every identifying setting both sides
         know (bucket, key, prefix, path, ...) are equal; ``local`` paths are relative to
-        the root reading them."""
+        the root reading them. Of several states that match, the one of the reader's
+        environment wins (the same ``key`` in one bucket per environment). A stack whose
+        backend leaves its key to ``terraform init`` is matched by the directory the key
+        names, when exactly one stack lives there."""
         if btype == "local":
             path = config.get("path") or "terraform.tfstate"
             config = {"path": posixpath.normpath(posixpath.join(inst.root_dir, path))}
-        if any(config.get(k) is None for k in _STATE_KEYS if k in config):
-            missing = [k for k in _STATE_KEYS if k in config and config[k] is None]
+        missing = [k for k in _STATE_KEYS if k in config and config[k] is None]
+        has_path = any(k in _STATE_PATH_KEYS and config.get(k) is not None for k in _STATE_KEYS)
+        if missing and not has_path:
             return {
                 "stack": None,
                 "env": None,
                 "status": "unresolved",
                 "reason": f"config {', '.join(missing)} not known statically",
             }
+        known = {k: v for k, v in config.items() if v is not None}
+        matches = []
+        partial = []
         for entry in self.state_index:
             if entry["type"] != btype or entry["root"] == inst.root_dir:
                 continue
@@ -603,23 +841,102 @@ class Engine:
             if btype == "local":
                 path = settings.get("path") or "terraform.tfstate"
                 settings = {"path": posixpath.normpath(posixpath.join(entry["root"], path))}
-            shared = [k for k in _STATE_KEYS if k in config and settings.get(k) is not None]
+            shared = [k for k in _STATE_KEYS if k in known and settings.get(k) is not None]
             if not any(k in _STATE_PATH_KEYS for k in shared):
+                if all(str(known[k]) == str(settings[k]) for k in shared):
+                    partial.append(entry)
                 continue
-            if all(str(config[k]) == str(settings[k]) for k in shared):
-                return {
-                    "stack": entry["root"],
-                    "env": entry.get("env"),
-                    "status": "linked",
-                    "reason": f"{btype} state of {entry['root']}"
-                    + (f" ({entry['env']})" if entry.get("env") else ""),
-                }
+            if all(str(known[k]) == str(settings[k]) for k in shared):
+                matches.append(entry)
+        matches = matches or _named_by_key(known, partial)
+        if matches:
+            reader = self.root_envs.get(inst.root_dir)
+            entry = next(
+                (m for m in matches if reader and m.get("env") == reader),
+                next((m for m in matches if not m.get("env")), matches[0]),
+            )
+            return {
+                "stack": entry["root"],
+                "env": entry.get("env"),
+                "status": "linked",
+                "reason": f"{btype} state of {entry['root']}"
+                + (f" ({entry['env']})" if entry.get("env") else ""),
+            }
+        if missing:
+            return {
+                "stack": None,
+                "env": None,
+                "status": "unresolved",
+                "reason": f"config {', '.join(missing)} not known statically",
+            }
         return {
             "stack": None,
             "env": None,
             "status": "external",
             "reason": "no stack of this repository writes this state",
         }
+
+    def producer(self, root: str, env: str | None) -> ModuleInstance | None:
+        """The stack ``root`` evaluated with its files for ``env``, to read its outputs when
+        it is not analyzed here (its blocks are not added to the graph). None when the
+        repository has no state of that stack for that environment."""
+        key = (root, env or "")
+        if key in self._producers:
+            return self._producers[key]
+        entry = next(
+            (e for e in self.state_index if e["root"] == root and (e.get("env") or "") == key[1]),
+            None,
+        )
+        self._producers[key] = None
+        if entry is None:
+            return None
+        child = Engine(self.repo, root_var_files={root: list(entry.get("var_files") or [])})
+        child.state_index = self.state_index
+        child._producers = self._producers
+        child.root_envs = {root: env} if env else {}
+        child.discover_roots()
+        src = self.repo.modules.get(child.root_modules.get(root, root))
+        if src is None:
+            return None
+        inst = child._instantiate(src, "", f"{root}::", root, None, None, ())
+        self._producers[key] = inst
+        return inst
+
+    # ------------------------------------------------------------ CI inputs
+    def ci_var(self, name: str) -> tuple[str | None, Location] | None:
+        """A variable a CI file / script on disk sets (``-var``, ``TF_VAR_*``): its value
+        when literal, None when it is computed at run time, and the line that sets it."""
+        if self._ci_vars is None:
+            self._ci_vars = ci_var_inputs(self.repo)
+        return self._ci_vars.get(name)
+
+    def workspace(self, root_dir: str, location: Location | None) -> Any:
+        """``terraform.workspace``: what the repository's CI selects (the environment), or
+        ``default`` when it has CI files that never select one."""
+        use = ci_workspace_use(self.repo)
+        if use == "selects":
+            env = self.root_envs.get(root_dir)
+            if env:
+                return env
+        elif use == "never":
+            return "default"
+        return Unknown("terraform.workspace is selected at runtime", origin=location)
+
+    # ------------------------------------------------------------ stable values
+    def settle(self) -> None:
+        """Repeat until stable. Evaluation is lazy and memoized, so one pass follows every
+        chain to its end; only a read of a value still being evaluated (a cycle, guarded
+        by ``try()`` or real) can leave a stale unknown behind. Those are forgotten and
+        evaluated again, as long as that resolves more of them."""
+        previous: int | None = None
+        for _ in range(MAX_SETTLE_ROUNDS):
+            self.cycle_hits = 0
+            open_values = sum(_evaluate_all(i) for i in self.instances)
+            if not self.cycle_hits or (previous is not None and open_values >= previous):
+                return
+            previous = open_values
+            for inst in self.instances:
+                inst._memo = {k: v for k, v in inst._memo.items() if not _is_open(v)}
 
     def _remote(self, root_dir: str, address: str) -> tuple[RemoteModule | None, str]:
         """Materialized directory of a remote module call, from the root's modules.json."""
@@ -642,6 +959,7 @@ class Engine:
             prefix = f"{root}::" if multi else ""
             src = self.repo.modules[self.root_modules[root]]
             self._instantiate(src, "", prefix, root, None, None, ())
+        self.settle()
         return self.instances
 
     def _instantiate(
@@ -721,12 +1039,11 @@ class Engine:
         unit = self.units.get(root_dir)
         if unit is not None:
             # Terragrunt passes inputs as TF_VAR_* variables: the lowest precedence.
-            empty.what = "terragrunt inputs"
+            unit_scope = _UnitScope(self, unit)
             for name, attr in unit.inputs.items():
-                empty.location = attr.loc
+                unit_scope.location = attr.loc
                 label = f"terragrunt inputs ({attr.loc.file})"
-                out[name] = (evaluate(attr.expr, empty), label, attr.loc)
-            empty.what = "tfvars"
+                out[name] = (evaluate(attr.expr, unit_scope), label, attr.loc)
         for f in files:
             for name, attr in self.repo.tfvars[f].items():
                 empty.location = attr.loc
@@ -762,15 +1079,104 @@ class _EmptyScope:
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
         self.location: Location | None = None
-        self.what = "tfvars"
 
     def resolve(self, name: str, ops: Ops) -> tuple[Any, Ops]:
-        if self.what != "tfvars":
-            return Unknown(f"{name}.* in {self.what} is only known when terragrunt runs"), []
-        return Unknown(f"references are not allowed in tfvars ({name})"), []
+        return Unknown(f"references are not allowed in tfvars ({name})", origin=self.location), []
 
     def read_file(self, path: str) -> str | None:
         return None
+
+
+class _UnitScope:
+    """A Terragrunt unit's ``inputs``: its locals (and its parents') and the outputs of its
+    ``dependency`` blocks, read from the stack they point at in this repository."""
+
+    def __init__(self, engine: Engine, unit: Any) -> None:
+        self.engine = engine
+        self.unit = unit
+        self.location: Location | None = None
+        self._locals: dict[str, Attr] = {}
+        self._dependencies: dict[str, Block] = {}
+        for cfg in [*unit.parents, unit.config]:
+            self._locals.update(cfg.locals)
+            self._dependencies.update(cfg.dependencies)
+        self._resolving: set[str] = set()
+
+    def resolve(self, name: str, ops: Ops) -> tuple[Any, Ops]:
+        first = ops[0][1] if ops and ops[0][0] == "attr" else None
+        if name == "local" and first in self._locals and first not in self._resolving:
+            self._resolving.add(first)
+            value = evaluate(self._locals[first].expr, self)
+            self._resolving.discard(first)
+            return value, ops[1:]
+        if name == "dependency" and first in self._dependencies:
+            return self._dependency(first, ops[1:])
+        reason = f"{name}.* in terragrunt inputs is only known when terragrunt runs"
+        return Unknown(reason, origin=self.location), []
+
+    def _dependency(self, name: str, ops: Ops) -> tuple[Any, Ops]:
+        """``dependency.<name>.outputs.<x>``: that stack's output; a link to it when the
+        value only exists after its apply (never an unknown: the code shows the link)."""
+        block = self._dependencies[name]
+        attr = block.attrs.get("config_path")
+        path = getattr(attr.expr, "value", None) if attr is not None else None
+        if not isinstance(path, str):
+            return Unknown(f"dependency.{name}: config_path is not a literal path"), []
+        root = posixpath.normpath(posixpath.join(self.unit.dir, path))
+        link = Ref(f"{root}::dependency.{name}", "")
+        if len(ops) < 2 or ops[0] != ("attr", "outputs") or ops[1][0] != "attr":
+            return apply_ops(link, ops), []
+        output = ops[1][1]
+        env = self.engine.root_envs.get(self.unit.dir)
+        producer = self.engine.producer(root, env) or self.engine.producer(root, None)
+        if producer is None or output not in producer.src.outputs:
+            return apply_ops(link, ops), []
+        value = producer.output(output)
+        return (value, ops[2:]) if is_known(value) else (apply_ops(link, ops), [])
+
+    def read_file(self, path: str) -> str | None:
+        return None
+
+
+MAX_SETTLE_ROUNDS = 8
+
+
+def _named_by_key(config: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The states among ``candidates`` (no key of their own) of the one stack whose directory
+    a remote state's key names: ``network/terraform.tfstate``, ``stacks/network/...``."""
+    path = config.get("key") or config.get("prefix")
+    if not isinstance(path, str) or not path:
+        return []
+    named = posixpath.dirname(path) if path.endswith(".tfstate") else path.rstrip("/")
+    if not named:
+        return []
+    parts = named.split("/")
+    roots = {e["root"] for e in candidates}
+    hits = {r for r in roots if r == named or r.split("/")[-1] in parts}
+    return [e for e in candidates if e["root"] in hits] if len(hits) == 1 else []
+
+
+def _evaluate_all(inst: ModuleInstance) -> int:
+    """Evaluate a module instance's variables, locals and outputs: how many are not known."""
+    open_values = 0
+    for name in sorted(inst.src.variables):
+        open_values += _is_open(inst.var(name))
+    for name in sorted(inst.src.locals):
+        open_values += _is_open(inst.local(name))
+    for name in sorted(inst.src.outputs):
+        open_values += _is_open(inst.output(name))
+    return open_values
+
+
+def _is_open(value: Any) -> bool:
+    """A memoized value that may resolve on another pass."""
+    if isinstance(value, tuple):  # instances_of: (None, why not known)
+        return bool(value) and value[0] is None
+    if value is _CIRCULAR:
+        return True
+    if isinstance(value, dict) and value.get("status") == "unresolved":
+        return True
+    return bool(collect_unknowns(value))
 
 
 def _literal_source(block: Block) -> str | None:

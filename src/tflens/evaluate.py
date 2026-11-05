@@ -8,8 +8,14 @@ relationships survive through variables, locals and module outputs.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import ipaddress
 import json
 import math
+import posixpath
+import re
+import urllib.parse
 from collections.abc import Callable
 from typing import Any, Protocol
 
@@ -27,6 +33,8 @@ from .expr import (
     TupleExpr,
     Unary,
     Var,
+    parse_expression,
+    parse_template,
 )
 from .values import (
     Interp,
@@ -99,7 +107,11 @@ class _Evaluator:
                 return self.eval(node.then if c else node.other, b)
             a = self.eval(node.then, b)
             o = self.eval(node.other, b)
+            if is_known(a) and is_known(o) and to_plain(a) == to_plain(o):
+                return a  # the same either way
             if not isinstance(c, Unknown) and c is not None:
+                if isinstance(c, str) and c in ("true", "false"):
+                    return a if c == "true" else o
                 return unknown_from("conditional on non-boolean value", c, a, o)
             reason = c.reason if isinstance(c, Unknown) else "condition not known"
             return unknown_from(f"conditional depends on unknown value ({reason})", c, a, o)
@@ -117,12 +129,70 @@ class _Evaluator:
         value, rest = self.scope.resolve(name, ops)
         return apply_ops(value, rest)
 
+    def _directives(self, items: list[Any], b: dict[str, Any]) -> list[Any]:
+        """Template parts with ``%{ if }`` / ``%{ for }`` expanded: strings, expressions
+        (with the bindings they are evaluated under), or an Unknown for the whole part."""
+        out: list[Any] = []
+        i = 0
+        while i < len(items):
+            p = items[i]
+            if not isinstance(p, Directive):
+                out.append((p, b))
+                i += 1
+                continue
+            word = p.text.split(None, 1)[0] if p.text else ""
+            if word not in ("if", "for"):
+                out.append((Unknown(f"template directive %{{{p.text}}} not evaluated"), b))
+                i += 1
+                continue
+            end, middle = _directive_end(items, i, word)
+            if end is None:
+                out.append((Unknown(f"template directive %{{{p.text}}} has no end"), b))
+                return out
+            body = items[i + 1 : middle if middle is not None else end]
+            other = items[middle + 1 : end] if middle is not None else []
+            if word == "if":
+                out.extend(self._if_directive(p, body, other, b))
+            else:
+                out.extend(self._for_directive(p, body, b))
+            i = end + 1
+        return out
+
+    def _if_directive(
+        self, p: Directive, body: list[Any], other: list[Any], b: dict[str, Any]
+    ) -> list[Any]:
+        c = unwrap(self.eval(parse_expression(p.text[2:].strip()), b))
+        if isinstance(c, str) and c in ("true", "false"):
+            c = c == "true"
+        if not isinstance(c, bool):
+            return [(unknown_from("template %{if} condition is not known", c), b)]
+        return self._directives(body if c else other, b)
+
+    def _for_directive(self, p: Directive, body: list[Any], b: dict[str, Any]) -> list[Any]:
+        m = re.fullmatch(r"for\s+(\w+)(?:\s*,\s*(\w+))?\s+in\s+(.+)", p.text, re.S)
+        if m is None:
+            return [(Unknown(f"template directive %{{{p.text}}} not evaluated"), b)]
+        coll = unwrap(self.eval(parse_expression(m.group(3)), b))
+        if isinstance(coll, dict):
+            pairs = sorted(coll.items(), key=lambda kv: str(kv[0]))
+        elif isinstance(coll, list):
+            pairs = list(enumerate(coll))
+        else:
+            return [(unknown_from("template %{for} collection is not known", coll), b)]
+        out: list[Any] = []
+        for k, v in pairs:
+            nb = dict(b)
+            if m.group(2):
+                nb[m.group(1)], nb[m.group(2)] = k, v
+            else:
+                nb[m.group(1)] = v
+            out.extend(self._directives(body, nb))
+        return out
+
     def template(self, node: Template, b: dict[str, Any]) -> Any:
         parts: list[Any] = []
-        for p in node.parts:
-            v = p if isinstance(p, str) else self.eval(p, b)
-            if isinstance(p, Directive):
-                v = Unknown("template directive (%{...}) not evaluated")
+        for p, pb in self._directives(list(node.parts), b):
+            v = p if isinstance(p, (str, Unknown)) else self.eval(p, pb)
             if isinstance(v, (Ref, Interp, Unknown)):
                 parts.extend(v.parts if isinstance(v, Interp) else [v])
                 continue
@@ -242,15 +312,23 @@ class _Evaluator:
         fn = _FUNCTIONS.get(node.name)
         if node.name == "jsonencode":
             return JsonEncoded(args[0] if args else None, self.scope.location)
-        if node.name in ("file", "templatefile") and args:
+        if node.name in ("file", "templatefile", "filebase64") and args:
             return self._file(node.name, args)
+        if node.name == "fileexists" and args:
+            path = render(args[0])
+            if path is None:
+                return unknown_from("fileexists() path not known", *args)
+            return self.scope.read_file(path) is not None
+        if node.name in _APPLY_TIME:
+            reason = f"{node.name}() is only known after apply"
+            return Unknown(reason, after_apply=True)
         if fn is None:
             return unknown_from(f"function {node.name}() is not evaluated statically", *args)
         try:
             return fn(*args)
         except _NeedsUnknown as exc:
             return unknown_from(f"{node.name}(): {exc}", *args)
-        except (TypeError, ValueError, KeyError, IndexError, AttributeError) as exc:
+        except (TypeError, ValueError, KeyError, IndexError, AttributeError, re.error) as exc:
             return unknown_from(f"{node.name}() could not be evaluated: {exc}", *args)
 
     def _file(self, name: str, args: list[Any]) -> Any:
@@ -262,7 +340,51 @@ class _Evaluator:
             return Unknown(f"{name}(): file {path!r} not found in repository")
         if name == "file":
             return content
-        return Unknown(f"templatefile({path!r}) is not rendered statically")
+        if name == "filebase64":
+            return base64.b64encode(content.encode()).decode()
+        variables = unwrap(args[1]) if len(args) > 1 else {}
+        if not isinstance(variables, dict):
+            return unknown_from(f"templatefile({path!r}): variables are not known", *args[1:])
+        # a template sees the variables it is given, and functions: nothing else
+        return _Evaluator(_TemplateScope(self.scope, path)).eval(
+            parse_template(content, escaped=False), dict(variables)
+        )
+
+
+class _TemplateScope:
+    """What a ``templatefile`` body can reach beyond its variables: nothing but files."""
+
+    def __init__(self, scope: Scope, path: str) -> None:
+        self.scope = scope
+        self.location = scope.location
+        self.path = path
+
+    def resolve(self, name: str, ops: Ops) -> tuple[Any, Ops]:
+        return Unknown(f"templatefile({self.path!r}): no variable {name!r} passed to it"), []
+
+    def read_file(self, path: str) -> str | None:
+        return self.scope.read_file(path)
+
+
+def _directive_end(items: list[Any], start: int, word: str) -> tuple[int | None, int | None]:
+    """Where the ``%{ if }`` / ``%{ for }`` at ``start`` ends, and its ``%{ else }``."""
+    closer = f"end{word}"
+    depth = 0
+    middle = None
+    for i in range(start + 1, len(items)):
+        p = items[i]
+        if not isinstance(p, Directive):
+            continue
+        head = p.text.split(None, 1)[0] if p.text else ""
+        if head in ("if", "for"):
+            depth += 1
+        elif head in ("endif", "endfor"):
+            if depth == 0:
+                return (i, middle) if head == closer else (None, None)
+            depth -= 1
+        elif head == "else" and depth == 0:
+            middle = i
+    return None, None
 
 
 def _num(v: Any) -> Any:
@@ -369,6 +491,11 @@ def _list(v: Any) -> list[Any]:
         return v
     if v is None:
         return []
+    if isinstance(v, Ref) and v.count is not None:
+        # aws_subnet.x[*].id: one element per instance of that resource
+        if v.count == 1:
+            return [Ref(v.target, v.attr)]
+        return [Ref(v.target, f"{v.attr}[{i}]") for i in range(v.count)]
     raise _NeedsUnknown("list argument not known statically")
 
 
@@ -511,8 +638,12 @@ def _element(lst: Any, idx: Any) -> Any:
 def _coalesce(*args: Any) -> Any:
     for a in args:
         u = unwrap(a)
-        if isinstance(u, Unknown) or (isinstance(u, Ref) and not u.has_value):
+        if isinstance(u, Unknown):
+            if u.after_apply:
+                return u
             raise _NeedsUnknown("coalesce over unknown value")
+        if isinstance(u, Ref) and not u.has_value:
+            return u  # the first value that is not empty: the code links to it
         if u is not None and u != "":
             return a
     raise ValueError("no non-null arguments")
@@ -520,7 +651,7 @@ def _coalesce(*args: Any) -> Any:
 
 def _try(*args: Any) -> Any:
     for a in args:
-        if not isinstance(a, Unknown):
+        if not isinstance(a, Unknown) or a.after_apply:
             return a
     raise _NeedsUnknown("all try() alternatives unknown")
 
@@ -542,7 +673,16 @@ def _length(v: Any) -> int:
     u = unwrap(v)
     if isinstance(u, (list, dict)):
         return len(u)
+    if isinstance(u, Ref) and u.count is not None:
+        return u.count
     return len(_str(u))
+
+
+def _to_bool(v: Any) -> bool:
+    known = _known(v)
+    if known in ("true", "false"):
+        return known == "true"
+    return bool(known)
 
 
 def _tostring(v: Any) -> Any:
@@ -562,8 +702,123 @@ def _tonumber(v: Any) -> Any:
 def _replace(s: Any, old: Any, new: Any) -> str:
     o = _str(old)
     if o.startswith("/") and o.endswith("/") and len(o) > 1:
-        raise _NeedsUnknown("regex replace not evaluated")
+        repl = re.sub(r"\$(\d+)|\$\{(\d+)\}", lambda m: f"\\{m.group(1) or m.group(2)}", _str(new))
+        return re.sub(o[1:-1], repl, _str(s))
     return _str(s).replace(o, _str(new))
+
+
+def _regex_value(m: re.Match[str]) -> Any:
+    if m.groupdict():
+        return m.groupdict()
+    if m.groups():
+        return list(m.groups())
+    return m.group(0)
+
+
+def _regex(pattern: Any, s: Any) -> Any:
+    m = re.search(_str(pattern), _str(s))
+    if m is None:
+        raise ValueError("regex() did not match")
+    return _regex_value(m)
+
+
+def _regexall(pattern: Any, s: Any) -> list[Any]:
+    return [_regex_value(m) for m in re.finditer(_str(pattern), _str(s))]
+
+
+def _formatlist(fmt: Any, *args: Any) -> list[Any]:
+    lists = [unwrap(a) for a in args]
+    sizes = {len(x) for x in lists if isinstance(x, list)}
+    if len(sizes) > 1:
+        raise ValueError("formatlist() lists of different lengths")
+    n = sizes.pop() if sizes else 1
+    return [_format(fmt, *[x[i] if isinstance(x, list) else x for x in lists]) for i in range(n)]
+
+
+def _network(prefix: Any) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    return ipaddress.ip_network(_str(prefix), strict=False)
+
+
+def _cidrsubnet(prefix: Any, newbits: Any, netnum: Any) -> str:
+    net = _network(prefix)
+    bits, num = int(_known(newbits)), int(_known(netnum))
+    if not 0 <= num < (1 << bits):
+        raise ValueError("cidrsubnet() netnum out of range")
+    base = int(net.network_address) + (num << (net.max_prefixlen - net.prefixlen - bits))
+    return f"{ipaddress.ip_address(base)}/{net.prefixlen + bits}"
+
+
+def _cidrhost(prefix: Any, hostnum: Any) -> str:
+    net = _network(prefix)
+    return str(ipaddress.ip_address(int(net.network_address) + int(_known(hostnum))))
+
+
+def _cidrsubnets(prefix: Any, *newbits: Any) -> list[str]:
+    net = _network(prefix)
+    out = []
+    cursor = int(net.network_address)
+    for b in newbits:
+        plen = net.prefixlen + int(_known(b))
+        step = 1 << (net.max_prefixlen - plen)
+        if cursor % step:
+            cursor += step - cursor % step
+        out.append(f"{ipaddress.ip_address(cursor)}/{plen}")
+        cursor += step
+    return out
+
+
+def _set_op(op: str, first: Any, *rest: Any) -> list[Any]:
+    def keyed(v: Any) -> dict[str, Any]:
+        return {json.dumps(to_plain(x), sort_keys=True): x for x in _list(v) if is_known(x)}
+
+    base = keyed(first)
+    for other in rest:
+        keys = keyed(other)
+        if op == "union":
+            base = {**base, **keys}
+        elif op == "intersection":
+            base = {k: v for k, v in base.items() if k in keys}
+        else:
+            base = {k: v for k, v in base.items() if k not in keys}
+    return [base[k] for k in sorted(base)]
+
+
+def _setproduct(*lists: Any) -> list[list[Any]]:
+    out: list[list[Any]] = [[]]
+    for lst in lists:
+        out = [row + [x] for row in out for x in _list(lst)]
+    return out
+
+
+def _index(lst: Any, v: Any) -> int:
+    target = _known(v)
+    for i, x in enumerate(_list(lst)):
+        if _known(x) == target:
+            return i
+    raise ValueError("index(): value not in list")
+
+
+def _chunklist(lst: Any, size: Any) -> list[list[Any]]:
+    items, n = _list(lst), int(_known(size))
+    return [items] if n == 0 else [items[i : i + n] for i in range(0, len(items), n)]
+
+
+def _matchkeys(values: Any, keys: Any, search: Any) -> list[Any]:
+    wanted = [_known(x) for x in _list(search)]
+    pairs = zip(_list(values), _list(keys), strict=True)
+    return [v for v, k in pairs if _known(k) in wanted]
+
+
+def _transpose(m: Any) -> dict[str, list[Any]]:
+    out: dict[str, list[Any]] = {}
+    for k, items in _dict(m).items():
+        for item in _list(items):
+            out.setdefault(_str(item), []).append(k)
+    return {k: sorted(out[k]) for k in sorted(out)}
+
+
+def _sum(lst: Any) -> Any:
+    return sum(_num(_known(x)) for x in _list(lst))
 
 
 def _keys(m: Any) -> list[str]:
@@ -616,6 +871,10 @@ def _toset(v: Any) -> list[Any]:
 
 def _can(v: Any) -> bool:
     if isinstance(v, Unknown):
+        if v.after_apply:
+            return True
+        if re.search(r"not found|out of range|non-object|cannot index", v.reason):
+            return False  # terraform's can(): the expression fails, whatever the values
         raise _NeedsUnknown("can() of unknown value")
     return True
 
@@ -627,7 +886,49 @@ def _one(v: Any) -> Any:
     return items[0] if items else None
 
 
+# Their value only exists when terraform runs: not an unknown, the code says what it is.
+_APPLY_TIME = frozenset({"timestamp", "plantimestamp", "uuid", "bcrypt", "rsadecrypt"})
+
 _FUNCTIONS: dict[str, Callable[..., Any]] = {
+    "regex": _regex,
+    "regexall": _regexall,
+    "formatlist": _formatlist,
+    "cidrsubnet": _cidrsubnet,
+    "cidrhost": _cidrhost,
+    "cidrsubnets": _cidrsubnets,
+    "cidrnetmask": lambda p: str(_network(p).netmask),
+    "setunion": lambda *s: _set_op("union", *s),
+    "setintersection": lambda *s: _set_op("intersection", *s),
+    "setsubtract": lambda *s: _set_op("subtract", *s),
+    "setproduct": _setproduct,
+    "index": _index,
+    "chunklist": _chunklist,
+    "matchkeys": _matchkeys,
+    "transpose": _transpose,
+    "sum": _sum,
+    "alltrue": lambda lst: all(_to_bool(x) for x in _list(lst)),
+    "anytrue": lambda lst: any(_to_bool(x) for x in _list(lst)),
+    "trim": lambda s, c: _str(s).strip(_str(c)),
+    "trimleft": lambda s, c: _str(s).lstrip(_str(c)),
+    "trimright": lambda s, c: _str(s).rstrip(_str(c)),
+    "chomp": lambda s: _str(s).rstrip("\r\n"),
+    "strrev": lambda s: _str(s)[::-1],
+    "strcontains": lambda s, x: _str(x) in _str(s),
+    "indent": lambda n, s: _str(s).replace("\n", "\n" + " " * int(_known(n))),
+    "basename": lambda s: posixpath.basename(_str(s)),
+    "dirname": lambda s: posixpath.dirname(_str(s)),
+    "abspath": lambda s: _str(s),
+    "pathexpand": lambda s: _str(s),
+    "base64encode": lambda s: base64.b64encode(_str(s).encode()).decode(),
+    "base64decode": lambda s: base64.b64decode(_str(s)).decode(),
+    "urlencode": lambda s: urllib.parse.quote_plus(_str(s)),
+    "md5": lambda s: hashlib.md5(_str(s).encode(), usedforsecurity=False).hexdigest(),
+    "sha1": lambda s: hashlib.sha1(_str(s).encode(), usedforsecurity=False).hexdigest(),
+    "sha256": lambda s: hashlib.sha256(_str(s).encode()).hexdigest(),
+    "sha512": lambda s: hashlib.sha512(_str(s).encode()).hexdigest(),
+    "parseint": lambda s, b: int(_str(s), int(_known(b))),
+    "pow": lambda a, b: _num(_known(a)) ** _num(_known(b)),
+    "signum": lambda v: (lambda n: (n > 0) - (n < 0))(_num(_known(v))),
     "jsondecode": _jsondecode,
     "concat": _concat,
     "merge": _merge,
@@ -644,7 +945,7 @@ _FUNCTIONS: dict[str, Callable[..., Any]] = {
     "substr": _substr,
     "tostring": _tostring,
     "tonumber": _tonumber,
-    "tobool": lambda v: bool(_known(v)),
+    "tobool": _to_bool,
     "tolist": lambda v: list(_list(v)),
     "toset": _toset,
     "tomap": lambda v: dict(_dict(v)),

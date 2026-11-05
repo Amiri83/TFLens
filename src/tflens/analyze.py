@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .countwhy import count_why
-from .engine import Engine, ModuleInstance
+from .engine import Engine, ModuleInstance, unknown_dynamic
 from .loader import Block, RepoSource
 from .model import Edge, Evidence, Graph, Node
 from .policy import Statement, as_list, parse_policy, statement_spans
@@ -31,6 +31,7 @@ from .values import (
     display,
     render,
     scalar_str,
+    shows_link,
     to_json,
     unwrap,
 )
@@ -321,9 +322,7 @@ class Analyzer:
         for name, blocks in item.block.blocks.items():
             attrs[name] = [to_json(item.inst.eval_block(b, item.id)) for b in blocks]
         for name in item.block.dynamic:
-            attrs.setdefault(
-                name, {"$unknown": f"dynamic block {name!r} is not expanded statically"}
-            )
+            attrs.setdefault(name, to_json(item.inst.eval_dynamic(item.block, name, item.id)))
         if item.data:
             category = "policy" if item.type == "aws_iam_policy_document" else "data"
         elif item.type in RELATIONSHIP_TYPES:
@@ -376,28 +375,39 @@ class Analyzer:
         )
 
     # ------------------------------------------------------------ generic walk
-    def _walk(self, item: Item, block: Block, prefix: str) -> None:
+    def _walk(
+        self, item: Item, block: Block, prefix: str, bindings: dict[str, Any] | None = None
+    ) -> None:
         for name in sorted(block.attrs):
             if not prefix and name in _SKIP_ATTRS:
                 continue
             attr = block.attrs[name]
-            value = item.inst.eval_attr(attr, item.id)
+            value = item.inst.eval_attr(attr, item.id, bindings)
             path = f"{prefix}{name}"
             for upath, unk in collect_unknowns(value, path):
-                self.unknown(item.id, upath, unk.reason, attr.loc)
+                self.unknown(item.id, upath, unk.reason, attr.loc, unk.origin)
+            # known after apply: why it is not counted
+            counted = not prefix and name in ("count", "for_each") and item.created is None
+            if counted and not collect_unknowns(value):
+                self.unknown(item.id, name, item.created_reason, attr.loc)
             self._config_refs(item, path, value, attr.loc)
             self._remote_state_refs(item, path, attr)
         for name in sorted(block.dynamic):
-            self.unknown(
-                item.id, f"{prefix}{name}", "dynamic block is not expanded statically", block.loc
-            )
+            items, each = item.inst.expand_dynamic(block, name, item.id, bindings)
+            if items is None:
+                unk = unknown_dynamic(name, each)
+                if not unk.after_apply:
+                    self.unknown(item.id, f"{prefix}{name}", unk.reason, block.loc, unk.origin)
+                continue
+            for i, (content, bound) in enumerate(items):
+                self._walk(item, content, f"{prefix}{name}[{i}].", bound)
         for name in sorted(block.blocks):
             if not prefix and name in _SKIP_ATTRS:
                 continue
             children = block.blocks[name]
             for i, child in enumerate(children):
                 sub = f"{prefix}{name}." if len(children) == 1 else f"{prefix}{name}[{i}]."
-                self._walk(item, child, sub)
+                self._walk(item, child, sub, bindings)
 
     def _config_refs(self, item: Item, path: str, value: Any, loc: Location) -> None:
         if isinstance(value, dict):
@@ -496,7 +506,14 @@ class Analyzer:
         return attr.loc if attr is not None else item.loc
 
     def nested(self, item: Item, name: str) -> list[tuple[Block, dict[str, Any]]]:
-        return [(b, item.inst.eval_block(b, item.id)) for b in item.block.blocks.get(name, [])]
+        """The ``name`` blocks of an item with their values, those a ``dynamic`` block
+        generates included (one per element of its ``for_each``, when that is known)."""
+        out = [(b, item.inst.eval_block(b, item.id)) for b in item.block.blocks.get(name, [])]
+        if name in item.block.dynamic:
+            items, _ = item.inst.expand_dynamic(item.block, name, item.id)
+            for content, bound in items or []:
+                out.append((content, item.inst.eval_block(content, item.id, bound)))
+        return out
 
     def props(self, node_id: str, **values: Any) -> None:
         node = self.graph.nodes[node_id]
@@ -539,8 +556,29 @@ class Analyzer:
             )
         )
 
-    def unknown(self, subject: str, attribute: str, reason: str, loc: Location | None) -> None:
-        self.graph.add_unknown(subject, attribute, reason, loc)
+    def unknown(
+        self,
+        subject: str,
+        attribute: str,
+        reason: str,
+        loc: Location | None,
+        origin: Location | None = None,
+    ) -> None:
+        self.graph.add_unknown(subject, attribute, reason, loc, origin)
+
+    def unresolved(
+        self, subject: str, attribute: str, value: Any, reason: str, loc: Location | None
+    ) -> None:
+        """A value an extractor needed and could not render: an unknown, unless it only
+        lacks what exists after apply (the code shows the link)."""
+        if shows_link(value):
+            return
+        v = unwrap(value)
+        if isinstance(v, Unknown):
+            self.unknown(subject, attribute, reason, loc, v.origin)
+        else:
+            found = collect_unknowns(value)
+            self.unknown(subject, attribute, reason, loc, found[0][1].origin if found else None)
 
     def type_of(self, node_id: str) -> str:
         node = self.graph.nodes.get(node_id)
@@ -617,7 +655,7 @@ class Analyzer:
             pattern = pattern_of(el)
             if pattern is None or pattern == "":
                 if pattern is None:
-                    self.unknown(item.id, attr, _why(el), loc)
+                    self.unresolved(item.id, attr, el, _why(el), loc)
                 named = self.named_external(item, attr, external)
                 if named and (pattern == "" or from_var):
                     out.append(named)
@@ -870,7 +908,7 @@ class Analyzer:
                 return ids
             p = pattern_of(value)
             if p is None:
-                self.unknown(holder.id, "policy.Principal", _why(value), loc)
+                self.unresolved(holder.id, "policy.Principal", value, _why(value), loc)
                 return []
             if p == "*":
                 return [self.external("principal", "*")]
@@ -883,7 +921,7 @@ class Analyzer:
             return [self.external("aws_principal", p)]
         p = pattern_of(value)
         if p is None:
-            self.unknown(holder.id, "policy.Principal", _why(value), loc)
+            self.unresolved(holder.id, "policy.Principal", value, _why(value), loc)
             return []
         kind = {"Service": "aws_service", "Federated": "federated"}.get(ptype, ptype.lower())
         return [self.external(kind, p)]

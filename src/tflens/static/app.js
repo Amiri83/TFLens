@@ -109,8 +109,11 @@
   }
 
   // ------------------------------------------------------------ file:line references
+  // Evidence is real files only: a doc is never something the UI points at.
+  const DOC_FILE = /\.(md|markdown)$/i;
+
   function locLink(loc) {
-    if (!loc) return null;
+    if (!loc || DOC_FILE.test(loc.file)) return null;
     if (!loc.start_line) return el("span", { class: "tag" }, `${loc.file}/`);
     return link(locText(loc), () => showSource(loc));
   }
@@ -165,13 +168,11 @@
         const r = byId.get(id);
         return r ? [...r.backend_hcl, ...r.var_files] : [];
       });
-      const active = (c.environments || []).some((id) => isShown(envs, id));
+      const active = (c.environments || []).some((id) => isSelected(envs, id));
       return el("tr", { class: active ? "env-row active" : "env-row", "data-env": c.id },
         el("td", {}, c.id),
-        ...types.map((t) => el("td", { class: c.uncertain[t.type] ? "num st-unknown" : "num",
-          title: c.uncertain[t.type] ? "blocks whose count is not known statically are not counted" : "" },
-          countText(c.counts[t.type] || 0, c.uncertain[t.type] || 0))),
-        el("td", { class: c.unknown_count ? "num st-unknown" : "num" }, String(c.unknown_count)),
+        ...types.map((t) => el("td", { class: "num" }, String(c.counts[t.type] || 0))),
+        el("td", { class: c.unknown_count ? "num st-unknown" : "num" }, unknownCount(c, `Unknowns in ${c.id}`)),
         el("td", {}, ...files.flatMap((f, i) => [i ? ", " : "",
           locLink({ file: f, start_line: 1, end_line: 1 })])));
     });
@@ -183,22 +184,81 @@
     return envs.columns && envs.columns.length ? envs.columns : envs.environments;
   }
 
-  function envUnknowns(envs) {
-    const row = envs.environments.find((r) => r.id === envs.active);
-    const shown = row || envs.current;
-    const title = row ? `Unknowns in ${row.id} after applying its variables` : "Unknowns (no environment applied)";
-    if (!shown.unknown_count) return [el("p", { class: "muted" }, `${title}: none.`)];
-    const items = shown.unknowns.map((u) => el("li", { class: "ov-line st-unknown" },
-      `${u.subject}.${u.attribute} — ${u.category}: ${u.reason} `, locLink(u.location)));
-    if (shown.unknown_count > shown.unknowns.length) {
-      items.push(el("li", { class: "ov-line" }, `… ${shown.unknown_count - shown.unknowns.length} more`));
+  // What is still unknown, grouped by why: each value with its reason and real file:line.
+  function groupUnknowns(list) {
+    const groups = new Map();
+    for (const u of list || []) {
+      const key = u.category || "other";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(u);
     }
-    return [el("h3", {}, `${title} (${shown.unknown_count})`), el("ul", { class: "overview-lines" }, ...items)];
+    return [...groups.entries()].map(([category, items]) => ({ category, count: items.length, items }))
+      .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
   }
 
-  // "4", or "4 (+3 uncertain)": a block whose count is not known is never counted as 1
-  function countText(known, uncertain) {
-    return uncertain ? `${known} (+${uncertain} uncertain)` : String(known);
+  function unknownItem(u) {
+    return el("li", { class: "unknown-item" },
+      link(`${u.subject}.${u.attribute}`, () => showDetail("node", u.subject)), ` — ${u.reason} `,
+      locLink(u.location),
+      u.defined_at ? el("span", { class: "tag" }, " · defined at ", locLink(u.defined_at)) : null);
+  }
+
+  function unknownsPanel(groups) {
+    return el("div", { class: "unknowns-panel" }, ...groups.map((g) => el("details", { class: "unknown-group", open: "" },
+      el("summary", {}, g.category, " ", el("span", { class: "tag" }, `(${g.count})`)),
+      el("ul", { class: "unknown-items" }, ...g.items.map(unknownItem)))));
+  }
+
+  // A count of unknowns in a table: opens that group of values in the detail pane.
+  function unknownCount(row, title) {
+    if (!row.unknown_count) return "0";
+    return link(String(row.unknown_count), () => {
+      const panel = document.getElementById("detail");
+      panel.replaceChildren(el("h2", {}, `${title} (${row.unknown_count})`),
+        unknownsPanel(row.unknown_groups || groupUnknowns(row.unknowns)));
+      panel.scrollTop = 0;
+    });
+  }
+
+  function envUnknowns(envs) {
+    const shown = envs.current;
+    const name = (envs.selected || []).join(", ") || envs.active;
+    const title = name ? `Unknowns in ${name}, after applying its variables` : "Unknowns (no environment applied)";
+    if (!shown.unknown_count) return [el("p", { class: "muted" }, `${title}: none.`)];
+    const parts = [el("h3", {}, `${title} (${shown.unknown_count})`),
+      unknownsPanel(shown.unknown_groups || groupUnknowns(shown.unknowns))];
+    if (shown.unknown_count > shown.unknowns.length) {
+      parts.push(el("p", { class: "muted" }, `… ${shown.unknown_count - shown.unknowns.length} more`));
+    }
+    return parts;
+  }
+
+  // The verified init / plan / apply of one stack + environment, once each, in a small popover.
+  function commandsInfo(r) {
+    const commands = r.commands || [];
+    if (!commands.length) return null;
+    const box = el("div", { class: "cmd-popover", role: "dialog", "aria-label": `Verified commands of ${r.id}` },
+      el("div", { class: "cmd-head" }, r.stack ? `${r.stack} · ${r.id}` : r.id),
+      ...commands.map((c) => el("div", { class: "cmd-line", "data-step": c.step },
+        el("code", {}, c.command),
+        el("div", { class: "tag" }, c.source === "ci" ? "" : "from this environment's files: ", locLink(c.location)))));
+    box.hidden = true;
+    const button = el("button", { type: "button", class: "cmd-info-btn", title: "Verified init / plan / apply commands",
+      "aria-label": `Verified commands of ${r.id}`, "aria-expanded": "false" }, "i");
+    button.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const open = box.hidden;
+      closeCommandPopovers();
+      box.hidden = !open;
+      button.setAttribute("aria-expanded", String(open));
+    });
+    box.addEventListener("click", (e) => e.stopPropagation());
+    return el("span", { class: "cmd-info" }, button, box);
+  }
+
+  function closeCommandPopovers() {
+    for (const p of document.querySelectorAll(".cmd-popover")) p.hidden = true;
+    for (const b of document.querySelectorAll(".cmd-info-btn")) b.setAttribute("aria-expanded", "false");
   }
 
   // ------------------------------------------------------------ environments view
@@ -215,6 +275,15 @@
   // The environments applied in the model shown: one per stack.
   function isShown(envs, id) {
     return (envs.selected || []).includes(id) || id === envs.active;
+  }
+
+  // The one selected row of the environment tables: the environment picked last, else the
+  // one the analysis shows. The other stacks' applied environments are not highlighted.
+  let pickedEnv = null;
+
+  function isSelected(envs, id) {
+    const picked = envs.environments.some((r) => r.id === pickedEnv) ? pickedEnv : envs.active;
+    return id === picked;
   }
 
   function multiStack(envs) {
@@ -258,6 +327,7 @@
   }
 
   async function selectStackEnv(stack, name) {
+    pickedEnv = name || null;
     for (const s of document.querySelectorAll("select[data-stack]")) s.disabled = true;
     try {
       await api(`api/env?stack=${encodeURIComponent(stack)}&name=${encodeURIComponent(name)}`,
@@ -277,8 +347,8 @@
       const wired = r.wired
         ? el("td", { title: r.wiring.join("; ") }, "yes")
         : el("td", { class: "st-unknown", title: r.not_wired_reason || "" }, "not wired");
-      return el("tr", { class: `env-row${isShown(envs, r.id) ? " active" : ""}${r.wired ? "" : " not-wired"}`, "data-env": r.id },
-        el("td", {}, envButton(envs, r.id)), stacked ? el("td", { class: "mono" }, r.stack || "—") : null, wired,
+      return el("tr", { class: `env-row${isSelected(envs, r.id) ? " active" : ""}${r.wired ? "" : " not-wired"}`, "data-env": r.id },
+        el("td", {}, envButton(envs, r.id), " ", commandsInfo(r)), stacked ? el("td", { class: "mono" }, r.stack || "—") : null, wired,
         el("td", {}, ...fileLinks(r.var_files)), el("td", {}, ...fileLinks(r.backend_hcl)));
     });
     return el("table", { class: "env-files" }, el("thead", {}, head), el("tbody", {}, ...rows));
@@ -308,7 +378,7 @@
     const rows = envs.environments.map((r) => {
       const st = r.state || { type: "?", settings: [] };
       const by = new Map(st.settings.map((s) => [s.key, s]));
-      return el("tr", { class: isShown(envs, r.id) ? "env-row active" : "env-row" },
+      return el("tr", { class: isSelected(envs, r.id) ? "env-row active" : "env-row" },
         el("td", {}, r.id), el("td", { title: st.origin || st.note || "" }, st.type),
         ...keys.map((k) => {
           const s = by.get(k);
@@ -341,15 +411,15 @@
   function showInventoryCell(row, column, cell) {
     const panel = document.getElementById("detail");
     const title = column ? `${row.label} in ${column}` : row.label;
-    const parts = [el("h2", {}, `${title}: ${countText(cell.count, cell.uncertain)}`)];
+    const parts = [el("h2", {}, `${title}: ${cell.count}`)];
     if (cell.uncertain) {
-      parts.push(el("p", { class: "st-unknown" },
-        `${cell.uncertain} block(s) with a count not known statically: not counted (never assumed to be 1); see why below.`));
+      parts.push(el("p", { class: "muted" },
+        `Not counted: ${cell.uncertain} block(s) whose count is not known statically; see why below.`));
     }
     if (!cell.items.length) parts.push(el("p", { class: "muted" }, "None created."));
     for (const it of cell.items) {
       const only = row.only[it.id];
-      parts.push(el("div", { class: `inv-item${it.created === null ? " uncertain" : ""}` },
+      parts.push(el("div", { class: `inv-item${it.created === null ? " count-open" : ""}` },
         el("strong", {}, it.name), " ", link(it.id, () => showDetail("node", it.id)), " ", locLink(it.location),
         it.stack || it.env ? el("div", { class: "tag" }, `stack ${it.stack || "—"} · env ${it.env || "none (variable defaults)"}`) : null,
         it.via && it.via.length ? el("div", { class: "tag" }, "via ", ...it.via.flatMap((m, i) => [i ? " → " : "", m.id, " ", locLink(m.location)])) : null,
@@ -369,7 +439,7 @@
       ...cols.map(([id, , wired]) => el("th", { class: wired ? "num" : "num st-unknown", title: wired ? "" : "not wired" },
         id || (envs.active ? envs.active : "shown (variable defaults)"))));
     const rows = envs.inventory.map((row) => {
-      const values = cols.map(([, inv]) => countText(inv[row.key].count, inv[row.key].uncertain));
+      const values = cols.map(([, inv]) => String(inv[row.key].count));
       const common = mostCommon(values);
       return el("tr", { class: row.differs ? "inv-row differs" : "inv-row", "data-row": row.key },
         el("td", {}, svcLabel(iconsData && iconsData.inventory[row.key], row.label),
@@ -378,7 +448,6 @@
           const cell = inv[row.key];
           const cls = ["num", "inv-cell"];
           if (row.differs && values[i] !== common) cls.push("diff");
-          if (cell.uncertain) cls.push("st-unknown");
           return el("td", { class: cls.join(" ") },
             link(values[i], () => showInventoryCell(row, id, cell)));
         }));
@@ -433,7 +502,7 @@
       section("env-state", "State file per environment", stateTable(envs));
     }
     section("env-inventory", "Service inventory",
-      el("p", { class: "muted" }, "Instances each environment creates with its own tfvars. Click a count for the names, file:line and why it is counted so; \"(+N uncertain)\": blocks whose count is not known statically (not counted)."),
+      el("p", { class: "muted" }, "Confirmed instances each environment creates with its own tfvars. Click a count for the names, file:line and why it is counted so."),
       inventoryGrid(envs));
     if (envs.environments.length) {
       section("env-diffs", "Differences between environments",
@@ -442,12 +511,6 @@
             el("li", { class: d.startsWith(" ") ? "ov-line lvl-1" : "ov-line" }, d.trim())))
           : el("p", { class: "muted" }, "None: every environment creates the same services."));
     }
-    const shownRow = envs.environments.find((r) => r.id === envs.active) || envs.current;
-    if (shownRow.uncertain_items && shownRow.uncertain_items.length) {
-      section("env-uncertain", "Uncertain counts", ...shownRow.uncertain_items.map((it) =>
-        el("div", { class: "inv-item uncertain" }, link(it.id, () => showDetail("node", it.id)), " ", locLink(it.location),
-          it.why ? whySteps(it.why) : el("div", { class: "tag" }, "count not known"))));
-    }
     toc.push(["env-unknowns", "Unknowns"]);
     parts.push(el("div", { id: "env-unknowns" }, ...envUnknowns(envs)));
     box.replaceChildren(...parts);
@@ -455,6 +518,7 @@
   }
 
   async function selectEnv(name) {
+    pickedEnv = name || null;
     const select = document.getElementById("env");
     select.disabled = true;
     try {
@@ -494,10 +558,8 @@
       ...names.map((n) => {
         const r = cell.get(`${s.id}\u0000${n}`);
         if (!r) return el("td", { class: "num muted", title: `${s.id} has no ${n} environment` }, "—");
-        const uncertain = sumCounts(r.uncertain);
         const what = Object.entries(r.counts || {}).map(([t, c]) => `${types.get(t) || t}: ${c}`).join("\n");
-        return el("td", { class: uncertain ? "num st-unknown" : "num", title: what || "nothing counted" },
-          countText(sumCounts(r.counts), uncertain));
+        return el("td", { class: "num", title: what || "nothing counted" }, String(sumCounts(r.counts)));
       })));
     return el("table", { class: "env-counts stack-counts" }, el("thead", {}, head), el("tbody", {}, ...rows));
   }
@@ -523,7 +585,7 @@
       parts.push(el("p", { class: "muted" }, "No confirmed environment: the counts below are the code with the variables' defaults."),
         el("table", { class: "env-counts" }, el("thead", {}, el("tr", {}, ...(envs.types || []).map((t) => el("th", { class: "num" }, t.label)), el("th", { class: "num" }, "Unknowns"))),
           el("tbody", {}, el("tr", {}, ...(envs.types || []).map((t) => el("td", { class: "num" },
-            countText((cur.counts || {})[t.type] || 0, (cur.uncertain || {})[t.type] || 0))), el("td", { class: "num" }, String(cur.unknown_count || 0))))));
+            String((cur.counts || {})[t.type] || 0))), el("td", { class: "num" }, unknownCount(cur, "Unknowns"))))));
     }
     // everything else (why-chains, per-root explanations) behind one toggle
     const details = [];
@@ -975,11 +1037,7 @@
     }
     parts.push(el("h3", {}, `Unknowns (${d.unknowns.length})`));
     if (!d.unknowns.length) parts.push(el("p", { class: "muted" }, "None."));
-    for (const u of d.unknowns) {
-      parts.push(el("div", { class: "unknown" },
-        el("strong", {}, `${u.subject} ${u.attribute}`), ": ", u.reason,
-        el("div", { class: "tag" }, locText(u.location))));
-    }
+    else parts.push(unknownsPanel(groupUnknowns(d.unknowns)));
     panel.replaceChildren(...parts);
     panel.scrollTop = 0;
   }
@@ -1403,6 +1461,8 @@
   // ------------------------------------------------------------ repository
   function treeNode(node) {
     if (node.type === "file") {
+      // a doc is listed, never opened: the views point at real files only
+      if (DOC_FILE.test(node.path)) return el("span", { class: "file other" }, node.name);
       // analyzed files are links with their resource count; every other file is listed too
       const analyzed = node.analyzed !== false;
       return el("a", {
@@ -1453,12 +1513,7 @@
           el("td", {}, link(r.id, () => showDetail("node", r.id)))))));
     }
     if (d.unknowns.length) {
-      parts.push(el("h3", {}, `Unknowns in this file (${d.unknowns.length})`));
-      for (const u of d.unknowns) {
-        parts.push(el("div", { class: "unknown" },
-          el("strong", {}, `${u.subject} ${u.attribute}`), ": ", u.reason,
-          el("div", { class: "tag" }, locText(u.location))));
-      }
+      parts.push(el("h3", {}, `Unknowns in this file (${d.unknowns.length})`), unknownsPanel(groupUnknowns(d.unknowns)));
     }
     box.replaceChildren(...parts);
   }
@@ -1779,14 +1834,21 @@
     const toggle = el("button", { type: "button", class: "summary-toggle", "aria-expanded": String(!panel.hidden),
       "aria-controls": "summary-details", title: "Show all the numbers" },
     stat(envCount, envCount === 1 ? "env" : "envs"), stat(stacks, stacks === 1 ? "stack" : "stacks"),
-    stat(resources, "resources"), stat(s.unknowns, "unknowns", s.unknowns ? "warn" : ""),
+    stat(resources, "resources"),
     el("span", { class: "caret", "aria-hidden": "true" }, "▾"));
     toggle.addEventListener("click", () => {
       const open = panel.hidden;
       panel.hidden = !open;
       toggle.setAttribute("aria-expanded", String(open));
     });
-    bar.replaceChildren(toggle);
+    // not a bare badge: it opens the panel that lists them, grouped by why
+    const unknowns = el("button", { type: "button", class: "summary-unknowns", title: "Open the Unknowns panel: grouped by why, with file:line",
+      onclick: () => {
+        setView("environments");
+        const target = document.getElementById("env-unknowns");
+        if (target) target.scrollIntoView();
+      } }, stat(s.unknowns, "unknowns", s.unknowns ? "warn" : ""));
+    bar.replaceChildren(toggle, unknowns);
     const item = (label, value, cls) => [el("dt", {}, label), el("dd", { class: cls || "" }, value)];
     const edges = Object.entries(s.edges).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
     panel.replaceChildren(el("dl", { class: "summary-grid" },
@@ -1809,8 +1871,10 @@
     for (const t of document.querySelectorAll(".tab[data-view]")) t.addEventListener("click", () => setView(t.dataset.view));
     document.getElementById("search").addEventListener("input", applyFilters);
     document.getElementById("hide-isolated").addEventListener("change", applyFilters);
+    document.addEventListener("click", closeCommandPopovers);
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
+        closeCommandPopovers();
         clearFocus();
         const panel = document.getElementById("summary-details");
         if (panel && !panel.hidden) {

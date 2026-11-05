@@ -220,7 +220,9 @@ def test_node_detail_has_evidence_snippets_definition_and_unknowns(api):
             "subject": "aws_sns_topic_subscription.alerts_email",
             "attribute": "endpoint",
             "reason": "variable var.alert_email has no default and no value in tfvars/--var-file",
+            "category": "missing variable",
             "location": {"file": "main.tf", "start_line": 55, "end_line": 55},
+            "defined_at": {"file": "main.tf", "start_line": 10, "end_line": 13},
         }
     ]
     # a module call that could not be analyzed has no graph node, but still a detail

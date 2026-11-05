@@ -106,20 +106,67 @@ class Edge:
         }
 
 
+# (category, substrings of the reason): the first match wins.
+_UNKNOWN_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("set by CI at run time", ("set at run time by",)),
+    ("conditional without default", ("conditional depends on unknown",)),
+    ("missing variable", ("has no default and no value", "undeclared variable")),
+    ("dynamic block", ("dynamic block", "dynamic statement")),
+    ("per-instance value", ("count.index", "each.key")),
+    (
+        "module not analyzed",
+        (
+            "non-local source",
+            "not fetched",
+            "has no .tf files",
+            "not a literal string",
+            "recursive",
+        ),
+    ),
+    ("known after apply", ("only known after apply", "self.*")),
+    ("workspace", ("terraform.workspace",)),
+    ("file / template", ("templatefile", "file ", "not rendered")),
+    ("function not evaluated", ("is not evaluated statically", "could not be evaluated")),
+    ("circular reference", ("circular reference",)),
+    ("broken reference", ("not found", "undeclared", "has no output", "out of range")),
+    ("unparseable expression", ("unparseable expression",)),
+)
+LIBRARY_INPUT = "input of a reusable module"
+
+
+def unknown_category(reason: str) -> str:
+    """A short name for why a value is unknown (missing variable, conditional without
+    default, dynamic block, ...)."""
+    low = reason.lower()
+    for category, needles in _UNKNOWN_CATEGORIES:
+        if any(n in low for n in needles):
+            return category
+    return "other"
+
+
 @dataclass(frozen=True)
 class UnknownEntry:
+    """A value still not resolved: what it is, why (``category``, ``reason``), where it is
+    used (``location``) and, when the chain ends elsewhere, where (``defined_at``: the
+    ``variable`` block with no value)."""
+
     subject: str
     attribute: str
     reason: str
     location: Location | None
+    origin: Location | None = field(default=None, compare=False, hash=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "subject": self.subject,
             "attribute": self.attribute,
             "reason": self.reason,
+            "category": unknown_category(self.reason),
             "location": self.location.to_dict() if self.location else None,
         }
+        if self.origin is not None and self.origin != self.location:
+            out["defined_at"] = self.origin.to_dict()
+        return out
 
     def sort_key(self) -> tuple[Any, ...]:
         loc = self.location
@@ -168,9 +215,14 @@ class Graph:
         self.edges.append(edge)
 
     def add_unknown(
-        self, subject: str, attribute: str, reason: str, location: Location | None
+        self,
+        subject: str,
+        attribute: str,
+        reason: str,
+        location: Location | None,
+        origin: Location | None = None,
     ) -> None:
-        entry = UnknownEntry(subject, attribute, reason, location)
+        entry = UnknownEntry(subject, attribute, reason, location, origin)
         if entry not in self._unknown_keys:
             self._unknown_keys.add(entry)
             self.unknowns.append(entry)

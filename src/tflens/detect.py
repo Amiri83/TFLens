@@ -26,6 +26,14 @@ import posixpath
 import re
 from typing import Any
 
+from .ciscan import (
+    CHDIR_RE,
+    CI_EXPR_RE,
+    CLI_FLAG_RE,
+    SECRET_KEY_RE,
+    ci_files,
+    env_commands,
+)
 from .engine import Engine, ModuleInstance, in_scope
 from .evaluate import evaluate
 from .expr import raw_to_expr
@@ -68,14 +76,10 @@ _BACKEND_FILE_RE = re.compile(
 )
 _BACKEND_WORD_RE = re.compile(r"(^|[._-])backends?(?=[._-]|$)", re.I)
 _BACKEND_DIR_RE = re.compile(r"^backends?([-_]?configs?)?$", re.I)
-# CI / docs: terraform init -backend-config=FILE, plan -var-file=FILE (key=value pairs and
-# CI expressions in the path are handled below)
-_CLI_FLAG_RE = re.compile(r"(?<![\w-])--?(backend-config|var-file)(?:=|\s+)['\"]?([^\s'\";|&)]+)")
-_CHDIR_RE = re.compile(r"(?<![\w-])--?chdir=['\"]?([^\s'\";|&)]+)")
-# ${{ matrix.env }}, ${ENV}, $ENV, $(ENV), %ENV%, <env>: one path segment, per environment
-_CI_EXPR_RE = re.compile(r"\$\{\{[^}]*\}\}|\$\{[^}]*\}|\$\([^)]*\)|\$[A-Za-z_]\w*|%\w+%|<[\w-]+>")
-_SCRIPT_NAMES = frozenset({"Makefile", "makefile", "GNUmakefile", "Taskfile.yml", "justfile"})
-_SECRET_KEY_RE = re.compile(r"(secret|password|token|access_key|sas|client_certificate)", re.I)
+_CLI_FLAG_RE = CLI_FLAG_RE
+_CHDIR_RE = CHDIR_RE
+_CI_EXPR_RE = CI_EXPR_RE
+_SECRET_KEY_RE = SECRET_KEY_RE
 
 # The settings shown for each backend type (missing ones are reported as UNKNOWN).
 BACKEND_KEYS: dict[str, tuple[str, ...]] = {
@@ -846,10 +850,10 @@ def detect_environments(
     Each is ``{name, root, kinds, var_files, backend_hcl, var_file_cli, evidence, roots}``:
     its tfvars files, its partial backend configurations (``backend.<env>.hcl``,
     ``<env>.tfbackend``, ``backend/<env>.hcl``) and the ``-var-file`` / ``-backend-config``
-    options naming them in CI files and docs. Backend files are attached to the
+    options naming them in CI files and scripts. Backend files are attached to the
     environment found from the layout or tfvars and add the kind ``backend`` when they are
-    what reveals it. CI / script / doc lines are hints: they are attached to an
-    environment real files established and never create one (rejected in ``trace``).
+    what reveals it. CI / script lines are leads: they are attached to an environment real
+    files established and never create one (rejected in ``trace``); docs are not read here.
 
     Detection is per stack: a tfvars file or a partial backend configuration at any depth
     below a root belongs to that root (the deepest one) and its stem names the
@@ -1086,8 +1090,8 @@ def detect_environments(
             e["backend_hcl"].append(f)
         if f not in repo.files:
             repo.files.append(f)  # listed, so its source can be shown
-    # 4. -backend-config / -var-file in CI files, scripts and docs: hints only. They are
-    # attached to an environment that a real tfvars / backend file / environment
+    # 4. -backend-config / -var-file in CI files and scripts (never docs): leads only. They
+    # are attached to an environment that a real tfvars / backend file / environment
     # directory already established; they never create one.
     for use in cli_env_files(repo, roots):
         if use["env"] is None:
@@ -1139,6 +1143,8 @@ def detect_environments(
         e["var_file_cli"].sort(key=lambda u: (u["location"]["file"], u["location"]["start_line"]))
         e.update(_wiring(e))
         e["state"] = _env_state(repo, engine, e)
+        siblings = [o["name"] for o in out if o["root"] == e["root"]]
+        e["commands"] = env_commands(repo, e, siblings)
     return out
 
 
@@ -1163,7 +1169,13 @@ def state_index(
         settings = _known_settings(state.get("settings", []))
         for r in e["roots"] or [e["root"]]:
             out.append(
-                {"root": r, "env": e["name"], "type": state.get("type"), "settings": settings}
+                {
+                    "root": r,
+                    "env": e["name"],
+                    "type": state.get("type"),
+                    "settings": settings,
+                    "var_files": list(e["var_files"]),
+                }
             )
             covered.add(r)
     for r in sorted(set(engine.root_modules) | set(engine.units)):
@@ -1177,6 +1189,7 @@ def state_index(
                 "env": None,
                 "type": b["type"],
                 "settings": _known_settings(b["settings"]),
+                "var_files": [],
             }
         )
     return out
@@ -1311,31 +1324,14 @@ def backend_env(path: str) -> str | None:
     return seg[0] if seg else None
 
 
-def _cli_sources(repo: RepoSource) -> list[str]:
-    """Files whose commands may pass -var-file / -backend-config: CI, scripts, docs."""
-    from .crawl import ci_system, doc_files
-
-    docs = set(doc_files(repo.all_files))
-    out = []
-    for f in repo.all_files:
-        base = posixpath.basename(f)
-        if (
-            ci_system(f)
-            or f in docs
-            or base in _SCRIPT_NAMES
-            or base.endswith((".sh", ".mk", ".bash", ".ps1"))
-        ):
-            out.append(f)
-    return out
-
-
 def cli_env_files(repo: RepoSource, roots: list[str]) -> list[dict[str, Any]]:
-    """``-var-file`` / ``-backend-config`` options that name a repository file, with the
-    environment a CI expression in the path stands for (``backend.${{ matrix.env }}.hcl``
-    matched against ``backend.dev.hcl`` -> ``dev``; None for a literal path)."""
+    """``-var-file`` / ``-backend-config`` options of CI files and scripts (a doc is never
+    read for this) that name a repository file, with the environment a CI expression in
+    the path stands for (``backend.${{ matrix.env }}.hcl`` matched against
+    ``backend.dev.hcl`` -> ``dev``; None for a literal path)."""
     pool = set(repo.all_files)
     out = []
-    for src in _cli_sources(repo):
+    for src in ci_files(repo):
         text = "\n".join(repo.lines(src))
         for n, line in enumerate(repo.lines(src), 1):
             if "-var-file" not in line and "-backend-config" not in line:
