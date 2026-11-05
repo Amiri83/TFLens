@@ -15,13 +15,13 @@ dependencies = [
     "flask>=3.0",
     "waitress>=3.0",
     "cryptography>=42",
+    # Discover's read-only AWS check (phase 3), turned on per run
+    "boto3>=1.28",
 ]
 
 [project.optional-dependencies]
-# Discover's optional, read-only AWS check (phase 3); without it the phase is skipped
-aws = [
-    "boto3>=1.28",
-]
+# kept so existing `pip install 'tflens[aws]'` lines keep working: boto3 is a dependency now
+aws = []
 dev = [
     "pytest>=8",
     "ruff>=0.6",

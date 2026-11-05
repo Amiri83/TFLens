@@ -545,7 +545,7 @@ def module_tree_svg(model: dict[str, Any], title: str = "") -> str:
 
 def backend_text(b: dict[str, Any]) -> str:
     """``s3 bucket-a/app/terraform.tfstate``: a backend's type, store and key."""
-    settings = {s["key"]: s["value"] for s in b["settings"]}
+    settings = {s["key"]: s["value"] for s in b["settings"] if s.get("known")}
     where = settings.get("key") or settings.get("prefix") or settings.get("path") or ""
     store = (
         settings.get("bucket")
@@ -598,7 +598,8 @@ _ENV_ORDER = {
 
 
 def _backend_cell(state: dict[str, Any], files: list[str]) -> dict[str, Any]:
-    settings = state.get("settings") or []
+    every = state.get("settings") or []
+    settings = [s for s in every if s.get("known")]  # only what is confirmed is shown
     by_key = {s["key"]: s for s in settings}
 
     def value(*keys: str) -> dict[str, Any] | None:
@@ -613,6 +614,11 @@ def _backend_cell(state: dict[str, Any], files: list[str]) -> dict[str, Any]:
         "key": key["value"] if key else None,
         "region": region["value"] if region else None,
         "settings": settings,
+        "unresolved": [
+            {"key": s["key"], "reason": s.get("reason", ""), "location": s.get("location")}
+            for s in every
+            if not s.get("known")
+        ],
         "files": files,
         # the backend file: where the bucket / key are set, else the backend block
         "location": next(

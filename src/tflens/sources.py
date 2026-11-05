@@ -8,7 +8,10 @@ call's ``version`` argument for registry modules and the ``?ref=`` of a git URL.
 
 from __future__ import annotations
 
+import posixpath
 import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -54,3 +57,37 @@ def classify_source(source: str) -> dict[str, Any]:
     if _REGISTRY_RE.match(s):
         return {"kind": "registry", "source": s, "ref": None}
     return {"kind": "other", "source": s, "ref": None}
+
+
+_SUBDIR_SOURCE_RE = re.compile(r"^(?:git::)?(?P<repo>.+?)//(?P<sub>[^?]+?)/?(?:\?.*)?$")
+
+
+def _repo_name(url: str) -> str:
+    return url.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1].removesuffix(".git").lower()
+
+
+@lru_cache(maxsize=64)
+def _origin_name(root: Path) -> str | None:
+    """The name of the repository a checkout was cloned from (``origin`` of its git config)."""
+    for d in [root, *list(root.parents)[:5]]:
+        try:
+            text = (d / ".git" / "config").read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        found = re.search(r'\[remote "origin"\][^\[]*?\burl\s*=\s*(\S+)', text)
+        return _repo_name(found.group(1)) if found else None
+    return None
+
+
+def same_repo_subdir(source: str, root: Path) -> str | None:
+    """The directory of this repository a remote source names: ``git::ssh://host/org/repo.git
+    //modules/x?ref=v1`` read from a checkout of ``repo``: the code is here (at this commit, not
+    necessarily that ref). None for any other source."""
+    found = _SUBDIR_SOURCE_RE.match(source.replace("://", "\0"))
+    if found is None:
+        return None
+    url = found.group("repo").replace("\0", "://")
+    origin = _origin_name(root)
+    if origin is None or _repo_name(url) != origin:
+        return None
+    return posixpath.normpath(found.group("sub"))

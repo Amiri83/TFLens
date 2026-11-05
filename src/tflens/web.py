@@ -457,11 +457,23 @@ def _job_key(repo_id: int) -> str:
 
 def _aws_target(raw: str) -> Any:
     """The AWS account a run checks against (its own credentials, fetched now so the
-    worker needs no request context); None when none is chosen / configured."""
-    if not raw.isdigit():
-        return None
-    acct = _accounts().get(int(raw), with_secret=True)
+    worker needs no request context): the one chosen; with none chosen, the first saved one
+    that can be used, else the first (the run then says why it cannot); None: no such account,
+    or none saved."""
+    if raw.isdigit():
+        chosen: int | None = int(raw)
+    else:
+        saved = _accounts().list()
+        usable = [a for a in saved if not a.credential_problem()]
+        first = next(iter(usable or saved), None)
+        chosen = first.id if first is not None else None
+    acct = _accounts().get(chosen, with_secret=True)
     return target_from_account(acct) if acct is not None else None
+
+
+def _account_rows() -> list[dict[str, Any]]:
+    """The accounts a New run form offers (no secret material)."""
+    return [a.public_dict() for a in _accounts().list()]
 
 
 def _discover_work(repo: dict[str, Any], aws_requested: bool, aws_target: Any):
@@ -841,6 +853,7 @@ def _register_managed(app: Flask) -> None:
             sources=tfrepo.SOURCE_LABELS,
             auth_modes=tfrepo.GIT_AUTH_LABELS,
             form=request.args,
+            accounts=_account_rows(),
         )
 
     @app.post("/repos")
@@ -1046,7 +1059,9 @@ def _register_managed(app: Flask) -> None:
         with _read() as conn:
             runs = tfrepo.list_runs(conn, repo_id) if conn is not None else []
             repos = tfrepo.list_repos(conn) if conn is not None else []
-        return render_template("runs.html", runs=runs, repos=repos, repo_id=repo_id)
+        return render_template(
+            "runs.html", runs=runs, repos=repos, repo_id=repo_id, accounts=_account_rows()
+        )
 
     @app.get("/runs/<int:run_id>/")
     def run_view(run_id: int):

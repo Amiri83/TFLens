@@ -1005,6 +1005,7 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
         total = analysis["total"]
         out["total"] = {**total, "text": env_counts_text(total)}
     out["counts"] = scope_counts(model)
+    out["unresolved_backends"] = unresolved_backends(out["environments"])
     # the grouped Unknowns panel: of the model shown, of each column and each row
     out["current"]["unknown_groups"] = unknown_groups(current["unknowns"])
     for section in (out["environments"], out["columns"]):
@@ -1019,7 +1020,33 @@ def public_row(row: dict[str, Any]) -> dict[str, Any]:
     out = {k: v for k, v in row.items() if k != "var_file_cli"}
     out["wiring"] = [w for w in row.get("wiring", []) if not w.startswith("CI / scripts:")]
     out["commands"] = list(row.get("commands") or [])
+    if row.get("state"):
+        out["state"] = public_backend(row["state"])
     return out
+
+
+def public_backend(backend: dict[str, Any]) -> dict[str, Any]:
+    """A backend / state as the UI gets it: its confirmed settings; the others only in
+    ``unresolved``, with the reason and file:line (older models have no such list)."""
+    settings = backend.get("settings") or []
+    return {
+        **backend,
+        "settings": [s for s in settings if s.get("known")],
+        "unresolved": [
+            {"key": s["key"], "reason": s.get("reason", ""), "location": s.get("location")}
+            for s in settings
+            if not s.get("known")
+        ],
+    }
+
+
+def unresolved_backends(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The backend settings still not resolved, for the Unresolved panel."""
+    return [
+        {"env": r["id"], "stack": r.get("stack"), **u}
+        for r in rows
+        for u in (r.get("state") or {}).get("unresolved", [])
+    ]
 
 
 def public_model(model: dict[str, Any]) -> dict[str, Any]:
@@ -1031,6 +1058,9 @@ def public_model(model: dict[str, Any]) -> dict[str, Any]:
         out["structure"] = {
             **{k: v for k, v in structure.items() if k != "env_files"},
             "environments": [public_row(e) for e in structure.get("environments", [])],
+            "roots": [
+                {**r, "backend": public_backend(r["backend"])} for r in structure.get("roots", [])
+            ],
         }
     return out
 
@@ -1039,6 +1069,22 @@ def aws_check(model: dict[str, Any]) -> dict[str, Any] | None:
     """The AWS check of a run that asked for one (None: it was off)."""
     aws = (model.get("pipeline") or {}).get("aws")
     return aws if aws and aws.get("status") != "off" else None
+
+
+def run_summary(model: dict[str, Any]) -> dict[str, Any]:
+    """What a run did: the unknowns before / after its resolution pass and how many resources it
+    validated in AWS (with why it did not, when it could not)."""
+    after = model["summary"]["unknowns"]
+    aws = (model.get("pipeline") or {}).get("aws") or {}
+    status = aws.get("status", "off")
+    return {
+        "unknowns_before": (model.get("resolution") or {}).get("before", after),
+        "unknowns_after": after,
+        "aws_status": status,
+        "aws_validated": (aws.get("counts") or {}).get("exists", 0),
+        "aws_reason": aws.get("reason", ""),
+        "aws_message": "" if status == "off" else aws.get("message", ""),
+    }
 
 
 def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
@@ -1056,6 +1102,7 @@ def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict
         "skipped": disc.get("skipped", []),
         "flow": build_flows(model)["metrics"],
         "environment": active["id"] if active else None,
+        "run": run_summary(model),
         "shapes": [
             {"dir": r["dir"], "shape": r["shape"], "view": r["view"]}
             for r in build_shapes(model)["roots"]

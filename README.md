@@ -174,22 +174,32 @@ level (never on the Logs page, which starts at INFO); they stay available in `mo
    evidence files), **hint-only** (named in docs / CI / git, nothing in the code) or
    **contradicted** (the hint names a file or directory that is not there, or a link the
    code does not have). The docs-vs-code mismatches are listed, including code the docs
-   never mention and resources the docs name that the code does not declare.
-3. **AWS** (optional, **off by default**, turned on per run): read-only existence checks
+   never mention and resources the docs name that the code does not declare. A **resolution
+   pass** then works on what is left: module sources naming this repository, tfvars per
+   environment (never another environment's), locals, defaults, data sources, remote state
+   outputs; `model["resolution"]` holds the unknowns before and after. Each stack:env backend
+   is resolved from the block, `backend-<env>.hcl` under any `envs/` directory, a shared
+   partial configuration, `-backend-config` in CI / scripts and terraform's defaults. A pair
+   with tfvars alone is dropped when its stack's other environments have backend files and
+   another stack has that environment located. What stays unresolved is never shown as a value:
+   it is listed once, in the **Unresolved** panel, with the reason and file:line.
+3. **AWS** (optional, **off by default**, turned on per run in every New run form): read-only existence checks
    (`sts:GetCallerIdentity`, `s3:HeadBucket`, `sqs:GetQueueUrl`, `dynamodb:DescribeTable`,
    `lambda:GetFunctionConfiguration`, `sns:GetTopicAttributes`,
    `ecr:DescribeRepositories`) of the confirmed resources whose name is known statically,
    with the run's own AWS credentials: an account from **Accounts** (managed) or
-   `--aws-profile NAME` (standalone). Needs `pip install 'tflens[aws]'`. With no account,
-   no boto3 or credentials that do not work the phase is skipped with the reason; it never
-   fails the run and never reports a result it did not get. Credentials are never written
-   to a file, put on a command line or logged.
+   `--aws-profile NAME` (standalone). With no account, no boto3 or credentials that do not
+   work the phase is skipped with a reason category (missing credentials, invalid
+   credentials, missing permission, missing region); it never fails the run and never reports
+   a result it did not get. Credentials are never written to a file, put on a command line or
+   logged. A run somebody asks for replaces an automatic one in progress, so its toggle counts.
 4. **Render**: the inventory (one column per confirmed environment), the diagrams and
    the graph are built from confirmed data only, then written atomically (a temporary
    file / directory renamed into place).
 
-The validation is `pipeline` in model.json. The result of an AWS check is in the Overview's
-details. The CLI (`tflens --dir`) runs phases 1, 2 and 4.
+The validation is `pipeline` in model.json. The Runs table and the analyzer's header show the
+unknowns before / after the resolution pass and the AWS-validated count (or why the check was
+skipped); the check's details are in the Overview. The CLI (`tflens --dir`) runs phases 1, 2 and 4.
 
 ## Deep crawl
 

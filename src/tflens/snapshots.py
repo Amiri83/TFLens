@@ -60,7 +60,7 @@ def snapshot(model: dict[str, Any]) -> dict[str, dict[Any, dict[str, Any]]]:
         backends[r["dir"]] = {
             "root": r["dir"],
             "type": b["type"],
-            "settings": {s["key"]: s["value"] for s in b["settings"]},
+            "settings": {s["key"]: s["value"] for s in b["settings"] if s["known"]},
         }
     resources = {}
     for n in model["nodes"]:
@@ -233,7 +233,8 @@ def load_snapshot(conn: sqlite3.Connection, run_id: int) -> dict[str, dict[Any, 
         out["envs"][(r["root"], r["env"])] = r
     out["backends"] = {}
     for r in rows("SELECT root, type, settings FROM run_backends WHERE run_id=?"):
-        r["settings"] = json.loads(r["settings"] or "{}")
+        stored = json.loads(r["settings"] or "{}")  # older runs kept a placeholder
+        r["settings"] = {k: v for k, v in stored.items() if v != "UNKNOWN"}
         out["backends"][r["root"]] = r
     return out
 

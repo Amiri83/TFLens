@@ -31,6 +31,7 @@ from .ciscan import (
     CI_EXPR_RE,
     CLI_FLAG_RE,
     SECRET_KEY_RE,
+    ci_backend_settings,
     ci_files,
     env_commands,
 )
@@ -48,7 +49,7 @@ from .loader import (
     read_attrs,
     read_blocks,
 )
-from .sources import classify_source
+from .sources import classify_source, same_repo_subdir
 from .tags import tagging
 from .terragrunt import Unit, substitute_raw, unit_context
 from .values import Location, Unknown, display, is_known, to_plain
@@ -114,6 +115,32 @@ _BACKEND_SETTINGS = frozenset(k for keys in BACKEND_KEYS.values() for k in keys)
     "skip_credentials_validation",
     "skip_metadata_api_check",
     "dynamodb_endpoint",
+}
+# What a state cannot be located without; every other setting of BACKEND_KEYS is optional:
+# not set means terraform's default (below) or nothing, never a missing value.
+BACKEND_REQUIRED: dict[str, frozenset[str]] = {
+    "s3": frozenset({"bucket", "key", "region"}),
+    "gcs": frozenset({"bucket"}),
+    "azurerm": frozenset({"storage_account_name", "container_name", "key"}),
+    "remote": frozenset({"organization"}),
+    "cloud": frozenset({"organization"}),
+    "consul": frozenset({"path"}),
+    "http": frozenset({"address"}),
+    "pg": frozenset({"conn_str"}),
+    "kubernetes": frozenset({"secret_suffix"}),
+    "oss": frozenset({"bucket"}),
+    "cos": frozenset({"bucket"}),
+}
+# terraform's own defaults for a setting the configuration leaves out
+BACKEND_DEFAULTS: dict[str, dict[str, str]] = {
+    "gcs": {"prefix": "default"},
+    "remote": {"hostname": "app.terraform.io"},
+    "cloud": {"hostname": "app.terraform.io"},
+    "kubernetes": {"namespace": "default"},
+    "local": {"path": "terraform.tfstate"},
+    "pg": {"schema_name": "terraform_remote_state"},
+    "oss": {"key": "terraform.tfstate"},
+    "cos": {"key": "terraform.tfstate"},
 }
 _CALL_META = {"source", "version", "providers", "count", "for_each", "depends_on"}
 
@@ -265,8 +292,14 @@ def classify_module_dirs(repo: RepoSource, engine: Engine) -> list[dict[str, Any
         for name, call in sorted(mod.module_calls.items()):
             attr = call.attrs.get("source")
             src = _static(attr.raw) if attr else None
-            if isinstance(src, str) and src.startswith(("./", "../")):
+            if not isinstance(src, str):
+                continue
+            target = None
+            if src.startswith(("./", "../")):
                 target = posixpath.normpath(posixpath.join(mod.dir, src))
+            else:
+                target = same_repo_subdir(src, repo.root)
+            if target is not None:
                 callers.setdefault(target, []).append(
                     {"caller": mod.dir, "address": f"module.{name}", "location": _loc(call.loc)}
                 )
@@ -1043,6 +1076,7 @@ def detect_environments(
     # 3. partial backend configurations: backend.<env>.hcl, <env>.tfbackend, backend/<env>.hcl,
     # env/<env>.hcl: matched to the environment of the same name
     configs = backend_files(repo)
+    shared_configs: dict[str, list[str]] = {}
     per_dir: dict[str, int] = {}
     for f in configs:
         d = posixpath.dirname(f) or "."
@@ -1053,15 +1087,17 @@ def detect_environments(
         owner = _owner(d, roots)
         if d != owner:
             owner = _owner(_backend_owner_dir(d), roots)
-        if name is None:
+        if name is None or name.lower() in COMMON_STEMS:
             note(
                 f,
                 owner,
                 None,
                 "backend",
                 False,
-                "partial backend configuration with no environment in its name or directory",
+                "partial backend configuration with no environment in its name or directory: "
+                "shared by every environment of the stack",
             )
+            shared_configs.setdefault(owner, []).append(f)
             continue
         known = any(k[1] == env_name(name) for k in envs)
         if name.lower() in ENV_WORDS:
@@ -1135,6 +1171,10 @@ def detect_environments(
         }
         if entry not in e["var_file_cli"]:
             e["var_file_cli"].append(entry)
+    # 5. what the engine can still find itself: backend files outside the stack's tree, tfvars
+    # setting a variable the environment's own files leave unset
+    _find_backend_files(envs, configs, roots, note)
+    _find_var_files(repo, engine, envs, roots, note)
     out = [envs[k] for k in sorted(envs)]
     for e in out:
         e["kinds"].sort()
@@ -1142,17 +1182,189 @@ def detect_environments(
         e["backend_hcl"].sort()
         e["var_file_cli"].sort(key=lambda u: (u["location"]["file"], u["location"]["start_line"]))
         e.update(_wiring(e))
-        e["state"] = _env_state(repo, engine, e)
-        siblings = [o["name"] for o in out if o["root"] == e["root"]]
-        e["commands"] = env_commands(repo, e, siblings)
-    return out
+        names = [o["name"] for o in out if o["root"] == e["root"]]
+        shared = shared_configs.get(e["roots"][0] if e["roots"] else e["root"], [])
+        e["state"] = _env_state(repo, engine, e, shared, names)
+    # 6. a stack:env pair no real file proves: dropped, only the debug trace says so
+    kept = []
+    for e in out:
+        if _unproven_pair(e, out):
+            note(
+                (e["var_files"] or [e["root"]])[-1],
+                e["roots"][0] if e["roots"] else e["root"],
+                e["name"],
+                "backend",
+                False,
+                f"dropped {e['root']}:{e['name']}: no backend file of this stack proves it, while "
+                f"its sibling environments and another stack's {e['name']} each have one",
+            )
+        else:
+            kept.append(e)
+    for e in kept:
+        e["commands"] = env_commands(repo, e, [o["name"] for o in kept if o["root"] == e["root"]])
+    return kept
+
+
+def _tokens(path: str) -> set[str]:
+    return {t for t in re.split(r"[/._-]+", path.lower()) if t}
+
+
+def _find_backend_files(
+    envs: dict[tuple[str, str], dict[str, Any]], configs: list[str], roots: list[str], note: Any
+) -> None:
+    """``backend-<env>.hcl`` of a stack that is under an ``envs/``-like directory outside every
+    root (``envs/backend-dev.hcl``, ``envs/<stack>/backend-dev.hcl``): it belongs to the stacks
+    it does not exclude by naming another one. Attached there, it is not an environment of the
+    repository's top directory any more."""
+    if "." in roots:
+        return  # the top directory is a root: such a file is its own
+    bases = {posixpath.basename(r).lower() for r in roots}
+    used: set[str] = set()
+    for e in list(envs.values()):
+        if e["root"] == "." or e["backend_hcl"] or {"dir", "terragrunt"} & set(e["kinds"]):
+            continue
+        stack = e["roots"][0] if e["roots"] else e["root"]
+        base = posixpath.basename(stack).lower()
+        for f in configs:
+            d = posixpath.dirname(f) or "."
+            if _owner(_backend_owner_dir(d), roots) != ".":
+                continue  # below a root: its own stack's file
+            parts = d.lower().split("/")
+            if not any(
+                p in ENV_CONTAINERS or p in VAR_DIRS or _BACKEND_DIR_RE.match(p) for p in parts
+            ):
+                continue
+            seg = env_segment(d)
+            stem = backend_env(f)
+            named_env = stem is not None and env_name(stem) == e["name"]
+            if not named_env and not (seg and seg[0] == e["name"] and (stem or "").lower() == base):
+                continue
+            tokens = _tokens(f)
+            if base not in tokens and tokens & (bases - {base}):
+                continue  # names another stack
+            e["backend_hcl"].append(f)
+            e["kinds"] = sorted({*e["kinds"], "backend"})
+            used.add(f)
+            note(f, stack, e["name"], "backend", True, f"found under {d}/ for {stack}:{e['name']}")
+            break
+    # an "environment" of the top directory that was only these files
+    for key in [k for k in envs if k[0] == "."]:
+        top = envs[key]
+        if (
+            not top["roots"]
+            and not top["var_files"]
+            and top["backend_hcl"]
+            and set(top["backend_hcl"]) <= used
+        ):
+            del envs[key]
+
+
+def _find_var_files(
+    repo: RepoSource,
+    engine: Engine,
+    envs: dict[tuple[str, str], dict[str, Any]],
+    roots: list[str],
+    note: Any,
+) -> None:
+    """A variable with no default that the environment's own tfvars leave unset, set by a
+    tfvars file of no other environment: below the stack (``envs/terraform.tfvars``) or outside
+    every root, naming this stack or this environment or shared by name. Applied first, so the
+    environment's own files win. Another environment's file is never used."""
+    bases = {posixpath.basename(r).lower() for r in roots}
+    used: set[str] = set()
+    for e in envs.values():
+        e["found_var_files"] = []
+        root = e["roots"][0] if e["roots"] else e["root"]
+        mod = repo.modules.get(engine.root_modules.get(root, root))
+        if mod is None or root in engine.units:
+            continue
+        unset = {n for n, b in mod.variables.items() if "default" not in b.attrs}
+        prefix = "" if root == "." else root + "/"
+        for f, attrs in repo.tfvars.items():
+            tail = f[len(prefix) :] if f.startswith(prefix) else ""
+            auto = "/" not in tail and (
+                tail in ("terraform.tfvars", "terraform.tfvars.json") or ".auto." in tail
+            )
+            if auto or f in e["var_files"]:
+                unset -= set(attrs)
+        if not unset:
+            continue
+        same_stack = [o for o in envs.values() if o["root"] == e["root"] and o is not e]
+        taken = {f for o in same_stack for f in o["var_files"]}
+        others = (ENV_WORDS | {o["name"].lower() for o in same_stack}) - {e["name"].lower()}
+        base = posixpath.basename(root).lower()
+        found = []
+        for f in sorted(repo.tfvars):
+            d = posixpath.dirname(f) or "."
+            stem = posixpath.basename(f).removesuffix(".json").removesuffix(".tfvars").lower()
+            owner = _owner(d, roots)
+            if f in taken or f in e["var_files"] or _BACKEND_FILE_RE.search(f) or d == root:
+                continue  # another environment's, or next to the root: terraform's own rules
+            tokens = _tokens(f)
+            if tokens & others or (base not in tokens and tokens & (bases - {base})):
+                continue  # another environment's, or another stack's
+            if owner != root:
+                outside = owner == "." and "." not in roots
+                named = base in tokens or e["name"].lower() in tokens
+                if not outside or not (named or stem in COMMON_STEMS | GENERIC_STEMS):
+                    continue
+            hits = unset & set(repo.tfvars[f])
+            if hits:
+                found.append(f)
+                unset -= hits
+                note(
+                    f,
+                    root,
+                    e["name"],
+                    "tfvars",
+                    True,
+                    "sets " + ", ".join(sorted(f"var.{h}" for h in hits)) + f" for {e['name']}",
+                )
+        if found:
+            e["found_var_files"] = found
+            e["var_files"][:0] = found
+            used.update(found)
+    # an "environment" of the top directory that is a stack's values, not an environment
+    # (envs/<stack>/terraform.tfvars): it must not stand for every stack
+    for key in [k for k in envs if k[0] == "." and "." not in roots]:
+        top = envs[key]
+        if top["roots"] or top["backend_hcl"] or len(envs) == 1:
+            continue
+        if top["name"].lower() in bases or (top["var_files"] and set(top["var_files"]) <= used):
+            del envs[key]
+
+
+def _state_complete(env: dict[str, Any]) -> bool:
+    return not (env.get("state") or {}).get("unresolved")
+
+
+def _unproven_pair(env: dict[str, Any], environments: list[dict[str, Any]]) -> bool:
+    """A stack:env pair with no real file behind its state: tfvars alone, its state not located,
+    while this stack's other environments have backend files and another stack has this
+    environment with its state located. A pair with a file of its own (a backend
+    configuration, an environment directory) is never dropped, nor is an environment only
+    this stack has, tfvars alone (listed as not wired)."""
+    if _state_complete(env) or env["backend_hcl"] or {"dir", "terragrunt"} & set(env["kinds"]):
+        return False
+    if env["var_file_cli"] or (env.get("state") or {}).get("ci_lines"):
+        return False  # a line of CI / a script runs it: only its values are not in the repository
+    siblings = [o for o in environments if o["root"] == env["root"] and o is not env]
+    if not any(o["backend_hcl"] and _state_complete(o) for o in siblings):
+        return False
+    return any(
+        o["name"] == env["name"] and o["root"] != env["root"] and _state_complete(o)
+        for o in environments
+    )
 
 
 def _known_settings(settings: list[dict[str, Any]]) -> dict[str, str]:
     return {
         s["key"]: s["value"]
         for s in settings
-        if s.get("known") and "per_environment" not in s and s.get("value") != "(redacted)"
+        if s.get("known")
+        and "per_environment" not in s
+        and not s.get("default")
+        and s.get("value") != "(redacted)"
     }
 
 
@@ -1215,16 +1427,54 @@ def _wiring(env: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _env_state(repo: RepoSource, engine: Engine, env: dict[str, Any]) -> dict[str, Any]:
+def _infer_backend_type(values: dict[str, Any]) -> str:
+    """The backend a partial configuration with no ``backend`` block is for, from its settings
+    ("partial" when they do not say)."""
+    if "storage_account_name" in values:
+        return "azurerm"
+    if "bucket" in values and "key" in values:
+        return "s3"
+    if "bucket" in values and "prefix" in values:
+        return "gcs"
+    return "partial"
+
+
+def _not_located(settings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The settings not resolved, each with why and where the search stopped; their value is
+    never kept (``known`` tells, nothing shows a placeholder for one)."""
+    out = []
+    for s in settings:
+        if not s.get("known"):
+            s["value"] = None
+            out.append({"key": s["key"], "reason": s.get("reason", ""), "location": s["location"]})
+    return out
+
+
+def _env_state(
+    repo: RepoSource,
+    engine: Engine,
+    env: dict[str, Any],
+    shared: list[str] | None = None,
+    names: list[str] | None = None,
+) -> dict[str, Any]:
     """The state file of an environment: the backend type and its key settings (``bucket``
-    / ``key`` / ``region`` / ``dynamodb_table`` for s3) from the root's backend block and
-    the environment's partial configurations (later files override earlier ones, as with
-    repeated ``-backend-config``); a setting found nowhere is UNKNOWN with the reason."""
+    / ``key`` / ``region`` / ``dynamodb_table`` for s3), resolved in terraform's order: the
+    root's backend block, its shared partial configuration, the environment's own (later
+    files override earlier ones, as with repeated ``-backend-config``), ``-backend-config``
+    settings of CI / scripts, then terraform's defaults. A required setting found nowhere is
+    ``unresolved``, with the reason and where the search stopped; an optional one is left out."""
     root = env["roots"][0] if env["roots"] else env["root"]
     unit = engine.units.get(root)
     if unit is not None and unit.remote_state is not None:
         rs = _remote_state(repo, unit)
-        return {"type": rs["type"], "origin": rs["origin"], "files": [], "settings": rs["settings"]}
+        return {
+            "type": rs["type"],
+            "origin": rs["origin"],
+            "location": rs["location"],
+            "files": [],
+            "settings": rs["settings"],
+            "unresolved": _not_located(rs["settings"]),
+        }
     mod = repo.modules.get(engine.root_modules.get(root, root))
     block = None
     for tb in mod.terraform if mod else []:
@@ -1232,32 +1482,71 @@ def _env_state(repo: RepoSource, engine: Engine, env: dict[str, Any]) -> dict[st
         if found:
             block = found[0]
             break
-    files = list(env["backend_hcl"])
+    files = [*(shared or []), *env["backend_hcl"]]
     if block is None and not files:
         return {
             "type": "local",
             "origin": "default (no backend block)",
             "files": [],
             "settings": [],
+            "unresolved": [],
             "note": "no backend configured: state is kept in a local terraform.tfstate",
         }
-    btype = UNKNOWN
     values: dict[str, tuple[Any, Location | None]] = {}
     origin = "partial backend configuration"
     if block is not None:
-        btype = "cloud" if block.type == "cloud" else (block.labels[0] if block.labels else UNKNOWN)
         origin = f"{block.type} block" + (f" + {', '.join(files)}" if files else "")
         reason = "backend settings cannot use variables"
         values = {k: (_static(a.raw, reason), a.loc) for k, a in block.attrs.items()}
     for f in files:
         for k, a in (read_attrs(repo, f) or {}).items():
             values[k] = (_static(a.raw, "backend settings cannot use variables"), a.loc)
+    at_runtime: dict[str, dict[str, Any]] = {}
+    ci_used: set[str] = set()
+    ci_items = ci_backend_settings(repo, root, env["name"], names or [])
+    for item in ci_items:
+        if item["value"] is None:
+            at_runtime.setdefault(item["key"], item)
+        else:
+            values[item["key"]] = (item["value"], item["location"])
+            ci_used.add(item["location"].file)
+    if ci_used:
+        origin += " + -backend-config in " + ", ".join(sorted(ci_used))
+    if block is not None:
+        btype = "cloud" if block.type == "cloud" else (block.labels[0] if block.labels else UNKNOWN)
+    else:
+        btype = _infer_backend_type(values)
     wanted = BACKEND_KEYS.get(btype, ())
+    required = BACKEND_REQUIRED.get(btype, frozenset())
+    defaults = BACKEND_DEFAULTS.get(btype, {})
+    stopped = _loc(block.loc) if block is not None else None
     settings = []
     for key in list(wanted) + sorted(k for k in values if k not in wanted):
         if key in values:
             settings.append(_setting(key, *values[key]))
-        else:
+        elif key in at_runtime:
+            where = at_runtime[key]["location"]
+            settings.append(
+                {
+                    "key": key,
+                    "value": None,
+                    "known": False,
+                    "location": _loc(where),
+                    "reason": f"set at run time by {where} (not in the repository)",
+                }
+            )
+        elif key in defaults:
+            settings.append(
+                {
+                    "key": key,
+                    "value": defaults[key],
+                    "known": True,
+                    "default": True,
+                    "location": stopped,
+                    "note": "terraform's default",
+                }
+            )
+        elif key in required:
             if files:
                 reason = f"not set in {', '.join(files)} nor in the backend block"
             else:
@@ -1265,19 +1554,22 @@ def _env_state(repo: RepoSource, engine: Engine, env: dict[str, Any]) -> dict[st
             settings.append(
                 {
                     "key": key,
-                    "value": UNKNOWN,
+                    "value": None,
                     "known": False,
-                    "location": None,
-                    "reason": reason + ": supplied by terraform init -backend-config (or the "
-                    "environment) at run time",
+                    "location": stopped,
+                    "reason": reason + f"; no backend-{env['name']}.hcl under an envs/ directory, "
+                    "no -backend-config setting where it is run from, and terraform has no "
+                    "default",
                 }
             )
     return {
         "type": btype,
         "origin": origin,
-        "location": _loc(block.loc) if block is not None else None,
+        "location": stopped,
         "files": files,
         "settings": settings,
+        "unresolved": _not_located(settings),
+        "ci_lines": bool(ci_items),
     }
 
 

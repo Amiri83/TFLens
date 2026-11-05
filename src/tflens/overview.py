@@ -548,7 +548,7 @@ def structure_lines(model: dict[str, Any]) -> list[dict[str, Any]]:
         role = f", {r['role']}" if r.get("role") else ""
         lines.append(_line(f"{r['dir']}/ — {kind}{role}", fallback))
         b = r["backend"]
-        settings = ", ".join(f"{s['key']} = {s['value']}" for s in b["settings"])
+        settings = ", ".join(f"{s['key']} = {s['value']}" for s in b["settings"] if s["known"])
         lines.append(
             _line(
                 f"backend: {b['type']} ({b['origin']})" + (f"; {settings}" if settings else ""),
@@ -644,7 +644,7 @@ def _backend_lines(b: dict[str, Any], fallback: dict[str, Any] | None) -> list[d
     for s in b["settings"]:
         text = f"{s['key']} = {s['value']}"
         if not s["known"]:
-            text += f" — {s.get('reason', '')}"
+            text = f"{s['key']}: {s.get('reason', '')}"
         elif s.get("note"):
             text += f" ({s['note']})"
         lines.append(_line(text, s["location"] or loc, 1, status="" if s["known"] else "unknown"))

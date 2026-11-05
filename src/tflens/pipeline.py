@@ -13,10 +13,11 @@
    docs and CI never create one. Each item is ``confirmed``, ``hint-only`` (named in
    docs / CI / git, nothing in the code) or ``contradicted`` (the hint names a path or file
    the code says otherwise about). Only confirmed items reach the UI; the others are written
-   to the log file at debug level (:func:`log_uncertain`).
+   to the log file at debug level (:func:`log_uncertain`). The analysis itself compares a first
+   pass with a resolution pass (``model["resolution"]``: the unknowns before and after).
 3. **AWS** (optional, off by default): read-only existence checks of confirmed resources
    with an AWS account's own credentials (:mod:`tflens.awscheck`). Skipped, with the
-   reason, when not asked for or not configured.
+   reason (a category, never a value), when not asked for or when it cannot run.
 4. **Render**: the model (inventory per environment column, diagrams, graph) is built from
    the confirmed data only and written by the caller's ``write`` callback, after the last
    cancellation point: a cancelled run writes nothing.
@@ -650,28 +651,37 @@ def log_uncertain(hints: list[dict[str, Any]], validation: dict[str, Any]) -> No
 
 
 def confirmed_only(model: dict[str, Any]) -> None:
-    """Render from confirmed data only: an environment with no real Terraform file behind
-    it is dropped from the structure, the stacks and the per-environment columns."""
+    """Render from confirmed data only: a stack:env pair with no real Terraform file behind
+    it is dropped from the structure, the stacks and the per-environment columns. Pair by
+    pair: another stack's environment of the same name stays."""
     structure = model.get("structure") or {}
     envs = structure.get("environments", [])
     keep = [e for e in envs if e.get("status", CONFIRMED) == CONFIRMED]
     if len(keep) == len(envs):
         return
-    dropped = {e["name"] for e in envs} - {e["name"] for e in keep}
+    dropped = {env_id(e, envs) for e in envs if e.get("status", CONFIRMED) != CONFIRMED}
     structure["environments"] = keep
-    for s in model.get("stacks", []):  # environment ids: name, or <root>:<name>
-        s["environments"] = [e for e in s["environments"] if e.split(":")[-1] not in dropped]
-        if s.get("selected") and s["selected"].split(":")[-1] in dropped:
+    for s in model.get("stacks", []):
+        s["environments"] = [e for e in s["environments"] if e not in dropped]
+        if s.get("selected") in dropped:
             s["selected"] = next(iter(s["environments"]), None)
             s["default"] = s["selected"] is not None
     analysis = model.get("environment_analysis") or {}
     if analysis.get("selected"):
-        analysis["selected"] = [e for e in analysis["selected"] if e.split(":")[-1] not in dropped]
-    for key in ("columns", "environments"):
-        if key in analysis:
-            analysis[key] = [
-                c for c in analysis[key] if str(c.get("id", "")).split(":")[-1] not in dropped
-            ]
+        analysis["selected"] = [e for e in analysis["selected"] if e not in dropped]
+    if "environments" in analysis:
+        analysis["environments"] = [r for r in analysis["environments"] if r["id"] not in dropped]
+    if "columns" in analysis:
+        columns = []
+        for c in analysis["columns"]:
+            if "environments" in c:
+                c["environments"] = [e for e in c["environments"] if e not in dropped]
+                if not c["environments"] and not c.get("no_environment"):
+                    continue
+            elif c.get("id") in dropped:
+                continue
+            columns.append(c)
+        analysis["columns"] = columns
 
 
 # ------------------------------------------------------------------ the pipeline
@@ -736,12 +746,27 @@ def discover(
     log_uncertain(hints, validation)
     c = validation["counts"]["envs"]
     prog.log(f"environments: {c[CONFIRMED]} confirmed")
-    done("validate", "done", f"{c[CONFIRMED]} environment(s) confirmed")
+    resolution = model["resolution"]
+    prog.log(f"unknowns: {resolution['before']} before resolution, {resolution['after']} after")
+    done(
+        "validate",
+        "done",
+        f"{c[CONFIRMED]} environment(s) confirmed; "
+        f"unknowns {resolution['before']} → {resolution['after']}",
+    )
 
     # 3. AWS (optional)
     prog.phase("aws", dict(PHASES)["aws"])
     aws = run_checks(model, opts.aws, opts.aws_requested, prog)
     done("aws", aws["status"], aws["message"])
+    model["summary"].update(
+        unknowns_before=resolution["before"],
+        aws={
+            "status": aws["status"],
+            "validated": (aws.get("counts") or {}).get("exists", 0),
+            "reason": aws.get("reason", ""),
+        },
+    )
 
     # 4. render
     prog.phase("render", dict(PHASES)["render"])
