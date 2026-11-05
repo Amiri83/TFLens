@@ -127,7 +127,7 @@ def run_analysis(
         engine.root_envs = dict(per_stack["root_envs"])
     elif selected is not None:
         engine.root_envs = {r: selected["name"] for r in env_roots(selected, all_roots)}
-    first_pass = None if explicit else _first_pass_unknowns(repo, engine, environments, mark)
+    first_pass = None if explicit else _first_pass_unknowns(repo, engine, mark)
     mark(
         "resolution pass: module sources, tfvars per environment, locals, defaults, "
         "data sources, remote state outputs"
@@ -188,26 +188,16 @@ def run_analysis(
 def _first_pass_unknowns(
     repo: RepoSource,
     engine: Engine,
-    environments: list[dict[str, Any]],
     mark: Callable[[str], None],
 ) -> list[dict[str, Any]]:
-    """The unknowns before the resolution pass: each environment's own tfvars only, no source
-    followed into this repository, no data source read from the provider."""
-    mark("first pass: each environment's own tfvars")
-    found = {f for e in environments for f in e.get("found_var_files", [])}
-    plain = Engine(
-        repo,
-        [f for f in engine.var_files if f not in found],
-        engine.cli_vars,
-        engine.scope,
-        root_var_files={
-            r: [f for f in files if f not in found] for r, files in engine.root_var_files.items()
-        },
-        exclude_roots=engine.exclude_roots,
-    )
+    """The unknowns before the resolution pass: the code alone. No environment's tfvars, no
+    value from CI, no state of another stack, no source followed into this repository, no data
+    source read from the provider: all of that is what the resolution pass adds. (Given the
+    environments' tfvars too, the two passes evaluate the same inputs and always count the
+    same.) What terraform always loads (terraform.tfvars, *.auto.tfvars) still applies."""
+    mark("first pass: the code alone, no environment's tfvars")
+    plain = Engine(repo, scope=engine.scope, exclude_roots=engine.exclude_roots)
     plain.deep = False
-    plain.state_index = engine.state_index
-    plain.root_envs = dict(engine.root_envs)
     plain.run()
     return [u.to_dict() for u in analyze(repo, plain).unknowns]
 

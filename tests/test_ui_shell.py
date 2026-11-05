@@ -222,7 +222,7 @@ def test_app_js_parses():
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed")
-    for name in ("app.js", "diagram.js"):
+    for name in ("app.js", "diagram.js", "discover.js"):
         subprocess.run([node, "--check", str(STATIC_DIR / name)], check=True, capture_output=True)
 
 

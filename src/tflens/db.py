@@ -62,7 +62,9 @@ CREATE TABLE IF NOT EXISTS tf_repos (
     synced_at     TEXT,
     sync_status   TEXT NOT NULL DEFAULT '',       -- '' | ok | failed
     sync_detail   TEXT NOT NULL DEFAULT '',
-    commit_sha    TEXT NOT NULL DEFAULT ''        -- HEAD of the last sync ('' = not git)
+    commit_sha    TEXT NOT NULL DEFAULT '',       -- HEAD of the last sync ('' = not git)
+    aws_check     TEXT NOT NULL DEFAULT '',       -- last AWS check choice: '' never chosen | 0 | 1
+    aws_account   TEXT NOT NULL DEFAULT ''        -- the account last chosen for it (accounts.id)
 );
 
 -- Environments of a repository. TFLens adds var_files (JSON list of tfvars paths relative
@@ -164,6 +166,8 @@ _ADDED_COLUMNS = (
     ("tf_repos", "sync_status", "TEXT NOT NULL DEFAULT ''"),
     ("tf_repos", "sync_detail", "TEXT NOT NULL DEFAULT ''"),
     ("tf_repos", "commit_sha", "TEXT NOT NULL DEFAULT ''"),
+    ("tf_repos", "aws_check", "TEXT NOT NULL DEFAULT ''"),
+    ("tf_repos", "aws_account", "TEXT NOT NULL DEFAULT ''"),
     ("tf_repo_envs", "var_files", "TEXT NOT NULL DEFAULT '[]'"),
     ("tf_repo_envs", "extra_vars_enc", "TEXT NOT NULL DEFAULT ''"),
     ("tf_repo_envs", "extra_vars_keys", "TEXT NOT NULL DEFAULT ''"),

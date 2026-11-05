@@ -1126,6 +1126,7 @@ def detect_environments(
             e["backend_hcl"].append(f)
         if f not in repo.files:
             repo.files.append(f)  # listed, so its source can be shown
+    _merge_split_envs(envs, note)
     # 4. -backend-config / -var-file in CI files and scripts (never docs): leads only. They
     # are attached to an environment that a real tfvars / backend file / environment
     # directory already established; they never create one.
@@ -1207,6 +1208,36 @@ def detect_environments(
 
 def _tokens(path: str) -> set[str]:
     return {t for t in re.split(r"[/._-]+", path.lower()) if t}
+
+
+def _merge_split_envs(envs: dict[tuple[str, str], dict[str, Any]], note: Any) -> None:
+    """One environment read as two: ``backend-dev.hcl`` is ``dev``, ``dev-us-east-1.tfvars`` (or
+    ``app-dev.tfvars``) is another name, so ``dev`` is analyzed with no tfvars and every variable
+    they set stays unknown. A stack's environment with backend files and no tfvars takes the
+    tfvars of the one tfvars-only environment naming it. Several name it (one per region): which
+    one applies is not known, they stay apart. ``non-prod`` is not ``prod``."""
+    for (root, name), e in list(envs.items()):
+        if e["var_files"] or not e["backend_hcl"] or {"dir", "terragrunt"} & set(e["kinds"]):
+            continue
+        named = [
+            k
+            for k, o in envs.items()
+            if k[0] == root
+            and o is not e
+            and o["kinds"] == ["tfvars"]
+            and name.lower() in _tokens(k[1])
+            and not {"non", "pre"} & _tokens(k[1])
+            and k[1].lower() not in ENV_WORDS
+        ]
+        if len(named) != 1:
+            continue
+        other = envs.pop(named[0])
+        e["var_files"].extend(other["var_files"])
+        e["evidence"].extend(x for x in other["evidence"] if x not in e["evidence"])
+        e["roots"].extend(r for r in other["roots"] if r not in e["roots"])
+        e["kinds"].append("tfvars")
+        for f in other["var_files"]:
+            note(f, root, name, "tfvars", True, f"{other['name']} is {name}: same environment")
 
 
 def _find_backend_files(

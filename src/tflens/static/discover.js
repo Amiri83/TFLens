@@ -216,6 +216,21 @@
     });
   });
 
+  // The Runs page's form: the AWS check choice follows the repository picked.
+  document.querySelectorAll("form[data-aws-choices]").forEach((form) => {
+    const choices = JSON.parse(form.dataset.awsChoices);
+    const picker = form.elements.repo_id;
+    const box = form.elements.aws;
+    const account = form.elements.account_id;
+    if (!picker || !box || box.disabled) return;
+    picker.addEventListener("change", () => {
+      const choice = choices[picker.value];
+      if (!choice) return;
+      box.checked = choice.on;
+      if (account && choice.account_id !== null) account.value = String(choice.account_id);
+    });
+  });
+
   // Re-attach after a reload: the running job of this repository (kept hidden if hidden).
   fetch(modal.dataset.currentUrl, { credentials: "same-origin" })
     .then((r) => (r.ok ? r.json() : { job: null }))

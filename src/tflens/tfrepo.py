@@ -413,6 +413,30 @@ def get_repo(conn: sqlite3.Connection, repo_id: int) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def aws_choice(repo: dict[str, Any], accounts: list[dict[str, Any]]) -> dict[str, Any]:
+    """What a repository's New run form shows for the AWS check: ``{on, account_id}``. The last
+    choice for this repository; with none (or its account deleted): on with the account
+    preselected when exactly one is saved, off otherwise (several: nothing says which)."""
+    ids = [a["id"] for a in accounts]
+    only = ids[0] if len(ids) == 1 else None
+    if not ids:
+        return {"on": False, "account_id": None}
+    check, raw = repo.get("aws_check") or "", str(repo.get("aws_account") or "")
+    if check and raw.isdigit() and int(raw) in ids:
+        return {"on": check == "1", "account_id": int(raw)}
+    if check == "0":
+        return {"on": False, "account_id": only}
+    return {"on": only is not None, "account_id": only}
+
+
+def save_aws_choice(conn: sqlite3.Connection, repo_id: int, on: bool, account: str) -> None:
+    """Remember a run's AWS check choice for its repository (the account's id, no credential)."""
+    conn.execute(
+        "UPDATE tf_repos SET aws_check=?, aws_account=? WHERE id=?",
+        ("1" if on else "0", account, repo_id),
+    )
+
+
 def _inside(path: Path, base: Path) -> bool:
     try:
         path.resolve().relative_to(base.resolve())

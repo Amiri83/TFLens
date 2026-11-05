@@ -1,6 +1,7 @@
-"""Phase 3 of discovery (optional, off by default): do the confirmed resources exist?
+"""Phase 3 of discovery (optional): do the confirmed resources exist?
 
-Only when the run asks for it *and* an AWS account is configured: an :class:`AwsTarget`
+Only when the run asks for it (the AWS check next to the New run button) *and* an AWS
+account is configured: an :class:`AwsTarget`
 built from that account's own credentials (a named profile, the standard credential chain
 of an "Environment" account, or the account's stored keys, held in memory only). The
 credentials are never written to a file, never put on a command line, never logged.
@@ -104,7 +105,27 @@ _REASONS: dict[str, frozenset[str]] = {
         }
     ),
 }
-OFF = "not requested for this run (off by default)"
+OFF = "not requested for this run (turn on AWS check next to the New run button)"
+# What an error is called in the run log, where its category says less than the error does.
+_ERROR_NAMES: dict[str, str] = {
+    "ProfileNotFound": "bad profile",
+    "SSOTokenLoadError": "expired SSO",
+    "UnauthorizedSSOTokenError": "expired SSO",
+    "TokenRetrievalError": "expired SSO",
+    "AccessDenied": "AccessDenied",
+    "AccessDeniedException": "AccessDenied",
+    "NoRegionError": "region",
+    "InvalidRegionError": "region",
+}
+# The read-only call each check makes.
+ACTIONS: dict[str, str] = {
+    "s3": "s3:HeadBucket",
+    "sqs": "sqs:GetQueueUrl",
+    "dynamodb": "dynamodb:DescribeTable",
+    "lambda": "lambda:GetFunctionConfiguration",
+    "sns": "sns:GetTopicAttributes",
+    "ecr": "ecr:DescribeRepositories",
+}
 
 
 @dataclass
@@ -246,7 +267,13 @@ def run_checks(
     """The ``pipeline.aws`` section: ``off`` (not asked for), ``skipped`` (asked for, not
     possible: ``reason``, a category, and the message), ``done`` (each check: exists / missing /
     denied / error with the error code). Error codes and categories only: an exception's text
-    can quote the request, so it is never kept or logged."""
+    can quote the request, so it is never kept or logged. The run log says which account was
+    used (its label), each call made (by the resource's address) and each error."""
+
+    def say(text: str) -> None:
+        progress.log(f"AWS check: {text}")
+        log.info("AWS check: %s", text)
+
     if not requested:
         return _result("off", OFF)
     if target is None:
@@ -255,6 +282,7 @@ def run_checks(
             "no AWS account is configured for this run (add one under Accounts, or start "
             "with --aws-profile): AWS check skipped",
         )
+    say(f"account used: {target.label}")
     if target.problem or target.session is None:
         problem = target.problem or "not usable"
         return _skipped(_problem_reason(problem), f"{target.label}: {problem}")
@@ -264,15 +292,18 @@ def run_checks(
         session = target.session()
         region = target.region or getattr(session, "region_name", None)
         if not region and hasattr(session, "region_name"):
+            say("error: region (no region set on the account or in its AWS profile)")
             return _skipped(
                 MISSING_REGION,
                 f"{target.label}: {MISSING_REGION} (set one on the account or in its AWS profile): "
                 "AWS check skipped",
             )
+        say("call: sts:GetCallerIdentity")
         ident_raw = session.client("sts").get_caller_identity()
     except Exception as exc:  # no credentials, expired, network: say so, never fake
         code = _code(exc) or type(exc).__name__
         reason = reason_of(code) or "cannot connect"
+        say(f"error: {_ERROR_NAMES.get(code, reason)} ({code})")
         return _skipped(
             reason, f"{target.label}: cannot connect: {reason} ({code}): AWS check skipped"
         )
@@ -285,7 +316,8 @@ def run_checks(
     checks = []
     clients: dict[str, Any] = {}
     for item in items[:MAX_CHECKS]:
-        progress.step(f"AWS: {item['type']} {item['name']}")
+        action = ACTIONS[item["service"]]
+        progress.step(f"AWS: {action} {item['id']}")
         try:
             client = clients.get(item["service"])
             if client is None:
@@ -302,10 +334,9 @@ def run_checks(
                 status, detail = "denied", code
             else:
                 status, detail = "error", code
-        progress.log(
-            f"   {item['type']} {item['name']}: {status}" + (f" ({detail})" if detail else "")
-        )
+        say(f"call: {action} {item['id']}: {status}" + (f" ({detail})" if detail else ""))
         checks.append({**item, "status": status, "detail": detail})
+    say(f"{len(checks) + 1} read-only call(s) made")
     counts = {
         s: sum(1 for c in checks if c["status"] == s)
         for s in ("exists", "missing", "denied", "error")

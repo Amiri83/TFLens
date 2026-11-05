@@ -1,17 +1,19 @@
-{# The run's AWS toggle (phase 3), in every New run form. `compact`: one per table row. Sends
-   aws=1 and account_id; web._start_run passes them to the pipeline. #}
+{# The AWS check of a New run form (phase 3), next to its button. `accounts`: the saved ones;
+   `aws_choice`: {on, account_id} (tfrepo.aws_choice: the last choice for the repository, else
+   the default). Sends aws=1 and account_id; web._start_run passes them to the pipeline and
+   remembers them per repository. An account with a problem stays offered: the run says why it
+   cannot be used. #}
 {% set saved = accounts | default([]) %}
-{% set usable = saved | rejectattr('problem') | list %}
-{% set broken = saved | selectattr('problem') | list %}
-<label class="check{{ ' small' if compact }}" title="Read-only existence checks of the confirmed resources, this run only">
-  <input type="checkbox" name="aws" value="1"{% if not compact %} id="discover-aws"{% endif %} {{ 'disabled' if not usable }}>
-  {{ 'AWS' if compact else 'Check confirmed resources in AWS (read-only, this run only)' }}</label>
-{% if usable | length > 1 or (usable and not compact) %}
-  <select name="account_id" aria-label="AWS account">
-    {% for a in usable %}<option value="{{ a.id }}">{{ a.display_name or ('account ' ~ a.id) }} · {{ a.region }}</option>{% endfor %}
-  </select>
-{% elif usable %}
-  <input type="hidden" name="account_id" value="{{ usable[0].id }}">
-{% elif not compact %}
-  <span class="muted small">{% if broken %}{{ broken[0].display_name or ('account ' ~ broken[0].id) }}: {{ broken[0].problem }}; {% else %}no usable AWS account: {% endif %}<a href="{{ url_for('accounts_page') }}">{{ 'fix it under Accounts' if broken else 'add one under Accounts' }}</a> to enable it</span>
-{% endif %}
+{% set choice = aws_choice or {'on': false, 'account_id': none} %}
+<span class="aws-toggle">
+  <label class="check" title="Read-only existence checks of the confirmed resources in this AWS account, during this run">
+    <input type="checkbox" name="aws" value="1" {{ 'checked' if choice.on }} {{ 'disabled' if not saved }}> AWS check</label>
+  {% if saved %}
+    <select name="account_id" aria-label="AWS account">
+      {% for a in saved %}<option value="{{ a.id }}" {{ 'selected' if a.id == choice.account_id }}>{{ a.display_name or ('account ' ~ a.id) }} · {{ a.region }}{% if a.problem %} ({{ a.problem }}){% endif %}</option>{% endfor %}
+    </select>
+  {% else %}
+    <select aria-label="AWS account" disabled><option>no account</option></select>
+    <a class="small" href="{{ url_for('accounts_page') }}">add one under Accounts</a>
+  {% endif %}
+</span>

@@ -662,13 +662,14 @@ def _start_run(repo: dict[str, Any], back_url: str):
     """Start a run of ``repo``. Pages with JavaScript post ``background=1`` and follow the
     job on the progress screen; a plain form post runs it to the end and opens the run."""
     background = request.form.get("background") == "1"
+    aws = request.form.get("aws") == "1"
+    account = request.form.get("account_id", "")
+    saved = {str(a["id"]) for a in _account_rows()}
+    if saved:  # with none saved there is no choice to remember: the first one added turns it on
+        with _write() as conn:
+            tfrepo.save_aws_choice(conn, repo["id"], aws, account if account in saved else "")
     try:
-        job = _start_discover(
-            repo,
-            background=background,
-            aws=request.form.get("aws") == "1",
-            account=request.form.get("account_id", ""),
-        )
+        job = _start_discover(repo, background=background, aws=aws, account=account)
     except JobBusy as exc:
         if background:
             return jsonify({"ok": False, "error": str(exc), "job": exc.job}), 409
@@ -847,13 +848,16 @@ def _register_managed(app: Flask) -> None:
     def tfrepos_page():
         with _read() as conn:
             repos = tfrepo.list_repos(conn) if conn is not None else []
+        accounts = _account_rows()
+        for p in repos:
+            p["aws_choice"] = tfrepo.aws_choice(p, accounts)
         return render_template(
             "repos.html",
             repos=repos,
             sources=tfrepo.SOURCE_LABELS,
             auth_modes=tfrepo.GIT_AUTH_LABELS,
             form=request.args,
-            accounts=_account_rows(),
+            accounts=accounts,
         )
 
     @app.post("/repos")
@@ -886,13 +890,14 @@ def _register_managed(app: Flask) -> None:
             envs = tfrepo.list_envs(conn, repo_id) if conn is not None else []
             runs = tfrepo.list_runs(conn, repo_id, limit=20) if conn is not None else []
         envs = [e for e in envs if e["present"]]  # a real file (or the user) stands behind it
-        accounts = [a.public_dict() for a in _accounts().list()]
+        accounts = _account_rows()
         return render_template(
             "tfrepo.html",
             repo=repo,
             envs=envs,
             runs=runs,
             accounts=accounts,
+            aws_choice=tfrepo.aws_choice(repo, accounts),
             auth_modes=tfrepo.GIT_AUTH_LABELS,
             root_exists=Path(repo["path"]).is_dir(),
         )
@@ -1059,8 +1064,18 @@ def _register_managed(app: Flask) -> None:
         with _read() as conn:
             runs = tfrepo.list_runs(conn, repo_id) if conn is not None else []
             repos = tfrepo.list_repos(conn) if conn is not None else []
+        accounts = _account_rows()
+        choices = {p["id"]: tfrepo.aws_choice(p, accounts) for p in repos}
+        # the form opens on the repository filtered on, else the first (as its picker does)
+        picked = repo_id if repo_id in choices else next(iter(choices), None)
         return render_template(
-            "runs.html", runs=runs, repos=repos, repo_id=repo_id, accounts=_account_rows()
+            "runs.html",
+            runs=runs,
+            repos=repos,
+            repo_id=repo_id,
+            accounts=accounts,
+            aws_choices=choices,
+            aws_choice=choices.get(picked),
         )
 
     @app.get("/runs/<int:run_id>/")
