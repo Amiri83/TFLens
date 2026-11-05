@@ -1,11 +1,9 @@
-"""One card per stack for the Root view: what it is for (only from its own README, and
-only when the stack is confirmed), its environments, its backend per environment, the
+"""One card per stack for the Root view: its environments, its backend per environment, the
 resources it declares by type, the modules it calls and the remote-state links into and
 out of it. Pure functions over the model, no I/O."""
 
 from __future__ import annotations
 
-import posixpath
 from collections import Counter
 from typing import Any
 
@@ -13,28 +11,6 @@ from .envs import node_root
 from .labels import type_label
 from .overview import FRIENDLY
 from .visuals import backend_text, env_matrix_table, root_node_id
-
-
-def _readme(model: dict[str, Any], roots: list[str]) -> dict[str, Any] | None:
-    """The README in a stack's own directory (never the repository's top-level one)."""
-    for d in (model.get("crawl") or {}).get("docs") or []:
-        base = posixpath.basename(d["path"]).lower()
-        if base.startswith("readme") and posixpath.dirname(d["path"]) in roots:
-            return d
-    return None
-
-
-def _purpose(model: dict[str, Any], stack: dict[str, Any], status: str) -> dict[str, Any]:
-    doc = _readme(model, stack["roots"])
-    if doc is None:
-        return {"text": None, "note": "no README in the stack's directory"}
-    if status != "confirmed":
-        return {"text": None, "note": f"stack {status}: its README is not used"}
-    text = doc.get("excerpt") or doc.get("title") or ""
-    if not text:
-        return {"text": None, "note": f"{doc['path']} has no prose to use"}
-    loc = doc.get("excerpt_location") if doc.get("excerpt") else doc.get("title_location")
-    return {"text": text, "location": loc, "source": doc["path"], "status": "confirmed"}
 
 
 def _link(lk: dict[str, Any]) -> dict[str, Any]:
@@ -60,15 +36,11 @@ def stack_cards(model: dict[str, Any]) -> list[dict[str, Any]]:
             for d, r in roots_by_dir.items()
             if r.get("role") != "library"
         ]
-    validation = (model.get("pipeline") or {}).get("validation") or {}
-    stack_status = {v["name"]: v["status"] for v in validation.get("stacks") or []}
-    env_status = {v["name"]: v["status"] for v in validation.get("envs") or []}
     matrix = {r["stack"]: r for r in env_matrix_table(model)["rows"]}
     links = model.get("stack_links") or []
     cards = []
     for s in stacks:
         here = set(s["roots"]) | {s["id"]}
-        status = stack_status.get(s["id"], "confirmed")
         by_type: Counter[str] = Counter(
             n["type"]
             for n in model["nodes"]
@@ -97,11 +69,7 @@ def stack_cards(model: dict[str, Any]) -> list[dict[str, Any]]:
                 "roots": s["roots"],
                 "node": root_node_id(s["roots"][0]) if s["roots"] else None,
                 "layout": s.get("layout", ""),
-                "status": status,
-                "purpose": _purpose(model, s, status),
-                "environments": [
-                    {"name": e, "status": env_status.get(e, "confirmed")} for e in envs
-                ],
+                "environments": [{"name": e} for e in envs],
                 "backend": {
                     "text": backend_text(root["backend"]) if root else "",
                     "location": root["backend"].get("location") if root else None,

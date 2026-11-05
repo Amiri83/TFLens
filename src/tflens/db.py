@@ -111,7 +111,8 @@ CREATE TABLE IF NOT EXISTS runs (
     model_path  TEXT NOT NULL,              -- '' when the run failed before writing a model
     root_path   TEXT NOT NULL DEFAULT '',   -- directory analyzed (evidence snippets)
     status      TEXT NOT NULL DEFAULT 'ok', -- ok | failed
-    error       TEXT NOT NULL DEFAULT ''    -- why the run failed (first line: the reason)
+    error       TEXT NOT NULL DEFAULT '',   -- why the run failed (first line: the reason)
+    code_version TEXT NOT NULL DEFAULT ''   -- the TFLens code that ran it (tfrepo.code_version)
 );
 CREATE INDEX IF NOT EXISTS ix_runs_repo ON runs(repo_id, ts);
 
@@ -169,6 +170,7 @@ _ADDED_COLUMNS = (
     ("runs", "root_path", "TEXT NOT NULL DEFAULT ''"),
     ("runs", "status", "TEXT NOT NULL DEFAULT 'ok'"),
     ("runs", "error", "TEXT NOT NULL DEFAULT ''"),
+    ("runs", "code_version", "TEXT NOT NULL DEFAULT ''"),
 )
 
 ACTIVE_ACCOUNT_KEY = "active_account"

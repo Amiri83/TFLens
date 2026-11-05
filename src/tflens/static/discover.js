@@ -1,10 +1,12 @@
-/* TFLens Discover progress screen (repository page of the managed app, and the analyzer
-   of `tflens serve --dir`). The single Discover button posts its form in the background;
-   the server starts the job (one per repository) and this script polls its state into
-   the box: the four phases with their outcome, the current phase / step, the elapsed
-   time, the live log, Hide and Cancel. Cancel stops the run after its current step,
-   before anything is written. Hide keeps the run going and shows a small badge that
-   reopens the box (remembered per tab); a reload re-attaches to a running job. Without
+/* TFLens progress screen of a run (the Runs, Repos and repository pages of the managed
+   app, and the analyzer of `tflens serve --dir`). A New run / Discover button posts its
+   form in the background; the server starts the job (one per repository) and this script
+   polls its state into the box: the four phases with their outcome, the current phase /
+   step, the elapsed time, the live log, Hide and Cancel. Cancel stops the run after its
+   current step, before anything is written. Hide keeps the run going and shows a small
+   badge that reopens the box (remembered per tab); a reload re-attaches to a running job.
+   When the run is done the page moves to it; if the box is hidden (or the run is an
+   automatic one, which only shows the badge), the badge says so and links to it. Without
    JavaScript the form posts normally and the run goes to the end before the page loads.
 
    The box (#discover-modal) carries its endpoints in data attributes:
@@ -105,11 +107,19 @@
     cancelBtn.disabled = Boolean(job.cancel_requested);
     hideBtn.hidden = !running;
     closeBtn.hidden = running;
-    badge.textContent = running ? `Discover running… ${job.step || ""}` : "";
+    badge.textContent = running ? `Run in progress… ${job.step || ""}` : finishedText(job);
     if (!running) {
-      badge.hidden = true;
       sessionStorage.removeItem(HIDDEN_KEY);
+      badge.hidden = !modal.hidden || job.state === "cancelled";
+      if (job.state === "done" && result.url && !modal.hidden && location.pathname !== result.url) {
+        window.location.href = result.url;
+      }
     }
+  }
+
+  function finishedText(job) {
+    if (job.state === "error") return `${job.label}: failed (click for why)`;
+    return result.url ? `${job.label}: finished, open the run` : `${job.label}: finished`;
   }
 
   function open() {
@@ -144,8 +154,9 @@
 
   function attach(job, show) {
     jobId = job.id;
+    if (show) open();
     render(job);
-    if (show) open(); else hide();
+    if (!show) hide();
     if (job.running) timer = setTimeout(poll, POLL_MS);
   }
 
@@ -155,7 +166,10 @@
     post(url(modal.dataset.cancelUrl, jobId), {}).then(poll).catch(poll);
   });
   hideBtn.addEventListener("click", hide);
-  badge.addEventListener("click", open);
+  badge.addEventListener("click", () => {
+    if (!running && result.url) window.location.href = result.url;
+    else open();
+  });
   closeBtn.addEventListener("click", () => {
     if (result.url && !location.pathname.startsWith(result.url)) window.location.href = result.url;
     else window.location.reload();
@@ -167,7 +181,7 @@
   function notStarted(text) {
     jobId = null;
     running = false;
-    title.textContent = "Discover not started";
+    title.textContent = "Run not started";
     phasesEl.replaceChildren();
     stepEl.textContent = "";
     logEl.textContent = "";
@@ -197,7 +211,7 @@
           }
           notStarted(d.error || `HTTP ${status}`);
         })
-        .catch((err) => notStarted(`Could not start Discover (${err.message}).`))
+        .catch((err) => notStarted(`Could not start the run (${err.message}).`))
         .finally(() => buttons.forEach((b) => { b.disabled = false; }));
     });
   });
@@ -207,7 +221,7 @@
     .then((r) => (r.ok ? r.json() : { job: null }))
     .then((d) => {
       const job = d.job;
-      if (job && job.running) attach(job, sessionStorage.getItem(HIDDEN_KEY) !== job.id);
+      if (job && job.running) attach(job, !job.auto && sessionStorage.getItem(HIDDEN_KEY) !== job.id);
       if (d.aws) {  // standalone: whether the AWS phase can be turned on
         const box = document.getElementById("discover-aws");
         const why = document.getElementById("discover-aws-why");

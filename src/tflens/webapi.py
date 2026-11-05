@@ -29,7 +29,7 @@ from .envs import (
     scope_counts,
     summarize,
 )
-from .flow import build_flows, chain_svg
+from .flow import build_flows, chain_svg, confirmed_flows
 from .graphlayout import layout as graph_layout
 from .icons import service_colour
 from .jobs import JobBusy, JobContext, JobManager
@@ -37,7 +37,7 @@ from .labels import call_name, node_label
 from .layouts import LayoutError, SqliteLayouts
 from .model import EDGE_KINDS, SCHEMA_VERSION
 from .output import dumps, library_roots
-from .overview import build_overview
+from .overview import build_overview, confirmed_overview
 from .pipeline import Options, discover
 from .report import describe_node
 from .shapes import build_root_view, build_shapes, root_entries, root_model
@@ -916,8 +916,7 @@ def file_detail(model: dict[str, Any], path: str) -> dict[str, Any] | None:
             "analyzed": False,
             "readable": readable,
             "note": "Not analyzed: TFLens reads *.tf, *.tf.json, *.tfvars(.json) and "
-            "terragrunt.hcl files only."
-            + (" Crawled (docs / CI / history): the source can be shown." if readable else ""),
+            "terragrunt.hcl files only." + (" The source can be shown." if readable else ""),
             "modules": [],
             "resources": [],
             "unknowns": [],
@@ -986,7 +985,7 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
         "default": bool(active and active.get("default")),  # applied as none was chosen
         "switchable": store is not None and not store.readonly,
         "types": analysis.get("types", []),
-        "environments": rows,
+        "environments": [public_row(r) for r in rows],
         "columns": columns,
         "inventory": inventory,
         "library_roots": sorted(library),
@@ -1004,98 +1003,34 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
     if rows:
         total = analysis["total"]
         out["total"] = {**total, "text": env_counts_text(total)}
-    out["env_debug"] = env_debug(model)
     out["counts"] = scope_counts(model)
     return out
 
 
-def env_debug(model: dict[str, Any]) -> dict[str, Any]:
-    """The environment debug list, grouped by environment: one line per environment
-    (its status, the number of real files that are its evidence, how many times docs / CI
-    / git mention it), its files and hint sources behind it; the rejected candidate files
-    in one group. Never one line per doc mention."""
-    validation = (model.get("pipeline") or {}).get("validation")
-    trace = (model.get("structure") or {}).get("env_files", [])
-    files_of: dict[str, list[dict[str, Any]]] = {}
-    for t in trace:
-        if t["accepted"] and t.get("env"):
-            files_of.setdefault(t["env"], []).append(t)
-    if validation is not None:
-        items = validation["envs"]
-    else:  # a model written before the pipeline: from the detected environments
-        by_name: dict[str, dict[str, Any]] = {}
-        for e in (model.get("structure") or {}).get("environments", []):
-            it = by_name.setdefault(
-                e["name"],
-                {
-                    "name": e["name"],
-                    "status": "confirmed",
-                    "stacks": [],
-                    "evidence": [],
-                    "hint_mentions": 0,
-                    "hint_sources": [],
-                    "via": [],
-                    "kinds": [],
-                },
-            )
-            it["stacks"].append(e["root"])
-            it["evidence"] = sorted(
-                set(it["evidence"]) | set(e.get("var_files", [])) | set(e.get("backend_hcl", []))
-            )
-            it["kinds"] = sorted(set(it["kinds"]) | set(e.get("kinds", [])))
-        items = [{**it, "evidence_count": len(it["evidence"])} for _, it in sorted(by_name.items())]
-    groups = []
-    for it in items:
-        groups.append(
-            {
-                "env": it["name"],
-                "status": it["status"],
-                "evidence_count": it.get("evidence_count", 0),
-                "evidence": it.get("evidence", []),
-                "stacks": it.get("stacks", []),
-                "kinds": it.get("kinds", []),
-                "hint_mentions": it.get("hint_mentions", 0),
-                "hint_via": it.get("via", []),
-                "hint_sources": it.get("hint_sources", [])[:10],
-                "reason": it.get("reason", ""),
-                "files": [
-                    {
-                        "file": t["file"],
-                        "stack": t["stack"],
-                        "kind": t["kind"],
-                        "reason": t["reason"],
-                    }
-                    for t in files_of.get(it["name"], [])
-                ],
-            }
-        )
-    order = {"confirmed": 0, "contradicted": 1, "hint-only": 2}
-    groups.sort(key=lambda g: (order.get(g["status"], 3), g["env"]))
-    rejected: dict[str, dict[str, Any]] = {}
-    for t in trace:
-        if not t["accepted"]:
-            r = rejected.setdefault(
-                t["file"],
-                {"file": t["file"], "stack": t["stack"], "reason": t["reason"], "count": 0},
-            )
-            r["count"] += 1
-    return {
-        "groups": groups,
-        "confirmed": sum(1 for g in groups if g["status"] == "confirmed"),
-        "rejected": [rejected[k] for k in sorted(rejected)],
-    }
+def public_row(row: dict[str, Any]) -> dict[str, Any]:
+    """An environment row of the UI: its real files, without the CI lines naming it."""
+    out = {k: v for k, v in row.items() if k != "var_file_cli"}
+    out["wiring"] = [w for w in row.get("wiring", []) if not w.startswith("CI / scripts:")]
+    return out
 
 
-def discovery_view(model: dict[str, Any]) -> dict[str, Any]:
-    """The Discovery tab: the phases, the crawl (tree), the hints and their validation,
-    the docs-vs-code mismatches and the AWS check."""
-    pipe = model.get("pipeline")
-    if pipe is None:
-        return {
-            "available": False,
-            "note": "this model was written before phased discovery: run Discover",
+def public_model(model: dict[str, Any]) -> dict[str, Any]:
+    """``api/model``: the model without what was read from docs, CI and the git log, the
+    validation of those hints and the rejected candidate files (model.json keeps them)."""
+    out = {k: v for k, v in model.items() if k not in ("crawl", "docs_diff", "pipeline")}
+    structure = model.get("structure")
+    if structure:
+        out["structure"] = {
+            **{k: v for k, v in structure.items() if k != "env_files"},
+            "environments": [public_row(e) for e in structure.get("environments", [])],
         }
-    return {"available": True, **pipe, "counts": scope_counts(model)}
+    return out
+
+
+def aws_check(model: dict[str, Any]) -> dict[str, Any] | None:
+    """The AWS check of a run that asked for one (None: it was off)."""
+    aws = (model.get("pipeline") or {}).get("aws")
+    return aws if aws and aws.get("status") != "off" else None
 
 
 def summary_view(model: dict[str, Any], store: ModelStore | None = None) -> dict[str, Any]:
@@ -1281,11 +1216,9 @@ class Api:
         if path == "/api/summary":
             return json_response(summary_view(model, self.store))
         if path == "/api/model":
-            return json_response(model)
+            return json_response(public_model(model))
         if path == "/api/environments":
             return json_response(environments_view(model, self.store))
-        if path == "/api/discovery":
-            return json_response(discovery_view(model))
         if path == "/api/graph":
             return json_response(graph_view(model))
         if path == "/api/nodes":
@@ -1300,9 +1233,10 @@ class Api:
         if path == "/api/tree":
             return json_response(repo_tree(model, self.store.title))
         if path == "/api/overview":
-            return json_response(build_overview(model, self.store.title, self.store.lines))
+            ov = confirmed_overview(build_overview(model, self.store.title, self.store.lines))
+            return json_response({**ov, "aws": aws_check(model)})
         if path == "/api/flow":
-            return json_response(build_flows(model))
+            return json_response(confirmed_flows(build_flows(model)))
         if path == "/api/shapes":
             return json_response(build_shapes(model))
         if path == "/api/stack-cards":
@@ -1359,10 +1293,6 @@ class Api:
                 return _download(body, "text/plain; charset=utf-8", f"{name}.mmd", query)
             body = svg(model, name, self.store.title)
             return _download(body, "image/svg+xml; charset=utf-8", f"{name}.svg", query)
-        if path == "/api/handoff":
-            return _download(
-                self._handoff(model), "text/markdown; charset=utf-8", "handoff.md", query
-            )
         if path == "/api/source":
             try:
                 start = int(query.get("start", "1"))
@@ -1381,19 +1311,6 @@ class Api:
             detail = file_detail(model, query.get("path", ""))
             return json_response(detail) if detail else _not_found(f"file {query.get('path')!r}")
         return _not_found(path)
-
-    def _handoff(self, model: dict[str, Any]) -> str:
-        """A recorded run serves the handoff.md written with it (it includes the changes
-        since the previous run); otherwise it is generated from the model."""
-        if self.store.readonly:
-            recorded = self.store.model_path.parent / "handoff.md"
-            try:
-                return recorded.read_text(encoding="utf-8")
-            except OSError:
-                pass
-        from .handoff import render_handoff
-
-        return render_handoff(model, self.store.title, self.store.lines)
 
 
 def _download(body: str, ctype: str, filename: str, query: dict[str, str]) -> Response:

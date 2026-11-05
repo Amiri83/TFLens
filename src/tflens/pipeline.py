@@ -12,7 +12,8 @@
    backend file (or environment directory holding Terraform code) in that stack's tree;
    docs and CI never create one. Each item is ``confirmed``, ``hint-only`` (named in
    docs / CI / git, nothing in the code) or ``contradicted`` (the hint names a path or file
-   the code says otherwise about); the docs-vs-code mismatches are listed.
+   the code says otherwise about). Only confirmed items reach the UI; the others are written
+   to the log file at debug level (:func:`log_uncertain`).
 3. **AWS** (optional, off by default): read-only existence checks of confirmed resources
    with an AWS account's own credentials (:mod:`tflens.awscheck`). Skipped, with the
    reason, when not asked for or not configured.
@@ -27,6 +28,7 @@ between steps.
 
 from __future__ import annotations
 
+import logging
 import posixpath
 import re
 from collections.abc import Callable
@@ -41,8 +43,10 @@ from .envs import env_id
 from .loader import ENV_CONTAINERS, ENV_WORDS, RepoSource, load_repo
 from .output import Analysis, run_analysis
 
+log = logging.getLogger(__name__)
+
 PHASES: tuple[tuple[str, str], ...] = (
-    ("crawl", "Crawl + hypothesis"),
+    ("crawl", "Crawl"),
     ("validate", "Validate against the code"),
     ("aws", "Check in AWS (read-only)"),
     ("render", "Render"),
@@ -626,6 +630,25 @@ def _closest(path: str, a: str, b: str) -> str | None:
     return max(hits, key=len) if hits else None
 
 
+def log_uncertain(hints: list[dict[str, Any]], validation: dict[str, Any]) -> None:
+    """The items that are not confirmed, for the log file only (debug level): the UI never
+    shows them. Names, statuses and file:line only, never the text of a doc line."""
+    if not log.isEnabledFor(logging.DEBUG):
+        return
+    for h in hints:
+        where = ", ".join(f"{s['file']}:{s.get('line', 0)}" for s in h["sources"][:5])
+        log.debug(
+            "hint: %s %s: %d mention(s) in %s (%s)",
+            h["kind"],
+            h["name"],
+            h["mentions"],
+            ", ".join(h["via"]),
+            where,
+        )
+    for m in validation["mismatches"]:
+        log.debug("%s: %s %s: %s", m["status"], m["kind"], m["name"], m["text"])
+
+
 def confirmed_only(model: dict[str, Any]) -> None:
     """Render from confirmed data only: an environment with no real Terraform file behind
     it is dropped from the structure, the stacks and the per-environment columns."""
@@ -676,7 +699,7 @@ def discover(
         prog.phase_done(name, status, detail)
         prog.log(f"{dict(PHASES)[name]}: {status}" + (f" ({detail})" if detail else ""))
 
-    # 1. crawl + hypothesis
+    # 1. crawl (and the draft map of hints, which only the debug log shows)
     prog.phase("crawl", dict(PHASES)["crawl"])
     prog.step("listing every file")
     repo = load_repo(root)
@@ -686,16 +709,10 @@ def discover(
         + (" (listing truncated)" if repo.truncated else "")
     )
     tree = tree_lines(repo.all_files, skipped)
-    prog.step("reading docs, CI and git history (hints only)")
+    prog.step("reading the repository")
     crawled = crawl(repo, opts.git_root, opts.git)
-    prog.step("drafting the map of stacks, environments and links")
     hints = hypothesize(repo, crawled)
-    n_by = {k: sum(1 for h in hints if h["kind"] == k) for k in ("stack", "env", "link")}
-    prog.log(
-        f"hints: {n_by['env']} environment(s), {n_by['stack']} stack(s), {n_by['link']} link(s) "
-        f"from {len(hint_sources(repo.all_files))} doc / CI file(s) and the git log"
-    )
-    done("crawl", "done", f"{len(repo.all_files)} files, {len(hints)} hints")
+    done("crawl", "done", f"{len(repo.all_files)} files")
 
     # 2. validate
     prog.phase("validate", dict(PHASES)["validate"])
@@ -714,13 +731,11 @@ def discover(
         step=prog.step,
     )
     model = analysis.model
-    prog.step("confirming the hints against .tf / .tfvars / backend files")
+    prog.step("confirming against .tf / .tfvars / backend files")
     validation = validate(model, hints)
+    log_uncertain(hints, validation)
     c = validation["counts"]["envs"]
-    prog.log(
-        f"environments: {c[CONFIRMED]} confirmed, {c[HINT_ONLY]} hint-only, "
-        f"{c[CONTRADICTED]} contradicted; {len(validation['mismatches'])} docs-vs-code mismatch(es)"
-    )
+    prog.log(f"environments: {c[CONFIRMED]} confirmed")
     done("validate", "done", f"{c[CONFIRMED]} environment(s) confirmed")
 
     # 3. AWS (optional)

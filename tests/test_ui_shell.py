@@ -25,7 +25,7 @@ from tflens.pipeline import (
     stack_candidate,
 )
 from tflens.web import create_app
-from tflens.webapi import STATIC_DIR, Api, ModelStore, discovery_view, env_debug, environments_view
+from tflens.webapi import STATIC_DIR, Api, ModelStore, environments_view
 
 TEMPLATES = Path(STATIC_DIR).parent / "templates"
 SHELL = 'data-shell="tflens"'
@@ -97,7 +97,16 @@ def _assert_shell(html: str, url: str, *, menu: bool = True) -> None:
 
 
 # Routes that answer with data or a download, never a page.
-NOT_PAGES = {"static", "job_current", "job_status", "run_api", "run_file", "overview"}
+NOT_PAGES = {
+    "static",
+    "job_current",
+    "job_status",
+    "jobs_current",
+    "jobs_status",
+    "run_api",
+    "run_file",
+    "overview",
+}
 
 
 def test_every_get_route_renders_the_shared_base_template(client, stacks_repo):
@@ -162,7 +171,7 @@ def test_run_tabs_are_a_subnav_under_the_shared_menu(client, stacks_repo):
     tabs = html[subnav : html.index("</nav>", subnav)]
     for view in ("environments", "roots", "flow", "overview", "graph", "diagrams", "repo"):
         assert f'data-view="{view}"' in tabs, view
-    assert 'data-view="discovery"' in tabs and f'href="/runs/{run_id}/changes"' in tabs
+    assert 'data-view="discovery"' not in tabs and f'href="/runs/{run_id}/changes"' in tabs
     assert "data-view" not in html[: html.index("</header>")]  # not in the top menu
     # on Changes the same tabs link back to the analyzer's views
     changes = client.get(f"/runs/{run_id}/changes").data.decode()
@@ -334,19 +343,6 @@ def test_git_log_never_proposes_a_stack(tmp_path):
     assert [h for h in hypothesize(repo, crawled) if h["kind"] == "stack"] == []
 
 
-def test_discovery_collapses_contradicted_items_behind_a_count():
-    js = (STATIC_DIR / "app.js").read_text()
-    group = js.split("function contradictedGroup(items, content) {", 1)[1].split("\n  }\n", 1)[0]
-    assert 'el("details", { class: "contradicted-group" }' in group
-    assert 'el("summary", {}, `${items.length} contradicted`)' in group
-    assert " open" not in group  # collapsed until asked for
-    table = js.split("function validationTable(items, label) {", 1)[1].split("\n  }\n", 1)[0]
-    assert 'it.status !== "contradicted"' in table and "contradictedGroup(hidden" in table
-    body = js.split("function renderDiscovery(d) {", 1)[1].split("\n  }\n", 1)[0]
-    assert 'v.mismatches.filter((m) => m.status === "contradicted")' in body
-    assert "validationTable(v.envs" in body and "validationTable(v.stacks.filter" in body
-
-
 # ---------------------------------------------------------------- 3. environment binding
 
 
@@ -432,13 +428,10 @@ def test_shown_env_names_are_unique_and_in_promotion_order():
 def _agreement(model: dict) -> dict:
     """The stack / environment numbers of every section, from what each one is built on."""
     view = environments_view(model)
-    disc = discovery_view(model)
     v = model["pipeline"]["validation"]
     return {
         "counts": scope_counts(model),
         "header_and_tables": view["counts"],
-        "discovery": disc["counts"],
-        "debug_confirmed": env_debug(model)["confirmed"],
         "validation_envs": v["counts"]["envs"][CONFIRMED],
         "validation_stacks": v["counts"]["stacks"][CONFIRMED],
         "stack_rows": [s for s in v["stacks"] if s.get("role") != "directory"],
@@ -449,10 +442,10 @@ def _agreement(model: dict) -> dict:
 
 
 def _assert_agree(a: dict, stacks: int, envs: int, rows: int) -> None:
-    assert a["counts"] == a["header_and_tables"] == a["discovery"]
+    assert a["counts"] == a["header_and_tables"]
     assert (a["counts"]["stacks"], a["counts"]["environments"]) == (stacks, envs)
     assert a["counts"]["stack_environments"] == rows == len(a["env_rows"])
-    assert a["debug_confirmed"] == a["validation_envs"] == len(a["columns"]) == envs
+    assert a["validation_envs"] == len(a["columns"]) == envs
     assert a["validation_stacks"] == len(a["stack_rows"]) == len(a["stacks_listed"]) == stacks
 
 
@@ -460,8 +453,8 @@ def test_counts_agree_per_env_files(stacks_repo):
     model = discover(stacks_repo, Options(git=False, auto_env=True)).model
     # dev | uat | prod; prod is in two stacks: 3 names, 4 rows
     _assert_agree(_agreement(model), stacks=3, envs=3, rows=4)
-    dbg = env_debug(model)
-    prod = next(g for g in dbg["groups"] if g["env"] == "prod")
+    v = model["pipeline"]["validation"]["envs"]
+    prod = next(e for e in v if e["name"] == "prod")
     assert prod["stacks"] == ["stacks/api", "stacks/worker"]
 
 
@@ -483,7 +476,7 @@ def test_counts_agree_for_environment_directories(tmp_path):
     assert v["envs/*"]["roots"] == ["envs/dev", "envs/prod"]
     assert v["envs/*"]["hint_mentions"] >= 2
     assert v["envs"]["role"] == "directory"
-    dev = next(g for g in env_debug(model)["groups"] if g["env"] == "dev")
+    dev = next(e for e in model["pipeline"]["validation"]["envs"] if e["name"] == "dev")
     assert dev["stacks"] == ["envs/*"]
 
 
@@ -521,11 +514,7 @@ def test_header_and_sections_read_the_same_counts():
     assert "const { environments: envCount, stacks } = envs.counts;" in bar
     view = js.split("function renderEnvironments(envs) {", 1)[1].split("\n  }\n", 1)[0]
     assert "`Stacks (${counts.stacks})`" in view
-    assert "`Environments (debug): ${counts.environments} confirmed`" in view
     assert "`Detected environments (${counts.environments})`" in view
-    disc = js.split("function renderDiscovery(d) {", 1)[1].split("\n  }\n", 1)[0]
-    assert "`Stacks (${d.counts.stacks})`" in disc
-    assert "`Environments (${d.counts.environments} confirmed)`" in disc
 
 
 def test_fixture_with_many_mentions_keeps_its_counts(tmp_path):

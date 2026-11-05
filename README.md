@@ -138,15 +138,28 @@ Nothing has to be configured before a first analysis:
 
 ## Discover: a phased pipeline
 
-Discovery is one run in four phases, started by the single **Discover** button (managed:
-the repository's page; standalone: the analyzer's header) and followed on a progress
-screen: the four phases with their outcome, the current phase and step, the elapsed time
-and a live log. **Hide** keeps the run going behind a small badge that reopens it;
-**Cancel** stops it after its current step, before anything is written (no model, no
-run, no environment record; the worker thread ends). Without JavaScript the form posts
-normally and the run goes to the end.
+Discovery is one run in four phases, started by **New run** (managed: the Runs page, each
+row of the Repos page and the repository's page; standalone: **Discover** in the
+analyzer's header) and followed on a progress screen: the four phases with their outcome,
+the current phase and step, the elapsed time and a live log. **Hide** keeps the run going
+behind a small badge that reopens it; **Cancel** stops it after its current step, before
+anything is written (no model, no run, no environment record; the worker thread ends).
+When it is done the page moves to the new run. Without JavaScript the form posts normally
+and the run goes to the end.
 
-1. **Crawl + hypothesis**: every file is listed, as `tree` prints it (`.terraform`,
+A manual **Sync** is only needed to bring in a git repository's new commits: a run reads
+what is on disk, and the first run of a git repository clones it. When the TFLens code
+changed since a repository's latest run (each run records its version and a hash of the
+sources), the first page opened after the server starts launches a new run of that
+repository, one at a time, shown by the badge only.
+
+**The UI shows confirmed facts only**: every page and every count is built from what real
+`.tf`, `.tfvars` and backend files confirm. Hint-only and contradicted items, what docs, CI
+and the git log say, and the docs-vs-code mismatches are written to the log file at debug
+level (never on the Logs page, which starts at INFO); they stay available in `model.json`,
+`report.md` and `overview.md` on disk.
+
+1. **Crawl**: every file is listed, as `tree` prints it (`.terraform`,
    `.venv`, `.git`, `dist`, `node_modules`, ... are skipped and listed with why). READMEs,
    other Markdown files, `docs/`, HANDOFF notes, CI files, scripts and the git log are read
    as **hints only**: a draft map of environments (environment words, `envs/<name>` paths,
@@ -175,12 +188,8 @@ normally and the run goes to the end.
    the graph are built from confirmed data only, then written atomically (a temporary
    file / directory renamed into place).
 
-The analyzer's **Discovery** tab shows the phases, the mismatches, each environment /
-stack / link with its status, evidence and hint sources, the AWS check and the file
-tree; it is `pipeline` in model.json. The Environments view's debug list is grouped by
-environment: one line per environment with its status, its evidence count and how many
-times docs / CI / git mention it (never one line per mention); the rejected candidate
-files are one group. The CLI (`tflens --dir`) runs phases 1, 2 and 4.
+The validation is `pipeline` in model.json. The result of an AWS check is in the Overview's
+details. The CLI (`tflens --dir`) runs phases 1, 2 and 4.
 
 ## Deep crawl
 
@@ -208,11 +217,12 @@ nobody calls that has no backend, provider configuration or tfvars), and a catal
 every module directory (`root` / `child` / `terragrunt-source` / `remote`) with its call
 sites.
 
-The **Overview** also has: a *Purpose (guess)* (README title and first paragraph, then
-e.g. "deploys 2 Lambda functions, 1 SQS queue, 1 DynamoDB table and 1 S3 bucket", the CI
-that applies it), a drill-down per resource (what it is, triggered by, triggers, can
-access, accessed by, network, and the defining code), the docs, the CI and lock files,
-and the history (recent commits, most-changed files). Every line links to `file:line`.
+The **Overview** in the UI also has a drill-down per resource (what it is, triggered by,
+triggers, can access, accessed by, network, and the defining code); every line links to
+`file:line`. `overview.md` and `report.md` on disk add a *Purpose (guess)* (README title and
+first paragraph, then e.g. "deploys 2 Lambda functions, 1 SQS queue, 1 DynamoDB table and 1
+S3 bucket", the CI that applies it), the docs, the CI and lock files, and the history
+(recent commits, most-changed files).
 
 ## Diagrams
 
@@ -250,9 +260,8 @@ first), environments, backends and files. Runs recorded before snapshots existed
 back-filled from their `model.json`.
 
 Every run also writes `handoff.md` (flows + overview + the three diagrams as Mermaid + the
-changes since the previous run) and `diagrams/` next to its `model.json`; both can be
-downloaded from the Runs table. `handoff.md` is meant to be given to Claude Code as
-context (`@handoff.md`).
+changes since the previous run) and `diagrams/` next to its `model.json`, on disk.
+`handoff.md` is meant to be given to Claude Code as context (`@handoff.md`).
 
 The report ends with an **Evidence** section: every relationship gets an entry
 (`E1`, `E2`, ... linked from the resource sections) with file, line range and
@@ -305,7 +314,7 @@ first save; just starting the server or browsing writes neither.
   Fernet-encrypted and goes to git only through its environment
   (`http.extraHeader`). It is never put on the command line or in a file, never
   logged, and never shown. URLs with embedded credentials are refused.
-- **Environments** per repository: recorded by **Discover** (which also records a run
+- **Environments** per repository: recorded by **New run** (which also records a run
   analyzing every confirmed environment) and editable: tfvars files plus extra
   `-var KEY=VALUE` lines (values stored encrypted, only names shown).
 - **Runs**: history per repository. A run's `model.json`, `report.md` and
@@ -357,8 +366,8 @@ JSON API (all GET; under `/runs/<id>/` for a run): `api/summary`, `api/graph`,
 `api/nodes`, `api/edges`, `api/node?id=`, `api/edge?id=`, `api/tree`,
 `api/file?path=`, `api/overview`, `api/source?file=&start=&end=`, `api/model`,
 `api/diagram?name=architecture|module-tree|env-matrix&format=svg|mmd`,
-`api/diagram?name=flow-<n>|network|iam&format=svg|drawio[&root=<dir>]`, `api/handoff`
-(add `download=1` for an attachment), `api/discovery`, `api/job[?id=]`,
+`api/diagram?name=flow-<n>|network|iam&format=svg|drawio[&root=<dir>]` (add `download=1`
+for an attachment), `api/job[?id=]`,
 `api/canvas?name=architecture|module-tree|flow-<n>|network|iam[&root=<dir>]` (a diagram
 as canvas elements), `api/icons`, `api/layout?view=<view>`; `POST api/layout?view=`
 (body `{"positions": {...}}`) and `POST api/layout/reset?view=` (both modes, a recorded

@@ -867,6 +867,14 @@ def env_lines(
     return lines
 
 
+def confirmed_flows(flows: dict[str, Any]) -> dict[str, Any]:
+    """The flows the UI shows: Start here without the CI lines (the Markdown keeps them)."""
+    return {
+        **flows,
+        "start_here": [ln for ln in flows["start_here"] if not ln["text"].startswith("CI: ")],
+    }
+
+
 def metrics_text(m: dict[str, Any]) -> str:
     def p(n: int, w: str) -> str:
         return f"{n} {w if n == 1 else w + 's'}"

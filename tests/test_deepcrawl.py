@@ -824,16 +824,12 @@ def test_changes_page_and_run_files(client, tmp_path):
     assert "Module version changes" in page and "version: 4.2.0 → 4.3.0" in page
     assert client.get(f"/runs/{run_id}/changes?base=999999").status_code == 404
     runs_page = client.get("/runs").data.decode()
-    assert (
-        f"/runs/{run_id}/changes" in runs_page and f"/runs/{run_id}/files/handoff.md" in runs_page
-    )
-    handoff = client.get(f"/runs/{run_id}/files/handoff.md")
-    assert handoff.status_code == 200 and b"## Changes since the previous run" in handoff.data
+    assert f"/runs/{run_id}/changes" in runs_page and "handoff.md" not in runs_page
+    assert client.get(f"/runs/{run_id}/files/handoff.md").status_code == 404
     assert client.get(f"/runs/{run_id}/files/diagrams/module-tree.svg").status_code == 200
     assert client.get(f"/runs/{run_id}/files/../../tflens.db").status_code == 404
-    # the run's analyzer serves the recorded handoff and the diagrams
-    api_handoff = client.get(run_url + "api/handoff").data
-    assert api_handoff == handoff.data
+    # the run's analyzer serves the diagrams, not the handoff
+    assert client.get(run_url + "api/handoff").status_code == 404
     mmd = client.get(run_url + "api/diagram?name=module-tree&format=mmd")
     assert mmd.status_code == 200 and validate_mermaid(mmd.data.decode()) == []
 
@@ -868,16 +864,11 @@ def test_handoff_contains_overview_and_mermaid(tmp_path):
     assert {p.name for p in diagrams.iterdir()} >= {
         f"{d}.{x}" for d in DIAGRAMS for x in ("mmd", "svg")
     }
-    # standalone analyzer: the same handoff and diagrams through the API
+    # standalone analyzer: the same diagrams through the API, no handoff route
     repo = tmp_path / "repo-a"
     shutil.copytree(FIXTURES / "app_flows", repo)
     api = Api(ModelStore(repo))
-    resp = api.handle("GET", "/api/handoff?download=1")
-    assert (
-        resp.status == 200
-        and resp.headers["Content-Disposition"] == 'attachment; filename="handoff.md"'
-    )
-    assert len(_mermaid_blocks(resp.body.decode())) == 3
+    assert api.handle("GET", "/api/handoff?download=1").status == 404
     svg_resp = api.handle("GET", "/api/diagram?name=architecture&format=svg")
     assert svg_resp.content_type.startswith("image/svg+xml")
     _check_svg(svg_resp.body.decode())

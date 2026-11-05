@@ -31,7 +31,7 @@ import posixpath
 from collections import Counter
 from typing import Any
 
-from .flow import COMPUTE_TYPES, build_flows, kind_of
+from .flow import COMPUTE_TYPES, build_flows, confirmed_flows, kind_of
 from .flow import label_of as _flow_label
 from .labels import readable_name
 from .overview import FRIENDLY, _line, _plural
@@ -521,7 +521,7 @@ def build_root_view(model: dict[str, Any], root: str, view: str = "") -> dict[st
         "shape": {k: v for k, v in shape.items() if k != "counts"},
     }
     if view == "flow":
-        out["flow"] = build_flows(sub)
+        out["flow"] = confirmed_flows(build_flows(sub))
     elif view == "provides":
         out["sections"] = provides_sections(model, entry, sub)
     elif view == "network":

@@ -5,7 +5,7 @@
 <form method="get" class="card row">
   <div><label for="level">Min level</label>
     <select id="level" name="level">
-      <option value="">all</option>
+      <option value="">all (from {{ levels[0] }})</option>
       {% for l in levels %}<option value="{{ l }}" {{ 'selected' if l == level }}>{{ l }}</option>{% endfor %}
     </select></div>
   <div><label for="q">Contains</label><input id="q" name="q" value="{{ q }}" size="30"></div>
@@ -14,7 +14,7 @@
 </form>
 <p class="muted">Log file: <span class="mono">{{ log_path }}</span> (change the directory in
   <a href="{{ url_for('settings_page') }}">Settings</a>). Credentials and tokens are redacted before
-  they are written. Newest first.</p>
+  they are written. Newest first; debug entries (what a run could not confirm) are in the file only.</p>
 <table>
   <thead><tr><th>Time</th><th>Level</th><th>Logger</th><th>Message</th></tr></thead>
   <tbody>

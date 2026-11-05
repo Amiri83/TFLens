@@ -630,8 +630,6 @@ def env_matrix_table(model: dict[str, Any]) -> dict[str, Any]:
     structure = model.get("structure") or {"roots": [], "environments": []}
     envs = structure.get("environments") or []
     roots = {r["dir"]: r for r in structure.get("roots") or []}
-    validation = (model.get("pipeline") or {}).get("validation") or {}
-    status = {v["name"]: v["status"] for v in validation.get("envs") or []}
     names = sorted({e["name"] for e in envs}, key=lambda n: (_ENV_ORDER.get(n.lower(), 6), n))
     stacks = [s for s in model.get("stacks") or [] if not s.get("library")]
     if not stacks:
@@ -670,7 +668,7 @@ def env_matrix_table(model: dict[str, Any]) -> dict[str, Any]:
             }
         )
     return {
-        "columns": [{"name": n, "status": status.get(n, "confirmed")} for n in names],
+        "columns": [{"name": n} for n in names],
         "rows": rows,
     }
 
