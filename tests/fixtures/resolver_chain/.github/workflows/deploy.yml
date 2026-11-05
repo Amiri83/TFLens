@@ -1,0 +1,29 @@
+name: deploy
+on: [push]
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, prod]
+    env:
+      TF_VAR_image_tag: ${{ github.sha }}
+    steps:
+      - name: init
+        working-directory: stacks/app
+        run: terraform init -backend-config=envs/backend-${{ matrix.env }}.hcl
+      - name: plan
+        working-directory: stacks/app
+        run: |
+          terraform plan \
+            -var-file=envs/${{ matrix.env }}.tfvars \
+            -out=tfplan
+      - name: apply
+        working-directory: stacks/app
+        run: terraform apply -auto-approve tfplan
+      - name: plan again, same command
+        working-directory: stacks/app
+        run: terraform plan -var-file=envs/${{ matrix.env }}.tfvars -out=tfplan
+      - name: names a file that is not there
+        working-directory: stacks/app
+        run: terraform plan -var-file=envs/ghost.tfvars

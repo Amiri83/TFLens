@@ -92,7 +92,8 @@ def test_unresolvable_remote_modules_stay_unknown_with_reason(load):
     )
     assert _module(m, "module.notify")["analyzed"] is False
     root_outputs = m.data["modules"][0]["outputs"]
-    assert "$unknown" in root_outputs["notify_topic"]
+    # its code is not here (reported once, on the call): reading its output is still a link
+    assert root_outputs["notify_topic"] == {"$ref": "module.notify", "attr": "topic_arn"}
     # an unset variable inside the remote module is unknown, not guessed
     (kms,) = m.unknowns("module.queues.aws_sqs_queue.this")
     assert kms["attribute"] == "kms_master_key_id"

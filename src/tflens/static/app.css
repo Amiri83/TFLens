@@ -85,6 +85,8 @@ button { font: inherit; cursor: pointer; }
 .sum-stat b { color: var(--header-fg); font-size: 14px; }
 .sum-stat.warn { background: rgba(227, 179, 65, .22); }
 .summary-toggle .caret { font-size: 12px; }
+.summary-unknowns { padding: 3px 0; background: none; border: 0; color: var(--header-muted); }
+.summary-unknowns:hover .sum-stat { background: rgba(255, 255, 255, .2); }
 .summary-details {
   padding: 10px 16px 12px; background: var(--bg-panel); border-bottom: 1px solid var(--border); box-shadow: var(--shadow);
 }
@@ -200,7 +202,23 @@ details.all-resources-ov > summary { cursor: pointer; font-weight: 600; font-siz
 ol.why-steps { margin: 2px 0; padding-left: 22px; font-size: 13px; }
 ol.why-steps ul { margin: 0; padding-left: 16px; }
 .inv-item { margin: 8px 0; padding: 6px 8px; border-left: 3px solid var(--border); }
-.inv-item.uncertain { border-left-color: var(--unknown-border); background: var(--unknown-bg); }
+.inv-item.count-open { border-left-color: var(--unknown-border); background: var(--unknown-bg); }
+/* the grouped Unknowns panel: one section per reason category */
+.unknowns-panel { margin: 6px 0 12px; }
+details.unknown-group { margin: 6px 0; padding: 4px 10px; background: var(--unknown-bg); border-left: 3px solid var(--unknown-border); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+details.unknown-group > summary { cursor: pointer; font-weight: 600; }
+ul.unknown-items { list-style: none; margin: 4px 0; padding: 0; }
+.unknown-item { padding: 2px 0; overflow-wrap: anywhere; }
+.unknown-item .link { font-family: var(--mono); font-size: var(--fs-xs); }
+/* the verified init / plan / apply of a stack + environment */
+.cmd-info { position: relative; display: inline-block; }
+.cmd-info-btn { width: 18px; height: 18px; padding: 0; font-size: 11px; font-style: italic; font-weight: 700; line-height: 16px; color: var(--accent); background: none; border: 1px solid var(--border-strong); border-radius: 50%; }
+.cmd-info-btn:hover { background: var(--bg-hover); }
+.cmd-popover { position: absolute; z-index: 20; top: 22px; left: 0; width: 30rem; max-width: 60vw; padding: 8px 10px; font-weight: 400; background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); box-shadow: var(--shadow); }
+.cmd-popover[hidden] { display: none; }
+.cmd-head { margin-bottom: 4px; font-size: var(--fs-xs); color: var(--fg-muted); overflow-wrap: anywhere; }
+.cmd-line { padding: 3px 0; }
+.cmd-line code { display: block; font-size: var(--fs-xs); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* ---------------------------------------------------------------- overview */
 #overview { padding: 16px 24px; overflow: auto; height: 100%; }

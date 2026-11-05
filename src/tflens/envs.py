@@ -24,37 +24,12 @@ from .analyze import analyze
 from .detect import env_segment
 from .engine import Engine, in_scope
 from .loader import RepoSource
-from .model import Graph
+from .model import Graph, unknown_category
 from .overview import FRIENDLY, _line, _plural
 
 # Each environment is a full analysis: bounded for repositories with many environments.
 MAX_ENVIRONMENTS = 12
 MAX_UNKNOWNS_LISTED = 500
-
-# (category, substrings of the reason): the first match wins.
-_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("conditional without default", ("conditional depends on unknown",)),
-    ("missing variable", ("has no default and no value", "undeclared variable")),
-    ("dynamic block", ("dynamic block", "dynamic statement")),
-    ("per-instance value", ("count.index", "each.key")),
-    (
-        "module not analyzed",
-        ("non-local source", "not fetched", "has no .tf files", "not a literal string"),
-    ),
-    ("known after apply", ("only known after apply", "self.*")),
-    ("workspace", ("terraform.workspace",)),
-    ("file / template", ("templatefile", "file ", "not rendered")),
-)
-
-
-def unknown_category(reason: str) -> str:
-    """A short name for why a value is unknown (missing variable, conditional without
-    default, dynamic block, ...)."""
-    low = reason.lower()
-    for category, needles in _CATEGORIES:
-        if any(n in low for n in needles):
-            return category
-    return "other"
 
 
 def created(node: dict[str, Any]) -> int | None:
@@ -210,8 +185,9 @@ def select_stacks(
 
 def counts(nodes: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int]]:
     """``(instances, uncertain)`` per recognized resource type: the instances known to be
-    created, and how many blocks have a count that is not known. An uncertain block is
-    never assumed to be 1: it is only in ``uncertain`` (shown ``4 (+3 uncertain)``)."""
+    created, and how many blocks have a count that is not known. Such a block is never
+    assumed to be 1: it is not in the confirmed count, only in ``uncertain`` (the Unknowns
+    panel explains it)."""
     instances: dict[str, int] = {}
     uncertain: dict[str, int] = {}
     for n in nodes:
@@ -230,9 +206,9 @@ def counts(nodes: list[dict[str, Any]]) -> tuple[dict[str, int], dict[str, int]]
     )
 
 
-def count_text(known: int, uncertain: int = 0) -> str:
-    """``4``, or ``4 (+3 uncertain)`` when blocks with a count not known exist."""
-    return f"{known} (+{uncertain} uncertain)" if uncertain else str(known)
+def count_text(known: int) -> str:
+    """A count as shown: the confirmed instances only."""
+    return str(known)
 
 
 def why_counted(node: dict[str, Any]) -> dict[str, Any] | None:
@@ -388,7 +364,7 @@ def inventory_rows(columns: list[tuple[str, dict[str, dict[str, Any]]]]) -> list
             i: sorted(col for col, s in ids.items() if i in s)
             for i in sorted(set().union(*ids.values()) - every)
         }
-        values = {(c["count"], c["uncertain"]) for c in cells.values()}
+        values = {c["count"] for c in cells.values()}
         rows.append(
             {
                 "key": key,
@@ -411,8 +387,7 @@ def difference_lines(analysis: dict[str, Any]) -> list[str]:
             continue
         cells = [(r["id"], r["inventory"][row["key"]]) for r in envs]
         out.append(
-            f"{row['label']}: "
-            + ", ".join(f"{e} {count_text(c['count'], c['uncertain'])}" for e, c in cells)
+            f"{row['label']}: " + ", ".join(f"{e} {count_text(c['count'])}" for e, c in cells)
         )
         for item, where in row["only"].items():
             out.append(f"  {item} only in {', '.join(where)}")
@@ -437,7 +412,20 @@ def _named(nodes: list[dict[str, Any]], rtype: str, attr: str) -> list[dict[str,
 
 
 def unknown_entries(unknowns: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [{**u, "category": unknown_category(u["reason"])} for u in unknowns]
+    """Unknowns with their category (models written before categories: from the reason)."""
+    return [{**u, "category": u.get("category") or unknown_category(u["reason"])} for u in unknowns]
+
+
+def unknown_groups(unknowns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The grouped Unknowns panel: per category (largest first) how many, and each with its
+    reason and real file:line (``location``, and ``defined_at`` where the chain ends)."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for u in unknown_entries(unknowns):
+        groups.setdefault(u["category"], []).append(u)
+    return [
+        {"category": k, "count": len(groups[k]), "items": groups[k]}
+        for k in sorted(groups, key=lambda c: (-len(groups[c]), c))
+    ]
 
 
 def summarize(
@@ -476,6 +464,7 @@ def summarize(
             "wiring": list(env.get("wiring", [])),
             "not_wired_reason": env.get("not_wired_reason"),
             "state": env.get("state"),
+            "commands": list(env.get("commands", [])),
             **out,
         }
     return out
@@ -495,15 +484,21 @@ def analyze_environment(repo: RepoSource, env: dict[str, Any]) -> tuple[Engine, 
 
 
 def analyze_roots(
-    repo: RepoSource, root_var_files: dict[str, list[str]], env: str = ""
+    repo: RepoSource,
+    root_var_files: dict[str, list[str]],
+    env: str = "",
+    state_index: list[dict[str, Any]] | None = None,
 ) -> tuple[Engine, Graph]:
     """These roots only (every other root left out), each with its own tfvars: one
-    environment applied to every stack that has it."""
+    environment applied to every stack that has it. ``state_index``: the stacks' states,
+    so a ``terraform_remote_state`` reads the producing stack's output for this
+    environment, whether that stack is in this column or not."""
     probe = Engine(repo)
     probe.discover_roots()
     every = set(probe.root_modules) | set(probe.units)
     engine = Engine(repo, root_var_files=root_var_files, exclude_roots=every - set(root_var_files))
     engine.root_envs = {r: env for r in root_var_files} if env else {}
+    engine.state_index = list(state_index or [])
     engine.run()
     return engine, analyze(repo, engine)
 
@@ -591,6 +586,7 @@ def analyze_environments(
     stack_list: list[dict[str, Any]] | None = None,
     library_roots: set[str] | frozenset[str] = frozenset(),
     step: Callable[[str], None] | None = None,
+    state_index: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """The ``environment_analysis`` section (None when no environment was detected).
     ``step`` (when given) is called before each column is analyzed: progress, and the
@@ -637,7 +633,10 @@ def analyze_environments(
         if step is not None:
             step(f"environment column {col['id'] or '(no environment)'}")
         engine, graph = analyze_roots(
-            repo, col["root_var_files"], "" if col.get("no_environment") else col["id"]
+            repo,
+            col["root_var_files"],
+            "" if col.get("no_environment") else col["id"],
+            state_index,
         )
         roots = list(engine.roots)
         nodes, unknowns = _graph_dicts(graph)
@@ -786,8 +785,8 @@ def uncertain_lines(row: dict[str, Any], level: int = 1) -> list[dict[str, Any]]
     for t, n in row["uncertain"].items():
         lines.append(
             _line(
-                f"+{_plural(n, FRIENDLY[t][0], FRIENDLY[t][1])} uncertain: count not known "
-                "statically (not counted)",
+                f"{_plural(n, FRIENDLY[t][0], FRIENDLY[t][1])} not counted: count not known "
+                "statically",
                 row.get("evidence"),
                 level,
                 status="unknown",
@@ -826,14 +825,11 @@ def uncertain_items(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def env_counts_text(row: dict[str, Any]) -> str:
-    """``1 ECS service · 4 (+3 uncertain) Lambda functions · 0 unknowns`` for a row (or
-    the total)."""
-    uncertain = row.get("uncertain") or {}
+    """``1 ECS service · 4 Lambda functions · 0 unknowns`` for a row (or the total)."""
     parts = []
     for t, n in row["counts"].items():
-        u = uncertain.get(t, 0)
-        label = FRIENDLY[t][0] if n == 1 and not u else FRIENDLY[t][1]
-        parts.append(f"{count_text(n, u)} {label}")
+        label = FRIENDLY[t][0] if n == 1 else FRIENDLY[t][1]
+        parts.append(f"{count_text(n)} {label}")
     unknown = row["unknown_count"]
     parts.append(f"{unknown} unknown{'' if unknown == 1 else 's'}")
     return " · ".join(parts)

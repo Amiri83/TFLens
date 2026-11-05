@@ -25,7 +25,7 @@ from .envs import (
     stacks,
 )
 from .loader import RepoSource, load_repo
-from .model import SCHEMA_VERSION, Graph
+from .model import LIBRARY_INPUT, SCHEMA_VERSION, Graph
 from .values import to_json
 
 _CALL_META = {"source", "version", "providers", "count", "for_each", "depends_on"}
@@ -171,9 +171,35 @@ def run_analysis(
             model["stacks"],
             library_roots(model),
             step=step,
+            state_index=engine.state_index,
         )
     )
+    _scope_unknowns(model)
     return Analysis(repo, engine, graph, model)
+
+
+def _scope_unknowns(model: dict[str, Any]) -> None:
+    """A reusable module nothing calls is not deployed from here: when other roots are, its
+    inputs are nobody's unknowns. When the repository is only such modules, what a caller
+    would pass is listed as that."""
+    roots = list(model.get("roots") or [])
+    library = library_roots(model)
+    if library:
+        kept = [u for u in model["unknowns"] if _unknown_root(u, roots) not in library]
+        model["unknowns"] = kept
+        model["summary"]["unknowns"] = len(kept)
+        return
+    every = {r["dir"] for r in model["structure"]["roots"] if r["role"] == "library"}
+    for u in model["unknowns"]:
+        if _unknown_root(u, roots) in every and u["category"] == "missing variable":
+            u["category"] = LIBRARY_INPUT
+
+
+def _unknown_root(unknown: dict[str, Any], roots: list[str]) -> str | None:
+    subject = unknown["subject"]
+    if "::" in subject:
+        return subject.split("::", 1)[0]
+    return roots[0] if len(roots) == 1 else None
 
 
 def library_roots(model: dict[str, Any]) -> set[str]:
@@ -322,9 +348,10 @@ def _module_tree(inst: ModuleInstance) -> dict[str, Any]:
         )
     inputs: dict[str, Any] = {}
     if inst.call is not None and inst.parent is not None:
+        call_id = inst.parent.call_id(inst.call.labels[0])
         for name in sorted(inst.call.attrs):
             if name not in _CALL_META:
-                inputs[name] = to_json(inst.parent.eval_attr(inst.call.attrs[name]))
+                inputs[name] = to_json(inst.parent.eval_attr(inst.call.attrs[name], call_id))
     resources = [inst.node_id(t, n) for t, n in sorted(inst.src.resources)]
     resources += [inst.node_id(t, n, data=True) for t, n in sorted(inst.src.data)]
     remote = None

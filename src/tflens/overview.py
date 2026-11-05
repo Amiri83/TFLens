@@ -191,14 +191,11 @@ def _label(n: dict[str, Any]) -> str:
 
 
 def _friendly(rtype: str, nodes: list[dict[str, Any]]) -> str:
-    """``4 Lambda functions``: the instances the blocks create; a block whose count is
-    not known is not assumed to be 1 but shown as uncertain (``4 (+3 uncertain) ...``)."""
+    """``4 Lambda functions``: the instances the blocks are confirmed to create; a block
+    whose count is not known is not assumed to be 1 and not counted."""
     one, many = FRIENDLY[rtype]
     created = [(n.get("properties") or {}).get("created", 1) for n in nodes]
     known = sum(c for c in created if c is not None)
-    uncertain = sum(1 for c in created if c is None)
-    if uncertain:
-        return f"{known} (+{uncertain} uncertain) {many}"
     return f"{known} {one if known == 1 else many}"
 
 

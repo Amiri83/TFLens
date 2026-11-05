@@ -113,6 +113,8 @@ class Block:
     attrs: dict[str, Attr] = field(default_factory=dict)
     blocks: dict[str, list[Block]] = field(default_factory=dict)
     dynamic: list[str] = field(default_factory=list)
+    # dynamic "name" { for_each, iterator, content { ... } }: each by name
+    dynamic_blocks: dict[str, Block] = field(default_factory=dict)
 
 
 @dataclass
@@ -639,10 +641,25 @@ def _make_block(
         name = str(normalize_key(k))
         if name == "dynamic":
             for entry in v if isinstance(v, list) else [v]:
-                if isinstance(entry, dict):
-                    block.dynamic.extend(
-                        str(normalize_key(x)) for x in entry if not str(x).startswith("__")
-                    )
+                if not isinstance(entry, dict):
+                    continue
+                for label, dyn_body in entry.items():
+                    if str(label).startswith("__"):
+                        continue
+                    dyn_name = str(normalize_key(label))
+                    block.dynamic.append(dyn_name)
+                    if isinstance(dyn_body, dict):
+                        dyn_lb = next(
+                            (
+                                c
+                                for c in (lb.children_of("dynamic") if lb else [])
+                                if c.labels == (dyn_name,)
+                            ),
+                            None,
+                        )
+                        block.dynamic_blocks[dyn_name] = _make_block(
+                            file, dyn_name, (), dyn_body, dyn_lb, span
+                        )
             continue
         loc_children = lb.children_of(name) if lb else []
         marked = (

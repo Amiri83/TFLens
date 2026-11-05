@@ -28,6 +28,7 @@ from .envs import (
     node_root,
     scope_counts,
     summarize,
+    unknown_groups,
 )
 from .flow import build_flows, chain_svg, confirmed_flows
 from .graphlayout import layout as graph_layout
@@ -1004,13 +1005,20 @@ def environments_view(model: dict[str, Any], store: ModelStore | None = None) ->
         total = analysis["total"]
         out["total"] = {**total, "text": env_counts_text(total)}
     out["counts"] = scope_counts(model)
+    # the grouped Unknowns panel: of the model shown, of each column and each row
+    out["current"]["unknown_groups"] = unknown_groups(current["unknowns"])
+    for section in (out["environments"], out["columns"]):
+        for row in section:
+            row["unknown_groups"] = unknown_groups(row.get("unknowns") or [])
     return out
 
 
 def public_row(row: dict[str, Any]) -> dict[str, Any]:
-    """An environment row of the UI: its real files, without the CI lines naming it."""
+    """An environment row of the UI: its real files and verified commands, without the CI
+    lines naming it."""
     out = {k: v for k, v in row.items() if k != "var_file_cli"}
     out["wiring"] = [w for w in row.get("wiring", []) if not w.startswith("CI / scripts:")]
+    out["commands"] = list(row.get("commands") or [])
     return out
 
 
