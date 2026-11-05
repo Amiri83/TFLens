@@ -72,6 +72,9 @@ td.actions { white-space: nowrap; }
 td.actions form, td.actions .btn { margin-right: .25rem; }
 input[type="checkbox"] { width: auto; }
 label.check { display: flex; align-items: center; gap: .4rem; font-weight: normal; }
+.aws-toggle, .run-start { display: inline-flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.aws-toggle select { width: auto; margin: 0; }
+td.actions .aws-toggle { margin-right: .25rem; }
 fieldset[data-group] { border: 0; padding: 0; margin: 0; }
 details.env-edit > summary { cursor: pointer; }
 .counts span { margin-right: .6rem; white-space: nowrap; }

@@ -175,15 +175,19 @@ level (never on the Logs page, which starts at INFO); they stay available in `mo
    **contradicted** (the hint names a file or directory that is not there, or a link the
    code does not have). The docs-vs-code mismatches are listed, including code the docs
    never mention and resources the docs name that the code does not declare. A **resolution
-   pass** then works on what is left: module sources naming this repository, tfvars per
-   environment (never another environment's), locals, defaults, data sources, remote state
-   outputs; `model["resolution"]` holds the unknowns before and after. Each stack:env backend
+   pass** then works on what the code alone leaves unknown (the first pass, with no
+   environment's files): module sources naming this repository, tfvars per environment (never
+   another environment's), variables set in CI, data sources, remote state outputs;
+   `model["resolution"]` holds the unknowns before and after, and the run log lists each value
+   that stayed unresolved and why, grouped by reason. Each stack:env backend
    is resolved from the block, `backend-<env>.hcl` under any `envs/` directory, a shared
    partial configuration, `-backend-config` in CI / scripts and terraform's defaults. A pair
    with tfvars alone is dropped when its stack's other environments have backend files and
    another stack has that environment located. What stays unresolved is never shown as a value:
    it is listed once, in the **Unresolved** panel, with the reason and file:line.
-3. **AWS** (optional, **off by default**, turned on per run in every New run form): read-only existence checks
+3. **AWS** (optional, the **AWS check** toggle and account dropdown next to every New run button: on with
+   the account preselected when exactly one is saved, off when none is, the last choice remembered per
+   repository; automatic runs never call AWS): read-only existence checks
    (`sts:GetCallerIdentity`, `s3:HeadBucket`, `sqs:GetQueueUrl`, `dynamodb:DescribeTable`,
    `lambda:GetFunctionConfiguration`, `sns:GetTopicAttributes`,
    `ecr:DescribeRepositories`) of the confirmed resources whose name is known statically,

@@ -22,7 +22,7 @@ from .pipeline import PHASES, Cancelled
 
 log = logging.getLogger(__name__)
 
-LOG_TAIL = 400
+LOG_TAIL = 2000  # holds a run's per-unknown lines and its AWS calls (MAX_CHECKS of them)
 KEEP_FINISHED = 20
 
 

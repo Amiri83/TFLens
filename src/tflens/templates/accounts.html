@@ -6,8 +6,8 @@
   <a class="btn" href="{{ url_for('account_new') }}">Add account</a>
 </div>
 <p class="muted">AWS account records, kept in the same form as IPLens's so the two tools can share
-  them. The static analysis never uses them; Discover's optional AWS check (off by default, turned on per
-  run) makes read-only calls with the account chosen for that run. Secrets are stored Fernet-encrypted
+  them. The static analysis never uses them; Discover's optional AWS check (next to the New run
+  button, remembered per repository) makes read-only calls with the account chosen for that run. Secrets are stored Fernet-encrypted
   (or kept in memory only) and never shown again.</p>
 <table class="accounts">
   <thead><tr><th>Account</th><th>Region</th><th>Auth</th><th>Credentials</th><th></th></tr></thead>

@@ -14,10 +14,12 @@
    docs / CI / git, nothing in the code) or ``contradicted`` (the hint names a path or file
    the code says otherwise about). Only confirmed items reach the UI; the others are written
    to the log file at debug level (:func:`log_uncertain`). The analysis itself compares a first
-   pass with a resolution pass (``model["resolution"]``: the unknowns before and after).
-3. **AWS** (optional, off by default): read-only existence checks of confirmed resources
-   with an AWS account's own credentials (:mod:`tflens.awscheck`). Skipped, with the
-   reason (a category, never a value), when not asked for or when it cannot run.
+   pass, the code alone, with a resolution pass (``model["resolution"]``: the unknowns before
+   and after); the run log says why each value stayed unresolved (:func:`log_unresolved`).
+3. **AWS** (optional, asked for per run next to the New run button): read-only existence
+   checks of confirmed resources with an AWS account's own credentials
+   (:mod:`tflens.awscheck`). Skipped, with the reason (a category, never a value), when not
+   asked for or when it cannot run.
 4. **Render**: the model (inventory per environment column, diagrams, graph) is built from
    the confirmed data only and written by the caller's ``write`` callback, after the last
    cancellation point: a cancelled run writes nothing.
@@ -40,8 +42,9 @@ from typing import Any, Protocol, TypeVar
 from .crawl import ci_system, crawl, doc_files
 from .detect import COMMON_STEMS, GENERIC_STEMS, backend_env
 from .engine import in_scope
-from .envs import env_id
+from .envs import env_id, unknown_groups
 from .loader import ENV_CONTAINERS, ENV_WORDS, RepoSource, load_repo
+from .logging_setup import redact
 from .output import Analysis, run_analysis
 
 log = logging.getLogger(__name__)
@@ -650,6 +653,30 @@ def log_uncertain(hints: list[dict[str, Any]], validation: dict[str, Any]) -> No
         log.debug("%s: %s %s: %s", m["status"], m["kind"], m["name"], m["text"])
 
 
+def _where(location: dict[str, Any] | None) -> str:
+    return f"{location['file']}:{location['start_line']}" if location else "no location"
+
+
+def log_unresolved(model: dict[str, Any], prog: Progress) -> None:
+    """The run log: each value that stayed unresolved and why, grouped by reason (largest group
+    first), with where it is used, where its chain ends and where the pass looked."""
+    groups = unknown_groups(model["unknowns"])
+    if groups:
+        prog.log(f"unresolved: {len(model['unknowns'])} value(s), grouped by reason")
+    for group in groups:
+        prog.log(f"  {group['category']} ({group['count']}):")
+        log.info("run: unresolved: %s (%d)", group["category"], group["count"])
+        for u in group["items"]:
+            text = f"{u['subject']} {u['attribute']}: {u['reason']} [{_where(u['location'])}]"
+            if u.get("defined_at"):
+                text += f", defined at {_where(u['defined_at'])}"
+            if u.get("searched"):
+                text += f"; {u['searched']}"
+            text = redact(text)  # a reason can quote a module source URL
+            prog.log(f"    {text}")
+            log.info("run: unresolved: %s: %s", group["category"], text)
+
+
 def confirmed_only(model: dict[str, Any]) -> None:
     """Render from confirmed data only: a stack:env pair with no real Terraform file behind
     it is dropped from the structure, the stacks and the per-environment columns. Pair by
@@ -748,6 +775,7 @@ def discover(
     prog.log(f"environments: {c[CONFIRMED]} confirmed")
     resolution = model["resolution"]
     prog.log(f"unknowns: {resolution['before']} before resolution, {resolution['after']} after")
+    log_unresolved(model, prog)
     done(
         "validate",
         "done",

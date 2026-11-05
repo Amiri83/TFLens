@@ -214,7 +214,7 @@ class ModuleInstance:
             value = _apply_type(self.eval_attr(attr), block)
             self.var_info[name] = VarInfo(name, value, "default", attr.loc, True, desc)
             return value
-        if self.call is None:
+        if self.call is None and self.engine.deep:
             found = self.engine.ci_var(name)
             if found is not None:
                 raw, ci_loc = found
@@ -789,7 +789,8 @@ class Engine:
         # how many reads met a value still being evaluated (settle: re-evaluate those)
         self.cycle_hits = 0
         # the resolution pass: follow a source naming this repository, read data.aws_region
-        # from the provider (False: the first, plain pass the run's summary compares with)
+        # from the provider, take a variable from CI (False: the first, plain pass the run's
+        # summary compares with)
         self.deep = True
 
     # ------------------------------------------------------------ discovery

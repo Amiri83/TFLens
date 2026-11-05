@@ -2,15 +2,16 @@
 {% block title %}Runs{% endblock %}
 {% block content %}
 <h1>Runs</h1>
-<form method="post" action="{{ url_for('run_new') }}" class="row card" id="new-run" data-discover>
+<form method="post" action="{{ url_for('run_new') }}" class="row card" id="new-run" data-discover
+      data-aws-choices="{{ aws_choices | tojson | forceescape }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <div><label for="new-run-repo">Repository to run</label>
     <select id="new-run-repo" name="repo_id" {{ 'disabled' if not repos }}>
       {% for p in repos %}<option value="{{ p.id }}" {{ 'selected' if p.id == repo_id }}>{{ p.name }}</option>
       {% else %}<option value="">no repository yet</option>{% endfor %}
     </select></div>
-  <div>{% include "_aws_toggle.html" %}</div>
-  <div><button type="submit" class="primary" {{ 'disabled' if not repos }}>New run</button></div>
+  <div class="run-start">{% include "_aws_toggle.html" %}
+    <button type="submit" class="primary" {{ 'disabled' if not repos }}>New run</button></div>
   {% if not repos %}<div class="muted small"><a href="{{ url_for('tfrepos_page') }}#add">Add a repository</a> first.</div>{% endif %}
 </form>
 <form method="get" class="row card">
