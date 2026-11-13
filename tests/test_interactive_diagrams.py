@@ -25,6 +25,7 @@ from tflens.webapi import KIND_COLORS, Api, ModelStore
 
 ROOT = Path(__file__).resolve().parent.parent
 STATIC = ROOT / "src" / "tflens" / "static"
+THEME = STATIC / "theme" / "dadsops-theme.css"  # the DadsOps shared theme: tokens, typography
 TOOLBAR = (
     "fit",
     "zoom-out",
@@ -100,7 +101,15 @@ def test_page_loads_only_local_scripts_in_order(tmp_path):
     # no remote script, style sheet or font anywhere in the page's assets
     templates = STATIC.parent / "templates"
     for path in [templates / "base.html", templates / "analyzer.html"] + [
-        STATIC / f for f in ("app.css", "style.css", "app.js", "diagram.js", "discover.js")
+        STATIC / f
+        for f in (
+            "theme/dadsops-theme.css",
+            "app.css",
+            "style.css",
+            "app.js",
+            "diagram.js",
+            "discover.js",
+        )
     ]:
         text = path.read_text()
         assert not re.search(r"""(src|href)=["']https?://""", text), path
@@ -345,18 +354,25 @@ def test_click_opens_the_pane_hover_is_a_short_tooltip():
 
 
 def test_typography_one_sans_15px_mono_for_code():
-    css = (STATIC / "app.css").read_text()
+    # the typography comes from the DadsOps shared theme; TFLens does not redefine it
+    css = THEME.read_text()
     sans = re.search(r"--sans: ([^;]+);", css).group(1)
     assert sans.startswith("Inter, system-ui")
-    assert re.search(r"body \{[^}]*font: 15px/1\.6 var\(--sans\)", css)
+    assert "--fs-base: 15px" in css and "--lh: 1.6;" in css
+    assert re.search(r"body \{[^}]*font: var\(--fs-base\)/var\(--lh\) var\(--sans\)", css)
     assert re.search(r"code, kbd, pre, samp, \.mono \{ font-family: var\(--mono\); \}", css)
     for token in ("--fs-xl: 24px", "--fs-lg: 20px", "--fs-base: 15px", "--fs-sm: 13.5px"):
         assert token in css
     assert re.search(r"\nh1 \{ font-size: var\(--fs-xl\)", css)
     assert re.search(r"\nh2 \{ font-size: var\(--fs-lg\)", css)
     assert re.search(r"\nh3 \{ font-size: var\(--fs-sm\)", css)
+    for own in ("app.css", "style.css"):
+        text = (STATIC / own).read_text()
+        assert "--sans:" not in text and "--fs-base:" not in text, own
+        assert not re.search(r"\nh[123] \{ font-size", text), own
+    # the form pages keep their own (shorter) stack: it picks the fallback font of arrows
     assert re.search(
-        r"body \{ margin: 0; font: 15px/1\.6 Inter, system-ui", (STATIC / "style.css").read_text()
+        r"body \{[^}]*font-family: Inter, system-ui", (STATIC / "style.css").read_text()
     )
     js = (STATIC / "diagram.js").read_text()
     assert 'themeVar("--sans", SANS)' in js  # the canvases use the page's font
@@ -386,7 +402,7 @@ def _theme(css: str, selector: str) -> dict[str, str]:
 
 
 def test_higher_contrast_text():
-    theme = _theme((STATIC / "app.css").read_text(), ":root {")
+    theme = _theme(THEME.read_text(), ":root {")
     for fg in ("--fg", "--fg-muted", "--fg-faint"):
         assert _contrast(theme[fg], theme["--bg-panel"]) >= 7.0, fg  # WCAG AAA
 
@@ -453,7 +469,7 @@ def test_canvas_legend_lists_edge_types_in_order(tmp_path):
 
 def test_selected_node_is_legible_in_dark_mode():
     css = (STATIC / "app.css").read_text()
-    dark = _theme(css, ":root {")
+    dark = _theme(THEME.read_text(), ":root {")
     assert _luminance(dark["--sel-bg"]) < 0.2  # a dark fill
     assert _contrast(dark["--sel-bg"], dark["--sel-fg"]) >= 4.5
     assert not re.search(

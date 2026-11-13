@@ -38,6 +38,7 @@ tflens = [
     "static/*.css",
     "static/*.js",
     "static/*.svg",
+    "static/theme/*.css",
     "static/vendor/*",
     "static/vendor/aws-icons/*",
     "templates/*.html",

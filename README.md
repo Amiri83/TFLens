@@ -346,6 +346,18 @@ first save; just starting the server or browsing writes neither.
 - **Logs**: the last N entries of the rotating log file. Credentials and tokens
   are redacted before they are written.
 
+The DadsOps environment variables only supply defaults; they are never saved:
+
+- `DADSOPS_LOG_DIR`: the log directory instead of `logs/` in the data directory (a log
+  directory saved under Settings wins over it).
+- `AWS_PROFILE` / `AWS_REGION`: a new account starts as "Named profile" with that
+  profile, and in that region (the form says "from AWS_PROFILE" / "from AWS_REGION").
+  Saved accounts keep their own values.
+
+The look is the DadsOps shared dark theme (`static/theme/dadsops-theme.css`, an
+unchanged copy of the DadsOps master, linked first). TFLens's own styles in
+`static/app.css` (and `style.css` for the form pages) come after it.
+
 ### Analyzer and security (both modes)
 
 - **Graph**: nodes show their service icon in their service colour, edges are coloured

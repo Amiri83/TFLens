@@ -90,6 +90,11 @@ def _assert_shell(html: str, url: str, *, menu: bool = True) -> None:
     assert html.count(SHELL) == 1 and html.count("<html") == 1, url
     assert html.count('<header class="shell-header">') == 1, url
     assert 'href="/static/app.css"' in html, url  # the one theme, on every page
+    # the DadsOps shared theme first, TFLens's own styles after it
+    theme = html.index('<link rel="stylesheet" href="/static/theme/dadsops-theme.css">')
+    assert theme < html.index('href="/static/app.css"'), url
+    if 'href="/static/style.css"' in html:
+        assert html.index('href="/static/app.css"') < html.index('href="/static/style.css"'), url
     if menu:
         assert html.count('<nav class="tabs" aria-label="Main">') == 1, url
         for link in MENU:
@@ -183,20 +188,22 @@ def test_run_tabs_are_a_subnav_under_the_shared_menu(client, stacks_repo):
 
 
 def test_the_light_theme_is_gone(client):
+    theme = (STATIC_DIR / "theme" / "dadsops-theme.css").read_text()
     css = (STATIC_DIR / "app.css").read_text()
     style = (STATIC_DIR / "style.css").read_text()
     js = (STATIC_DIR / "app.js").read_text() + (STATIC_DIR / "diagram.js").read_text()
-    assert "color-scheme: dark" in css and "color-scheme: light" not in css
-    assert css.count(":root {") == 1
-    for text in (css, style, js):
+    assert "color-scheme: dark" in theme and "color-scheme" not in css + style
+    assert theme.count(":root {") == 1 and css.count(":root {") == 1  # + TFLens-only tokens
+    for text in (theme, css, style, js):
         assert "prefers-color-scheme" not in text
         assert "data-theme" not in text and "dataset.theme" not in text
         assert "theme-toggle" not in text and "tflens-theme" not in text
         assert not re.search(r"\blight\b", text, re.I)
-    # every colour of the form pages comes from the shared theme
+    # every colour of the form pages comes from the shared theme, its tokens only from there
     assert not re.search(r"#[0-9a-fA-F]{3,6}\b", style)
     for name in ("--fg", "--bg-panel", "--accent"):
-        assert re.search(rf"{name}: #", css) and not re.search(rf"{name}: #", style)
+        assert re.search(rf"{name}: #", theme)
+        assert not re.search(rf"{name}: #", css) and not re.search(rf"{name}: #", style)
     for url in ("/repos", "/settings"):
         assert "theme-toggle" not in client.get(url).data.decode()
     assert not list(TEMPLATES.glob("*light*"))

@@ -22,6 +22,7 @@
     </select></div>
     <div><input name="region_custom" placeholder="or type a region code" size="20" aria-label="Custom region"></div>
   </div>
+  {% if env_origin.region %}<div class="muted small env-origin">from <span class="mono">{{ env_origin.region }}</span></div>{% endif %}
 
   <h2>Credentials</h2>
   {% for m in modes %}
@@ -46,6 +47,7 @@
         <option value="{{ a.profile }}" selected>{{ a.profile }} (not found)</option>
       {% endif %}
     </select>
+    {% if env_origin.profile %}<div class="muted small env-origin">from <span class="mono">{{ env_origin.profile }}</span></div>{% endif %}
     <div class="muted">From <span class="mono">~/.aws/config</span> and <span class="mono">~/.aws/credentials</span>
       (including SSO profiles; run <span class="mono">aws sso login</span> first).
       {% if not profiles %}No profiles found.{% endif %}</div>
