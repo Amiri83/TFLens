@@ -43,11 +43,21 @@ class Model:
 
 @pytest.fixture(autouse=True)
 def _isolated_home(tmp_path_factory, monkeypatch):
-    """Never touch the real ~/.tflens: HOME and TFLENS_HOME point into a temp dir."""
+    """Never touch the real ~/.tflens: HOME and TFLENS_HOME point into a temp dir. The
+    shell's DadsOps / AWS defaults (and AWS config file locations) never leak into a test;
+    the tests that need them set their own."""
     user_home = tmp_path_factory.mktemp("user-home")
     monkeypatch.setenv("HOME", str(user_home))
-    monkeypatch.delenv("TFLENS_HOME", raising=False)
-    monkeypatch.delenv("TFLENS_SECRET_KEY", raising=False)
+    for name in (
+        "TFLENS_HOME",
+        "TFLENS_SECRET_KEY",
+        "DADSOPS_LOG_DIR",
+        "AWS_PROFILE",
+        "AWS_REGION",
+        "AWS_CONFIG_FILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+    ):
+        monkeypatch.delenv(name, raising=False)
     return user_home
 
 

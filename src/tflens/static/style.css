@@ -1,53 +1,39 @@
-/* Settings / Accounts / Repos / Runs / Logs pages: forms, tables and cards, on top of
-   app.css (the shared shell and the one dark theme: every colour here is one of its
-   variables). The analyzer page does not load this file. */
-:root {
-  --muted: var(--fg-faint); --card: var(--bg-panel); --line: var(--border);
-  --link: var(--accent); --err: var(--danger);
-  --badge-bg: var(--bg-hover); --badge-fg: var(--fg-muted);
-  --ok-fg: var(--ok); --warn-fg: var(--warn);
-  --err-bg: var(--danger-bg); --err-fg: var(--danger);
-  /* rows greyed out by a rule: visibly muted, still readable */
-  --blocked-bg: var(--bg-subtle); --blocked-fg: var(--fg-faint); --blocked-link: var(--accent);
-}
-/* The hidden attribute always wins, even over a display set by a class or element rule. */
-[hidden] { display: none !important; }
-/* typography: the analyzer page's (app.css) — one sans stack at 15px, mono for code;
-   the document scrolls here (the analyzer's panes scroll on their own) */
-body { margin: 0; font: 15px/1.6 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-       display: block; height: auto; min-height: 100%; }
-.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden;
-           clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
-main { display: block; padding: 1.25rem; max-width: 1400px; margin: 0 auto; }
-h1 { font-size: 24px; line-height: 1.25; margin: 0 0 1rem; }
-h2 { font-size: 20px; line-height: 1.3; margin: 1.5rem 0 .5rem; }
-a { color: var(--link); }
-.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
-        padding: 1rem 1.15rem; margin-bottom: 1rem; }
-.muted { color: var(--muted); }
-.mono, code, pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; }
-.mono { font-size: 13.5px; }
-table { width: 100%; border-collapse: collapse; background: var(--card); }
-th, td { text-align: left; padding: .4rem .55rem; border-bottom: 1px solid var(--line);
-         vertical-align: top; }
-th { font-weight: 600; font-size: 12.5px; text-transform: uppercase; color: var(--muted); }
-tr.blocked td, tr.blocked td .muted { color: var(--blocked-fg); background: var(--blocked-bg); }
-tr.blocked td a { color: var(--blocked-link); }
-.badge { display: inline-block; padding: 0 .45rem; border-radius: 10px; font-size: 11.5px;
-         background: var(--badge-bg); color: var(--badge-fg); white-space: nowrap; }
-.badge.ok { background: var(--ok-bg); color: var(--ok-fg); }
-.badge.err { background: var(--err-bg); color: var(--err-fg); }
-.badge.warn { background: var(--warn-bg); color: var(--warn-fg); }
+/* Settings / Accounts / Repos / Runs / Logs pages, on top of the DadsOps shared theme and
+   app.css: the theme brings the tokens, links, cards, tables, badges, buttons and form
+   fields; this file keeps the form pages' own sizes and shapes (every colour is a theme
+   variable). The analyzer page does not load this file. */
+/* the document scrolls here (the analyzer's panes scroll on their own); the form pages'
+   font stack is shorter than the theme's --sans, which changes the fallback font of
+   glyphs such as arrows */
+body { display: block; height: auto; min-height: 100%;
+       font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { display: block; padding: 1.25rem; max-width: var(--page-max); margin: 0 auto; }
+.card { position: static; display: block; flex-direction: row; gap: normal; box-shadow: none;
+        margin-bottom: 1rem; }
+.card h2 { margin: var(--sp-5) 0 var(--sp-2); }
+.card h3 { margin: 20px 0 var(--sp-2); }
+.mono { font-size: var(--fs-sm); }
+th, td { padding: .4rem .55rem; }
+th { font-weight: 600; font-size: var(--fs-xs); text-transform: uppercase; color: var(--fg-faint); }
+/* rows greyed out by a rule: visibly muted, still readable */
+tbody tr.blocked td, tr.blocked td .muted { color: var(--fg-faint); background: var(--bg-subtle); }
+tr.blocked td a { color: var(--accent); }
+.badge { padding: 0 .45rem; border: 0; border-radius: 10px; font-weight: normal; line-height: inherit; }
 a.badge:hover { text-decoration: underline; }
-button, .btn { background: var(--link); color: var(--accent-fg); border: 0; border-radius: 5px;
-               padding: .4rem .85rem; cursor: pointer; font: inherit; text-decoration: none;
-               display: inline-block; }
-button.secondary, .btn.secondary { background: var(--badge-bg); color: var(--fg); }
-button.danger { background: var(--err); color: var(--accent-fg); }
-input, select, textarea { font: inherit; padding: .35rem .5rem; border: 1px solid var(--line);
-                          border-radius: 4px; color: var(--fg); background: var(--bg-subtle); }
-label { display: block; font-weight: 600; margin: .6rem 0 .2rem; }
-.row { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
+/* (over app.css's analyzer .btn too) */
+button, .btn { display: inline-block; align-items: normal; gap: normal; padding: .4rem .85rem;
+               font: inherit; color: var(--accent-fg); background: var(--accent); border: 0;
+               border-radius: 5px; }
+button.secondary, .btn.secondary { color: var(--fg); background: var(--bg-hover); }
+button.danger { color: var(--accent-fg); background: var(--danger); }
+/* every input (checkboxes too), with a selector that outweighs the theme's text-field rule */
+input, input:not([type="checkbox"]):not([type="radio"]), select, textarea {
+  max-width: none; padding: .35rem .5rem; color: var(--fg); background: var(--bg-subtle);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+input:not([type="checkbox"]):not([type="radio"]):focus, select:focus, textarea:focus { border-color: var(--border); }
+textarea { max-width: 100%; }
+.row { display: flex; flex-direction: row; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }
 .inline { display: inline; }
 
 .small { font-size: 11.5px; }
@@ -60,22 +46,21 @@ textarea.secret-paste { width: 100%; max-width: 760px; }
 .history-actions { align-items: flex-end; margin-top: .5rem; }
 table.history td:first-child { width: 4.5rem; }
 
-.log-ERROR td, .log-CRITICAL td { background: var(--danger-bg); }
-.log-WARNING td { background: var(--warn-bg); }
-pre.logmsg { margin: 0; white-space: pre-wrap; word-break: break-word; }
-.run-reason { margin-top: 2px; max-width: 32rem; color: var(--err-fg); word-break: break-word; }
+tbody tr.log-ERROR td, tbody tr.log-CRITICAL td { background: var(--danger-bg); }
+tbody tr.log-WARNING td { background: var(--warn-bg); }
+pre.logmsg { margin: 0; padding: 0; line-height: inherit; color: inherit; white-space: pre-wrap;
+             word-break: break-word; overflow: visible; background: none; border: 0; border-radius: 0; }
+.run-reason { margin-top: 2px; max-width: 32rem; color: var(--danger); word-break: break-word; }
 pre.listing { margin: 4px 0 0; font-size: 11.5px; white-space: pre; overflow-x: auto; max-width: 40rem; }
 
 /* TFLens additions */
 .mode-note { margin: 0 0 1rem; }
-td.actions { white-space: nowrap; }
+td.actions { display: table-cell; flex-wrap: nowrap; gap: normal; align-items: normal; white-space: nowrap; }
 td.actions form, td.actions .btn { margin-right: .25rem; }
-input[type="checkbox"] { width: auto; }
-label.check { display: flex; align-items: center; gap: .4rem; font-weight: normal; }
+label.check { display: flex; }
 .aws-toggle, .run-start { display: inline-flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
 .aws-toggle select { width: auto; margin: 0; }
 td.actions .aws-toggle { margin-right: .25rem; }
 fieldset[data-group] { border: 0; padding: 0; margin: 0; }
 details.env-edit > summary { cursor: pointer; }
 .counts span { margin-right: .6rem; white-space: nowrap; }
-textarea { max-width: 100%; }

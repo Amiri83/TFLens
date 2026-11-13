@@ -404,9 +404,11 @@ def test_service_colours_are_fixed_and_shared():
 
 
 def test_one_dark_theme():
-    css = (STATIC / "app.css").read_text()
-    assert "color-scheme: dark" in css and "prefers-color-scheme" not in css
-    assert re.search(r"body \{[^}]*font: 15px", css)  # the 15px base (interactive diagrams pass)
+    theme = (STATIC / "theme" / "dadsops-theme.css").read_text()  # the DadsOps shared theme
+    assert "color-scheme: dark" in theme and "prefers-color-scheme" not in theme
+    assert "prefers-color-scheme" not in (STATIC / "app.css").read_text()
+    # the 15px base (interactive diagrams pass)
+    assert "--fs-base: 15px" in theme and re.search(r"body \{[^}]*font: var\(--fs-base\)", theme)
     js = (STATIC / "app.js").read_text()
     assert 'themeColor("--fg"' in js and "style: graphStyle()" in js
 

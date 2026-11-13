@@ -48,7 +48,7 @@ from . import __version__, tfrepo
 from .accounts import AUTH_MODE_LABELS, AUTH_MODES, Account, AccountStore, MemoryVault
 from .accounts import discover_profiles as _discover_profiles
 from .awscheck import target_from_account
-from .config import AppPaths, default_paths
+from .config import PROFILE_ENV, REGION_ENV, AppPaths, aws_env_defaults, default_paths
 from .crypto import LazySecretBox
 from .db import reading, writing
 from .jobs import JobBusy, JobContext, JobFailed, JobManager
@@ -704,6 +704,7 @@ def _register_managed(app: Flask) -> None:
             "settings.html",
             s=_store().load(),
             default_log_dir=_paths().default_log_dir,
+            default_log_dir_source=_paths().default_log_dir_source,
             retention_limits=(MIN_RETENTION_RUNS, MAX_RETENTION_RUNS),
             paths=_paths(),
             db_ready=_paths().db_path.is_file(),
@@ -769,7 +770,7 @@ def _register_managed(app: Flask) -> None:
             "accounts.html", accounts=[a.public_dict() for a in _accounts().list()]
         )
 
-    def _account_form(acct: Account, status: int = 200):
+    def _account_form(acct: Account, status: int = 200, env_origin: dict[str, str] | None = None):
         profiles = _discover_profiles()
         return render_template(
             "account_form.html",
@@ -780,7 +781,22 @@ def _register_managed(app: Flask) -> None:
             profiles=profiles,
             profile_known=acct.profile in {p.name for p in profiles},
             max_name=MAX_DISPLAY_NAME,
+            env_origin=env_origin or {},
         ), status
+
+    def _new_account() -> tuple[Account, dict[str, str]]:
+        """A new account's defaults: ``AWS_PROFILE`` (auth mode "Named profile" with that
+        profile) and ``AWS_REGION`` when set, else the built-in ones; and which field came
+        from which variable. Only shown in the form: nothing is saved until the user does."""
+        acct, origin = Account(), {}
+        env = aws_env_defaults()
+        if env.profile:
+            acct.auth_mode, acct.profile = "profile", env.profile
+            origin["profile"] = PROFILE_ENV
+        if env.region:
+            acct.region = env.region
+            origin["region"] = REGION_ENV
+        return acct, origin
 
     def _save_account(account_id: int | None):
         f = request.form
@@ -822,7 +838,8 @@ def _register_managed(app: Flask) -> None:
     @app.route("/accounts/new", methods=["GET", "POST"])
     def account_new():
         if request.method == "GET":
-            return _account_form(Account())
+            acct, origin = _new_account()
+            return _account_form(acct, env_origin=origin)
         return _save_account(None)
 
     @app.route("/accounts/<int:account_id>/edit", methods=["GET", "POST"])
